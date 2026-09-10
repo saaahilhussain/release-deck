@@ -1,0 +1,16 @@
+node_modules/
+.pnpm-store/
+.turbo/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# Local planning and agent session memory
+/AGENTS.md
+/docs/ROADMAP.md
+/docs/STATUS.md
+/docs/phases/
