@@ -1,0 +1,78 @@
+export type ApiErrorCode =
+  'BAD_REQUEST' | 'NOT_FOUND' | 'CONFLICT' | 'PAYLOAD_TOO_LARGE' | 'INTERNAL_ERROR';
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: ApiErrorCode;
+  readonly fields: readonly string[] | undefined;
+
+  constructor(
+    status: number,
+    code: ApiErrorCode,
+    message: string,
+    fields?: readonly string[],
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.fields = fields;
+  }
+}
+
+export class BadRequestError extends ApiError {
+  constructor(message = 'request is invalid', fields?: readonly string[]) {
+    super(400, 'BAD_REQUEST', message, fields);
+    this.name = 'BadRequestError';
+  }
+}
+
+export class NotFoundError extends ApiError {
+  constructor(message = 'resource was not found') {
+    super(404, 'NOT_FOUND', message);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class ConflictError extends ApiError {
+  constructor(message = 'resource conflicts with an existing record') {
+    super(409, 'CONFLICT', message);
+    this.name = 'ConflictError';
+  }
+}
+
+export class PayloadTooLargeError extends ApiError {
+  constructor() {
+    super(413, 'PAYLOAD_TOO_LARGE', 'request body is too large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+export function isDuplicateError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; codeName?: unknown; name?: unknown };
+  return (
+    candidate.code === 11000 ||
+    candidate.code === 'DUPLICATE_KEY' ||
+    candidate.code === 'DUPLICATE' ||
+    candidate.codeName === 'DuplicateKey' ||
+    candidate.name === 'DuplicateKeyError'
+  );
+}
+
+export function isInvalidInputError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; name?: unknown };
+  return (
+    candidate.code === 'VALIDATION_ERROR' ||
+    candidate.code === 'INVALID_CURSOR' ||
+    candidate.name === 'ValidationError' ||
+    candidate.name === 'InvalidCursorError'
+  );
+}
+
+export function isNotFoundError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; name?: unknown };
+  return candidate.code === 'NOT_FOUND' || candidate.name === 'NotFoundError';
+}

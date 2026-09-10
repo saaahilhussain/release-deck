@@ -6,15 +6,13 @@ ReleaseDeck is a learning-focused, self-hosted release and deployment platform.
 
 The long-term product will accept verified GitHub webhooks, create asynchronous
 deployment jobs, run CI in isolated workspaces, publish immutable releases,
-health-check candidates, and promote or roll back safely. The repository is
-currently in **Phase 1 — Foundation**. The foundation implementation and
-verification are complete, and the user has approved the Phase 1 commit and push.
-Phase 2 has not started.
+health-check candidates, and promote or roll back safely. Implementation and
+verification for **Phase 2 — API domain and persistence** are complete and
+awaiting commit/push approval. No queue, deployment execution, or webhook
+receipt behavior exists yet.
 
 This project values understanding over rapid code generation. The public
-architecture and technical decisions are documented in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/decisions/`](docs/decisions/).
+architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 The approved visual references are preserved in
 [`docs/references/`](docs/references/). Frontend implementation is deferred to
@@ -55,15 +53,16 @@ current setup.
 
 The available quality commands are:
 
-| Command               | Purpose                                                                 |
-| --------------------- | ----------------------------------------------------------------------- |
-| `pnpm build`          | Build all packages and applications                                     |
-| `pnpm typecheck`      | Type check all workspaces                                               |
-| `pnpm test`           | Run workspace tests                                                     |
-| `pnpm lint`           | Run ESLint                                                              |
-| `pnpm format:check`   | Check Prettier formatting                                               |
-| `pnpm format`         | Apply Prettier formatting                                               |
-| `pnpm verify:runtime` | Build, then run opt-in integration/failure checks against real services |
+| Command                   | Purpose                                                                      |
+| ------------------------- | ---------------------------------------------------------------------------- |
+| `pnpm build`              | Build all packages and applications                                          |
+| `pnpm typecheck`          | Type check all workspaces                                                    |
+| `pnpm test`               | Run workspace tests                                                          |
+| `pnpm lint`               | Run ESLint                                                                   |
+| `pnpm format:check`       | Check Prettier formatting                                                    |
+| `pnpm format`             | Apply Prettier formatting                                                    |
+| `pnpm verify:runtime`     | Build, then run opt-in integration/failure checks against real services      |
+| `pnpm verify:persistence` | Build, verify repositories against an isolated database, and clean it safely |
 
 `pnpm verify:runtime` is intentionally opt-in. It runs `pnpm build` itself and
 requires reachable development MongoDB and Redis. The harness reads
@@ -80,8 +79,38 @@ In PowerShell, set `$env:MONGODB_URI` and `$env:REDIS_URL` before running
 `pnpm verify:runtime`. If neither variable is exported, the harness falls back
 to `mongodb://127.0.0.1:27017/releasedeck` and `redis://127.0.0.1:6379`.
 It checks health, waiting-worker startup, malformed configuration, unreachable
-dependencies, occupied ports, and graceful shutdown; it performs no database
-writes or Redis key writes.
+dependencies, occupied ports, and graceful shutdown. API startup idempotently
+ensures Phase 2 MongoDB indexes, but this verifier creates no domain records or
+Redis keys.
+
+`pnpm verify:persistence` accepts the same shell-provided `MONGODB_URI`. It
+selects a randomly named `releasedeck_phase2_verify_*` database through the
+connected client, verifies uniqueness, cursor pagination, guarded concurrent
+updates, webhook delivery uniqueness, and required indexes, then drops only that
+generated database and closes the client. Use a development service where the
+configured account can create indexes and temporary databases.
+
+## Phase 2 API
+
+Phase 2 exposes only routes whose behavior is real:
+
+| Method | Route                                  | Behavior                                     |
+| ------ | -------------------------------------- | -------------------------------------------- |
+| `POST` | `/api/projects`                        | Create a normalized GitHub-backed project    |
+| `GET`  | `/api/projects`                        | List projects with bounded cursor pagination |
+| `GET`  | `/api/projects/:projectId`             | Read one project                             |
+| `GET`  | `/api/projects/:projectId/deployments` | List that project's deployments              |
+| `GET`  | `/api/deployments/:deploymentId`       | Read one deployment                          |
+
+Requests are strictly validated and JSON bodies are limited to 64 KiB. List
+routes accept `limit` (default 25, maximum 100) and an opaque `cursor`. The API
+returns stable JSON errors for invalid input, missing records, conflicts,
+oversized bodies, and sanitized internal failures.
+
+Deployment creation remains an internal service/repository capability until the
+verified GitHub-to-queue flow arrives in Phase 3. WebhookEvent persistence stores
+bounded metadata and a unique provider/delivery identifier, but there is no
+public webhook route and no raw webhook payload storage.
 
 For a built API/worker process, run `pnpm build` first, then start each app with
 its workspace filter:
@@ -96,6 +125,6 @@ continues to load its own `.env`. The dashboard currently produces a static
 `apps/dashboard/dist` build; a production web server for that artifact belongs
 to the later deployment phases.
 
-The Phase 1 dashboard is a presentation-only shell and makes no API calls yet.
-Deployment records, queue processing, releases, rollback, live status, and
+The dashboard remains a presentation-only shell and makes no API calls yet.
+Queue processing, deployment execution, releases, rollback, live status, and
 observability arrive in later phases.

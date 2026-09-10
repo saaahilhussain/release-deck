@@ -13,6 +13,7 @@
     "test": "turbo run test",
     "lint": "turbo run lint && eslint scripts/*.mjs eslint.config.mjs",
     "verify:runtime": "pnpm run build && node scripts/verify-runtime.mjs",
+    "verify:persistence": "pnpm run build && node scripts/verify-persistence.mjs",
     "format:check": "prettier --check .",
     "format": "prettier --write ."
   },

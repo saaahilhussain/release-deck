@@ -1,4 +1,4 @@
-import { connectMongo } from '@releasedeck/db';
+import { connectMongo, initializeDomainRepositories } from '@releasedeck/db';
 import {
   connectRedis,
   createLogger,
@@ -15,7 +15,12 @@ let logger = createLogger();
 try {
   const environment = parseApiEnvironment();
   logger = createLogger(environment.LOG_LEVEL);
-  const started = await startApi(environment, { connectMongo, connectRedis, logger });
+  const started = await startApi(environment, {
+    connectMongo,
+    connectRedis,
+    initializeDomainRepositories,
+    logger,
+  });
   installShutdownHandlers(started, logger);
   const address = started.server.address();
   logger.info(

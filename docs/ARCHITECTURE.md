@@ -6,10 +6,12 @@ verified.
 
 ## Current state
 
-The repository now contains the Phase 1 foundation on top of baseline commit
-`2cad338`. It is a pnpm/Turborepo monorepo with three applications and three
-useful shared packages. Build, typecheck, test, lint, formatting, and runtime
-verification are supported by the root quality commands.
+The repository contains the Phase 1 process foundation plus the implemented and
+verified Phase 2 API domain/persistence work, which is awaiting commit/push
+approval. It is a pnpm/Turborepo monorepo with three applications and three
+useful shared packages. Build, typecheck, test, lint, formatting, runtime
+verification, and isolated persistence verification are supported by root
+commands.
 
 ## Implemented Phase 1 foundation
 
@@ -42,8 +44,8 @@ authorization, worker health, or target application health. Operational and
 target health remain later concerns.
 
 `packages/db` owns the native MongoDB 7.6.0 `MongoClient` connection, bounded
-`ping` operations, and client cleanup. `packages/runtime` owns Zod environment
-validation,
+`ping` operations, client cleanup, and the Phase 2 authoritative domain
+persistence boundary. `packages/runtime` owns Zod environment validation,
 dotenv loading from the application working directory, Pino structured logging
 with redaction, sanitized startup errors, and ioredis connection/ping/close
 support. `packages/tsconfig` owns shared TypeScript settings. No
@@ -56,6 +58,41 @@ configured with bounded command/connect timeouts and no automatic reconnect, so
 a process must be restarted after a lost connection in this foundation.
 Shutdown handlers drain the API server (with a five-second bound), close both
 dependency clients, and exit with an explicit success or failure code.
+
+## Implemented Phase 2 domain and API
+
+`packages/db` defines Project, Deployment, and WebhookEvent records and maps
+them to native MongoDB collections. Records use server-generated UUIDs and
+timestamps. GitHub repository coordinates and full 40-character commit SHAs are
+normalized before storage. Webhook events retain bounded metadata rather than
+raw payloads.
+
+Projects are unique by provider/owner/repository. Webhook events are unique by
+provider/delivery identifier so Phase 3 can build idempotent receipt behavior on
+a database constraint. Deployment status and pipeline stage are separate,
+invalid combinations are rejected, and updates use versioned compare-and-swap
+filters so concurrent writers cannot silently overwrite each other. Repositories
+provide newest-first opaque cursor pagination with a default limit of 25 and a
+maximum of 100.
+
+API startup connects to MongoDB, idempotently ensures the required unique and
+query indexes, connects to Redis, constructs services, and only then binds the
+HTTP port. Failure at any step closes acquired resources. Normal startup now
+requires MongoDB index privileges; a ping alone is no longer sufficient for the
+API to become ready.
+
+The Phase 2 HTTP surface is intentionally narrow:
+
+- create, list, and read projects;
+- list a project's deployments and read a deployment;
+- retain the Phase 1 `/health` contract.
+
+Strict Zod schemas reject unknown fields, malformed IDs/cursors, and out-of-
+bounds inputs. JSON bodies are limited to 64 KiB. Controllers only validate,
+call application services, and serialize responses; centralized middleware maps
+expected errors and sanitizes unexpected failures. Deployment creation and
+WebhookEvent recording exist behind internal services/repositories, but no
+public route claims to enqueue work or receive a verified webhook.
 
 ## Target control and execution planes
 
@@ -70,18 +107,19 @@ GitHub signed webhook → API → MongoDB authoritative state
                                             Worker execution plane
 ```
 
-The API will validate input, persist state, and request work. The worker will
+The API validates Phase 2 domain input and persists state. It will request work
+after the Phase 3 queue boundary exists. The worker will
 load authoritative project/deployment state and run the pipeline. Long-running
 CI and deployment operations must never run inside HTTP handlers. Queue,
-webhook, and domain behavior are future work and are not implemented by the
-Phase 1 foundation. BullMQ remains the planned queue technology; no queue choice
-or deployment behavior is implemented yet.
+signed-webhook receipt, and delivery-processing behavior are future work and are
+not implemented by Phase 2. BullMQ remains the planned queue technology; no
+queue or deployment behavior is implemented yet.
 
-The target domain keeps overall deployment status separate from pipeline stage,
-records the exact commit SHA, and makes GitHub delivery IDs idempotent. Status
+The implemented domain keeps overall deployment status separate from pipeline
+stage and records the exact commit SHA. Phase 3 must use the implemented unique
+delivery constraint to make GitHub delivery processing idempotent. Status
 (`QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`, `ROLLED_BACK`) describes the outcome;
-stage describes pipeline progress. These contracts belong to later API and
-webhook phases.
+the worker will drive stage progress in later phases.
 
 ## Target deployment and release model
 

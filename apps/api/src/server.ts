@@ -1,6 +1,11 @@
 import type { Server } from 'node:http';
 
-import { connectMongo, type MongoConnection } from '@releasedeck/db';
+import {
+  connectMongo,
+  initializeDomainRepositories,
+  type DomainRepositories,
+  type MongoConnection,
+} from '@releasedeck/db';
 import {
   connectRedis,
   createLogger,
@@ -16,6 +21,7 @@ import { createApp } from './app.js';
 export interface ApiServices {
   mongo: MongoConnection;
   redis: RedisConnection;
+  repositories: DomainRepositories;
 }
 
 export interface StartedApi {
@@ -27,6 +33,7 @@ export interface StartedApi {
 export interface ApiStartupDependencies {
   connectMongo(uri: string): Promise<MongoConnection>;
   connectRedis(url: string): Promise<RedisConnection>;
+  initializeDomainRepositories(db: MongoConnection['db']): Promise<DomainRepositories>;
   logger: Logger;
 }
 
@@ -35,16 +42,23 @@ export async function startApi(
   dependencies: ApiStartupDependencies = {
     connectMongo,
     connectRedis,
+    initializeDomainRepositories,
     logger: createLogger(environment.LOG_LEVEL),
   },
 ): Promise<StartedApi> {
   let mongo: MongoConnection | undefined;
   let redis: RedisConnection | undefined;
+  let repositories: DomainRepositories | undefined;
   let server: Server | undefined;
 
   try {
     mongo = await dependencies
       .connectMongo(environment.MONGODB_URI)
+      .catch((error: unknown) => {
+        throw new DependencyError('mongodb', error);
+      });
+    repositories = await dependencies
+      .initializeDomainRepositories(mongo.db)
       .catch((error: unknown) => {
         throw new DependencyError('mongodb', error);
       });
@@ -55,7 +69,12 @@ export async function startApi(
           ? error
           : new DependencyError('redis', error);
       });
-    const app = createApp({ mongo, redis, logger: dependencies.logger });
+    const app = createApp({
+      mongo,
+      redis,
+      repositories,
+      logger: dependencies.logger,
+    });
 
     server = app.listen(environment.PORT, environment.HOST);
     await new Promise<void>((resolve, reject) => {
@@ -85,7 +104,11 @@ export async function startApi(
     let closing: Promise<void> | undefined;
     return {
       server: startedServer,
-      services: { mongo: connectedMongo, redis: connectedRedis },
+      services: {
+        mongo: connectedMongo,
+        redis: connectedRedis,
+        repositories,
+      },
       close() {
         closing ??= closeApi(startedServer, connectedRedis, connectedMongo);
         return closing;

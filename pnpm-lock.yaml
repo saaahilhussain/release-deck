@@ -44,6 +44,9 @@ importers:
       express:
         specifier: ^5.1.0
         version: 5.2.1
+      zod:
+        specifier: ^4.6.1
+        version: 4.6.1
     devDependencies:
       '@releasedeck/tsconfig':
         specifier: workspace:*

@@ -1,5 +1,19 @@
 import { MongoClient, type Db } from 'mongodb';
 
+export * from './domain.js';
+export * from './errors.js';
+export * from './pagination.js';
+export {
+  createDomainRepositories,
+  type DeploymentRepository,
+  type DomainRepositories,
+  type ProjectRepository,
+  type WebhookEventRepository,
+} from './repositories.js';
+export { DOMAIN_INDEXES, ensureDomainIndexes } from './indexes.js';
+import { ensureDomainIndexes } from './indexes.js';
+import { createDomainRepositories, type DomainRepositories } from './repositories.js';
+
 export interface MongoConnection {
   readonly client: MongoClient;
   readonly db: Db;
@@ -46,4 +60,12 @@ export async function connectMongo(
     await client.close().catch(() => undefined);
     throw error;
   }
+}
+
+/** Ensure all indexes before exposing repositories to an application. */
+export async function initializeDomainRepositories(
+  db: Db,
+): Promise<DomainRepositories> {
+  await ensureDomainIndexes(db);
+  return createDomainRepositories(db);
 }

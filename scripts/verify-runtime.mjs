@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { startApi } from '../apps/api/dist/server.js';
 
 // Opt-in integration checks. Requires built apps and running development services.
-// Only connection probes are performed; no records or Redis keys are written.
+// API startup ensures Phase 2 indexes; no domain records or Redis keys are written.
 const root = new URL('../', import.meta.url);
 const environment = {
   ...process.env,

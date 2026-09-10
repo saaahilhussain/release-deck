@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import type { MongoConnection } from '@releasedeck/db';
+import type { DomainRepositories, MongoConnection } from '@releasedeck/db';
 import {
   createLogger,
   DependencyError,
@@ -32,6 +32,7 @@ test('startup closes Mongo when Redis initialization fails', async () => {
   await assert.rejects(
     startApi(environment, {
       connectMongo: async () => mongo,
+      initializeDomainRepositories: async () => ({}) as DomainRepositories,
       connectRedis: async () => {
         throw new Error('redis unavailable');
       },
@@ -47,4 +48,39 @@ test('startup closes Mongo when Redis initialization fails', async () => {
     },
   );
   assert.equal(mongoClosed, true);
+});
+
+test('startup closes Mongo and does not connect Redis when indexes fail', async () => {
+  let mongoClosed = false;
+  let redisConnected = false;
+  const mongo = {
+    ping: async () => undefined,
+    close: async () => {
+      mongoClosed = true;
+    },
+  } as unknown as MongoConnection;
+
+  await assert.rejects(
+    startApi(environment, {
+      connectMongo: async () => mongo,
+      initializeDomainRepositories: async () => {
+        throw new Error('index details must remain private');
+      },
+      connectRedis: async () => {
+        redisConnected = true;
+        throw new Error('must not be called');
+      },
+      logger: createLogger('silent'),
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof DependencyError);
+      assert.deepEqual(errorForLog(error), {
+        name: 'DependencyError',
+        dependency: 'mongodb',
+      });
+      return true;
+    },
+  );
+  assert.equal(mongoClosed, true);
+  assert.equal(redisConnected, false);
 });

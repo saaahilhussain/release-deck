@@ -18,7 +18,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "pnpm run build && node --test dist/*.test.js"
   },
   "dependencies": {
     "mongodb": "^7.6.0"
