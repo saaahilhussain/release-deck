@@ -1,16 +1,26 @@
 import type { Collection, Db, Document, Filter, UpdateFilter } from 'mongodb';
+import { randomUUID } from 'node:crypto';
 
 import {
   createProject,
   createQueuedDeployment,
   createWebhookEvent,
   assertDeploymentState,
+  assertCiExecutionState,
+  createCiStepResult,
   assertWebhookEventState,
   normalizeProjectCoordinates,
   DEPLOYMENT_STAGES,
   DEPLOYMENT_STATUSES,
   transitionDeployment,
   transitionWebhookEvent,
+  DEFAULT_CI_LEASE_MS,
+  MAX_CI_LEASE_MS,
+  CI_STAGES,
+  type CiExecutionClaim,
+  type CiExecutionLeaseInput,
+  type CiStepOutcomeInput,
+  type DeploymentCiExecution,
   type Deployment,
   type DeploymentCreateInput,
   type DeploymentTransition,
@@ -78,6 +88,34 @@ export interface DeploymentRepository {
   findBySourceWebhookEventId(sourceWebhookEventId: string): Promise<Deployment | null>;
   listByProject(projectId: string, options?: PageOptions): Promise<Page<Deployment>>;
   transition(id: string, transition: DeploymentTransition): Promise<Deployment>;
+  claimCiExecution(
+    id: string,
+    options?: CiExecutionClaimOptions,
+  ): Promise<CiExecutionClaim | null>;
+  reclaimExpiredCiExecution(
+    id: string,
+    options?: CiExecutionReclaimOptions,
+  ): Promise<CiExecutionClaim | null>;
+  renewCiExecution(
+    id: string,
+    lease: CiExecutionLeaseInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordCiStepOutcome(
+    id: string,
+    outcome: CiStepOutcomeInput,
+    now?: Date,
+  ): Promise<Deployment>;
+}
+
+export interface CiExecutionClaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
+}
+
+export interface CiExecutionReclaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
 }
 
 export interface WebhookEventRepository {
@@ -115,6 +153,26 @@ function asDate(value: unknown): Date {
   if (!(value instanceof Date) || Number.isNaN(value.valueOf()))
     throw new PersistenceError();
   return value;
+}
+
+function ciNow(value: Date | undefined): Date {
+  const now = value ?? new Date();
+  if (!(now instanceof Date) || Number.isNaN(now.valueOf())) {
+    throw new ValidationError('CI timestamp is invalid');
+  }
+  return now;
+}
+
+function ciLeaseMs(value: number | undefined): number {
+  const leaseMs = value ?? DEFAULT_CI_LEASE_MS;
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > MAX_CI_LEASE_MS) {
+    throw new ValidationError('CI lease duration is invalid');
+  }
+  return leaseMs;
+}
+
+function ciTokenValid(attemptId: string, fence: number): boolean {
+  return UUID_PATTERN.test(attemptId) && Number.isSafeInteger(fence) && fence >= 1;
 }
 
 function projectFromDocument(document: Document): Project {
@@ -179,11 +237,19 @@ function deploymentFromDocument(document: Document): Deployment {
     ...(value.sourceWebhookEventId === undefined
       ? {}
       : { sourceWebhookEventId: value.sourceWebhookEventId }),
+    ...(value.ci === undefined ? {} : { ci: value.ci as DeploymentCiExecution }),
     createdAt: asDate(value.createdAt),
     updatedAt: asDate(value.updatedAt),
   };
   try {
     assertDeploymentState(record.status, record.stage);
+    if (
+      value.ci !== undefined &&
+      (typeof value.ci !== 'object' || value.ci === null || Array.isArray(value.ci))
+    ) {
+      throw new ValidationError('CI execution is invalid');
+    }
+    assertCiExecutionState(record.status, record.stage, record.ci);
   } catch {
     throw new PersistenceError();
   }

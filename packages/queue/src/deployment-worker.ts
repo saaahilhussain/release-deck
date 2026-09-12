@@ -12,7 +12,14 @@ export interface WorkerLike {
   close(): Promise<void>;
 }
 
-export type DeploymentJobProcessor = (job: DeploymentJobData) => Promise<void>;
+export interface DeploymentJobContext {
+  readonly signal?: AbortSignal;
+}
+
+export type DeploymentJobProcessor = (
+  job: DeploymentJobData,
+  context: DeploymentJobContext,
+) => Promise<void>;
 
 export interface DeploymentWorkerDependencies {
   createWorker?: (
@@ -43,8 +50,11 @@ export function createDeploymentWorker(
 ): DeploymentWorker {
   const worker = (dependencies.createWorker ?? defaultWorker)(
     DEPLOYMENT_QUEUE_NAME,
-    async (job: Job<DeploymentJobData>) => {
-      await processor(parseDeploymentJobData(job.data));
+    async (job: Job<DeploymentJobData>, _token?: string, signal?: AbortSignal) => {
+      await processor(
+        parseDeploymentJobData(job.data),
+        signal === undefined ? {} : { signal },
+      );
     },
     {
       connection,

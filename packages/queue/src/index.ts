@@ -13,6 +13,7 @@ export {
 } from './deployment-queue.js';
 export {
   createDeploymentWorker,
+  type DeploymentJobContext,
   type DeploymentJobProcessor,
   type DeploymentWorker,
   type DeploymentWorkerDependencies,

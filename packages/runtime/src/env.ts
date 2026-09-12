@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { isAbsolute, resolve } from 'node:path';
 
 import dotenv from 'dotenv';
 import { z } from 'zod';
@@ -64,8 +65,68 @@ const apiEnvironmentSchema = commonEnvironmentSchema.extend({
   GITHUB_WEBHOOK_SECRET: z.string().min(16),
 });
 
+const workerEnvironmentSchema = commonEnvironmentSchema
+  .extend({
+    CI_WORKSPACE_ROOT: z
+      .string()
+      .trim()
+      .min(1)
+      .max(4_096)
+      .refine(
+        (value) =>
+          ![...value].some(
+            (character) =>
+              character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127,
+          ),
+      )
+      .refine(isAbsolute, 'must be an absolute path')
+      .default(resolve(tmpdir(), 'releasedeck-workspaces')),
+    CI_STEP_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(86_400_000)
+      .default(300_000),
+    CI_TOTAL_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(86_400_000)
+      .default(1_800_000),
+    CI_MAX_OUTPUT_BYTES: z.coerce
+      .number()
+      .int()
+      .min(1_024)
+      .max(16_777_216)
+      .default(1_048_576),
+    CI_LEASE_MS: z.coerce
+      .number()
+      .int()
+      .min(61_000)
+      .max(172_800_000)
+      .default(2_400_000),
+    CI_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
+  })
+  .superRefine((value, context) => {
+    if (value.CI_TOTAL_TIMEOUT_MS < value.CI_STEP_TIMEOUT_MS) {
+      context.addIssue({
+        code: 'custom',
+        path: ['CI_TOTAL_TIMEOUT_MS'],
+        message: 'must be at least CI_STEP_TIMEOUT_MS',
+      });
+    }
+    if (value.CI_LEASE_MS < value.CI_TOTAL_TIMEOUT_MS + 60_000) {
+      context.addIssue({
+        code: 'custom',
+        path: ['CI_LEASE_MS'],
+        message: 'must exceed CI_TOTAL_TIMEOUT_MS by at least 60000ms',
+      });
+    }
+  });
+
 export type RuntimeEnvironment = z.infer<typeof commonEnvironmentSchema>;
 export type ApiEnvironment = z.infer<typeof apiEnvironmentSchema>;
+export type WorkerEnvironment = z.infer<typeof workerEnvironmentSchema>;
 
 export class ConfigurationError extends Error {
   readonly fields: readonly string[];
@@ -98,6 +159,12 @@ export function parseApiEnvironment(
   input: NodeJS.ProcessEnv = process.env,
 ): ApiEnvironment {
   return parseWithSchema(apiEnvironmentSchema, input);
+}
+
+export function parseWorkerEnvironment(
+  input: NodeJS.ProcessEnv = process.env,
+): WorkerEnvironment {
+  return parseWithSchema(workerEnvironmentSchema, input);
 }
 
 export function loadAppEnvironment(cwd: string = process.cwd()): void {
