@@ -1,6 +1,14 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "globalEnv": ["NODE_ENV", "LOG_LEVEL", "MONGODB_URI", "REDIS_URL", "HOST", "PORT"],
+  "globalEnv": [
+    "NODE_ENV",
+    "LOG_LEVEL",
+    "MONGODB_URI",
+    "REDIS_URL",
+    "GITHUB_WEBHOOK_SECRET",
+    "HOST",
+    "PORT"
+  ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

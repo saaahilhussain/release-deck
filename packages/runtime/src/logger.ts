@@ -3,8 +3,10 @@ import pino, { type Logger, type LoggerOptions } from 'pino';
 const sensitiveKeyPaths = [
   'MONGODB_URI',
   'REDIS_URL',
+  'GITHUB_WEBHOOK_SECRET',
   '*.MONGODB_URI',
   '*.REDIS_URL',
+  '*.GITHUB_WEBHOOK_SECRET',
   'password',
   '*.password',
   'token',

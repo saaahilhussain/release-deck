@@ -10,6 +10,9 @@ export interface RedisConnection {
 
 export interface RedisConnectionOptions {
   connectTimeoutMs?: number;
+  /** Null disables ioredis command deadlines for BullMQ blocking consumers. */
+  commandTimeoutMs?: number | null;
+  maxRetriesPerRequest?: number | null;
 }
 
 export async function connectRedis(
@@ -19,8 +22,13 @@ export async function connectRedis(
   const redisOptions: RedisOptions = {
     lazyConnect: true,
     connectTimeout: options.connectTimeoutMs ?? 5_000,
-    commandTimeout: options.connectTimeoutMs ?? 5_000,
-    maxRetriesPerRequest: 1,
+    ...(options.commandTimeoutMs === null
+      ? {}
+      : {
+          commandTimeout: options.commandTimeoutMs ?? options.connectTimeoutMs ?? 5_000,
+        }),
+    maxRetriesPerRequest:
+      options.maxRetriesPerRequest === undefined ? 1 : options.maxRetriesPerRequest,
     retryStrategy: () => null,
   };
   const client = new Redis(url, redisOptions);

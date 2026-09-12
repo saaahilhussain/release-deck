@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@releasedeck/db": "workspace:*",
+    "@releasedeck/queue": "workspace:*",
     "@releasedeck/runtime": "workspace:*"
   },
   "devDependencies": {

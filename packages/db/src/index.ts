@@ -5,6 +5,7 @@ export * from './errors.js';
 export * from './pagination.js';
 export {
   createDomainRepositories,
+  WEBHOOK_PENDING_MAX,
   type DeploymentRepository,
   type DomainRepositories,
   type ProjectRepository,

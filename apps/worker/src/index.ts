@@ -16,7 +16,7 @@ try {
   const environment = parseRuntimeEnvironment();
   logger = createLogger(environment.LOG_LEVEL);
   const worker = await startWorker(environment, { connectMongo, connectRedis, logger });
-  logger.info('worker connected and waiting');
+  logger.info('worker connected and consuming deployment jobs');
   const idleTimer = setInterval(() => undefined, 60_000);
 
   let shuttingDown = false;

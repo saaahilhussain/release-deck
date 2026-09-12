@@ -50,11 +50,14 @@ function repositories(overrides: Partial<ApiRepositories> = {}): ApiRepositories
     projects: {
       create: async () => project,
       findById: async (id) => (id === project.id ? project : null),
+      findByCoordinates: async (owner, repository) =>
+        owner === project.owner && repository === project.repository ? project : null,
       list: async () => page([project], 'next-page'),
     },
     deployments: {
       createQueued: async () => deployment,
       findById: async (id) => (id === deployment.id ? deployment : null),
+      findBySourceWebhookEventId: async () => null,
       listByProject: async () => page([deployment]),
       transition: async () => deployment,
     },
@@ -68,6 +71,10 @@ function repositories(overrides: Partial<ApiRepositories> = {}): ApiRepositories
           metadata: input.metadata ?? {},
         }) as WebhookEventRecord,
       findByDeliveryId: async () => null,
+      transition: async () => {
+        throw new Error('not used');
+      },
+      listPending: async () => [],
     },
     ...overrides,
   };
@@ -192,6 +199,7 @@ test('deployment routes distinguish missing resources and hide persistence detai
           throw persistenceError;
         },
         findById: async () => project,
+        findByCoordinates: async () => project,
         list: async () => page([project]),
       },
     }),
@@ -219,6 +227,7 @@ test('duplicate persistence errors map to a conflict envelope', async () => {
           throw { code: 'DUPLICATE' };
         },
         findById: async () => project,
+        findByCoordinates: async () => project,
         list: async () => page([project]),
       },
     }),
@@ -249,6 +258,7 @@ test('internal services support queued deployments and bounded webhook metadata'
         return deployment;
       },
       findById: async () => deployment,
+      findBySourceWebhookEventId: async () => null,
       listByProject: async () => page([deployment]),
       transition: async () => deployment,
     },
@@ -264,6 +274,10 @@ test('internal services support queued deployments and bounded webhook metadata'
         } as WebhookEventRecord;
       },
       findByDeliveryId: async () => null,
+      transition: async () => {
+        throw new Error('not used');
+      },
+      listPending: async () => [],
     },
   });
 

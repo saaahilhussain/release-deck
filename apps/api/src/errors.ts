@@ -1,5 +1,12 @@
 export type ApiErrorCode =
-  'BAD_REQUEST' | 'NOT_FOUND' | 'CONFLICT' | 'PAYLOAD_TOO_LARGE' | 'INTERNAL_ERROR';
+  | 'BAD_REQUEST'
+  | 'UNAUTHORIZED'
+  | 'UNSUPPORTED_MEDIA_TYPE'
+  | 'NOT_FOUND'
+  | 'CONFLICT'
+  | 'PAYLOAD_TOO_LARGE'
+  | 'SERVICE_UNAVAILABLE'
+  | 'INTERNAL_ERROR';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -27,6 +34,20 @@ export class BadRequestError extends ApiError {
   }
 }
 
+export class UnauthorizedError extends ApiError {
+  constructor(message = 'webhook authentication failed') {
+    super(401, 'UNAUTHORIZED', message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+export class UnsupportedMediaTypeError extends ApiError {
+  constructor() {
+    super(415, 'UNSUPPORTED_MEDIA_TYPE', 'content type must be application/json');
+    this.name = 'UnsupportedMediaTypeError';
+  }
+}
+
 export class NotFoundError extends ApiError {
   constructor(message = 'resource was not found') {
     super(404, 'NOT_FOUND', message);
@@ -45,6 +66,13 @@ export class PayloadTooLargeError extends ApiError {
   constructor() {
     super(413, 'PAYLOAD_TOO_LARGE', 'request body is too large');
     this.name = 'PayloadTooLargeError';
+  }
+}
+
+export class ServiceUnavailableError extends ApiError {
+  constructor(message = 'service is temporarily unavailable') {
+    super(503, 'SERVICE_UNAVAILABLE', message);
+    this.name = 'ServiceUnavailableError';
   }
 }
 

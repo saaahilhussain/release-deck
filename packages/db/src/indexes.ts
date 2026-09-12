@@ -11,6 +11,12 @@ export const DOMAIN_INDEXES = {
   ],
   deployments: [
     {
+      key: { sourceWebhookEventId: 1 },
+      name: 'deployments_source_webhook_event_unique',
+      unique: true,
+      partialFilterExpression: { sourceWebhookEventId: { $type: 'string' } },
+    },
+    {
       key: { projectId: 1, createdAt: -1, _id: -1 },
       name: 'deployments_project_created_at_id',
     },
@@ -21,6 +27,10 @@ export const DOMAIN_INDEXES = {
       key: { provider: 1, deliveryId: 1 },
       name: 'webhook_events_provider_delivery_unique',
       unique: true,
+    },
+    {
+      key: { processingStatus: 1, updatedAt: 1, _id: 1 },
+      name: 'webhook_events_processing_updated_id',
     },
     { key: { createdAt: -1, _id: -1 }, name: 'webhook_events_created_at_id' },
   ],

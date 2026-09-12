@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import type { DomainRepositories, MongoConnection } from '@releasedeck/db';
+import type { DeploymentQueue } from '@releasedeck/queue';
 import {
   createLogger,
   DependencyError,
@@ -9,7 +10,7 @@ import {
   type ApiEnvironment,
 } from '@releasedeck/runtime';
 
-import { startApi } from './server.js';
+import { startApi, startPendingWebhookReconciler } from './server.js';
 
 const environment: ApiEnvironment = {
   NODE_ENV: 'test',
@@ -18,7 +19,18 @@ const environment: ApiEnvironment = {
   PORT: 31_111,
   MONGODB_URI: 'mongodb://127.0.0.1/releasedeck',
   REDIS_URL: 'redis://127.0.0.1',
+  GITHUB_WEBHOOK_SECRET: 'phase-3-test-secret',
 };
+
+function queueStub(overrides: Partial<DeploymentQueue> = {}): DeploymentQueue {
+  return {
+    name: 'releasedeck-deployments',
+    waitUntilReady: async () => undefined,
+    enqueueDeployment: async () => undefined,
+    close: async () => undefined,
+    ...overrides,
+  };
+}
 
 test('startup closes Mongo when Redis initialization fails', async () => {
   let mongoClosed = false;
@@ -36,6 +48,7 @@ test('startup closes Mongo when Redis initialization fails', async () => {
       connectRedis: async () => {
         throw new Error('redis unavailable');
       },
+      createDeploymentQueue: () => queueStub(),
       logger: createLogger('silent'),
     }),
     (error: unknown) => {
@@ -70,6 +83,7 @@ test('startup closes Mongo and does not connect Redis when indexes fail', async 
         redisConnected = true;
         throw new Error('must not be called');
       },
+      createDeploymentQueue: () => queueStub(),
       logger: createLogger('silent'),
     }),
     (error: unknown) => {
@@ -83,4 +97,95 @@ test('startup closes Mongo and does not connect Redis when indexes fail', async 
   );
   assert.equal(mongoClosed, true);
   assert.equal(redisConnected, false);
+});
+
+test('startup closes queue, Redis, and Mongo when queue readiness fails', async () => {
+  const closed: string[] = [];
+  const mongo = {
+    db: {},
+    ping: async () => undefined,
+    close: async () => {
+      closed.push('mongo');
+    },
+  } as unknown as MongoConnection;
+  const redis = {
+    client: {},
+    ping: async () => undefined,
+    close: async () => {
+      closed.push('redis');
+    },
+  } as never;
+
+  await assert.rejects(
+    startApi(environment, {
+      connectMongo: async () => mongo,
+      initializeDomainRepositories: async () => ({}) as DomainRepositories,
+      connectRedis: async () => redis,
+      createDeploymentQueue: () =>
+        queueStub({
+          waitUntilReady: async () => {
+            throw new Error('queue unavailable');
+          },
+          close: async () => {
+            closed.push('queue');
+          },
+        }),
+      logger: createLogger('silent'),
+    }),
+    (error: unknown) =>
+      error instanceof DependencyError && error.dependency === 'redis',
+  );
+  assert.deepEqual(closed, ['queue', 'redis', 'mongo']);
+});
+
+test('successful API shutdown closes the queue before shared connections', async () => {
+  const closed: string[] = [];
+  const mongo = {
+    db: {},
+    ping: async () => undefined,
+    close: async () => {
+      closed.push('mongo');
+    },
+  } as unknown as MongoConnection;
+  const redis = {
+    client: {},
+    ping: async () => undefined,
+    close: async () => {
+      closed.push('redis');
+    },
+  } as never;
+  const repositories = {
+    webhookEvents: { listPending: async () => [] },
+  } as unknown as DomainRepositories;
+  const started = await startApi(
+    { ...environment, PORT: 0 },
+    {
+      connectMongo: async () => mongo,
+      initializeDomainRepositories: async () => repositories,
+      connectRedis: async () => redis,
+      createDeploymentQueue: () =>
+        queueStub({
+          close: async () => {
+            closed.push('queue');
+          },
+        }),
+      logger: createLogger('silent'),
+    },
+  );
+
+  await started.close();
+  assert.deepEqual(closed, ['queue', 'redis', 'mongo']);
+});
+
+test('reconciliation shutdown has a bounded wait', async () => {
+  const never = new Promise<number>(() => undefined);
+  const reconciler = startPendingWebhookReconciler(
+    { reconcilePending: () => never } as never,
+    createLogger('silent'),
+    60_000,
+    20,
+  );
+  const startedAt = Date.now();
+  await reconciler.close();
+  assert.ok(Date.now() - startedAt < 500);
 });

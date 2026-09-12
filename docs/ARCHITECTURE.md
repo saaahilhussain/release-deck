@@ -6,11 +6,12 @@ verified.
 
 ## Current state
 
-The repository contains the Phase 1 process foundation plus the implemented and
-verified Phase 2 API domain/persistence work, which is awaiting commit/push
-approval. It is a pnpm/Turborepo monorepo with three applications and three
-useful shared packages. Build, typecheck, test, lint, formatting, runtime
-verification, and isolated persistence verification are supported by root
+The repository contains the approved Phase 1 process foundation and Phase 2 API
+domain/persistence work at commit `447435f`, plus implemented and verified
+Phase 3 GitHub-to-queue work awaiting commit/push approval. It is a
+pnpm/Turborepo monorepo with three applications and four useful shared packages.
+Build, typecheck, test, lint, formatting, runtime verification, isolated
+persistence verification, and a real-service Phase 3 flow are supported by root
 commands.
 
 ## Implemented Phase 1 foundation
@@ -24,19 +25,17 @@ apps/api (Express control-plane health endpoint)
         ▼                     ▼
 packages/db → MongoDB     packages/runtime → Redis
 
-apps/worker (startup process; connects and waits, no jobs)
+apps/worker (startup process; no jobs in Phase 1)
         │                     │
         └──── packages/db / packages/runtime ────┘
 ```
 
-The API requests work and exposes `/health`; it does not execute deployment
-pipelines. Startup connects to MongoDB and Redis before listening on loopback
-`127.0.0.1:3000`. The health handler pings both dependencies concurrently with
-a bounded three-second request timeout and returns `200` only when both are
-reachable, otherwise `503`. The worker connects to both dependencies and logs
-that it is waiting; it consumes no queue and starts no deployment jobs. The
-dashboard is a minimal branded shell at Vite's default `127.0.0.1:5173` and
-does not call the API in this phase.
+The Phase 1 API requested work and exposed `/health`; it did not execute
+deployment pipelines. Startup connected to MongoDB and Redis before listening
+on loopback `127.0.0.1:3000`. The health handler still pings both dependencies
+concurrently with a bounded three-second request timeout and returns `200` only
+when both are reachable, otherwise `503`. The dashboard remains a minimal
+branded shell at Vite's default `127.0.0.1:5173` and does not call the API.
 
 The `/health` contract should report dependency reachability with bounded checks.
 A MongoDB `ping` is a connectivity no-op: it does not establish write
@@ -55,7 +54,7 @@ added before a useful consumer existed.
 API and worker environment examples live beside each app. Required MongoDB and
 Redis URLs are validated before startup; credentials are not logged. Redis is
 configured with bounded command/connect timeouts and no automatic reconnect, so
-a process must be restarted after a lost connection in this foundation.
+a process must currently be restarted after a lost connection.
 Shutdown handlers drain the API server (with a five-second bound), close both
 dependency clients, and exit with an explicit success or failure code.
 
@@ -94,6 +93,42 @@ expected errors and sanitizes unexpected failures. Deployment creation and
 WebhookEvent recording exist behind internal services/repositories, but no
 public route claims to enqueue work or receive a verified webhook.
 
+## Implemented Phase 3 webhook and queue boundary
+
+The API now mounts `POST /api/webhooks/github` before its global JSON parser. A
+raw-body parser accepts at most 1 MiB, and the webhook processor requires one
+delivery ID, event name, and SHA-256 signature header. It authenticates the
+exact bytes with HMAC-SHA256 and constant-time digest comparison before parsing
+JSON. `GITHUB_WEBHOOK_SECRET` is required at API startup and covered by logger
+redaction. Raw payloads and secrets are neither stored nor logged.
+
+For signed pushes, the API normalizes GitHub repository coordinates, finds a
+registered project, and requires the exact `refs/heads/<defaultBranch>` ref.
+Unsupported events, unknown projects, non-default branches, deleted refs, and
+zero-SHA pushes become terminal `IGNORED` records without deployments. Reuse of
+a delivery ID with different signed content is a conflict.
+
+MongoDB is authoritative across the non-transactional MongoDB/Redis boundary.
+Recoverable webhook states (`RECEIVED`, `QUEUE_PENDING`, and `QUEUED`), a unique
+deployment source link, versioned compare-and-swap transitions, and bounded
+pending reconciliation converge retries and process/queue failure windows. The
+legacy Phase 2 webhook shape remains readable but is excluded from Phase 3
+reconciliation because it lacks recoverable routing data.
+
+`packages/queue` owns BullMQ queue/job names, payload validation, producer and
+consumer construction, deterministic job IDs, retries, and lifecycle. A job
+contains only `{ deploymentId }`; completed and failed jobs are retained so the
+deterministic ID remains the duplicate boundary. The worker reloads authoritative
+MongoDB state and atomically claims only `QUEUED/QUEUED` deployments as
+`RUNNING/CHECKOUT`. Duplicate or stale jobs do not move state backward. Checkout,
+CI execution, and target deployment remain future work.
+
+API startup now requires MongoDB/indexes, Redis, and a ready queue before the
+HTTP listener binds. Worker startup requires MongoDB/indexes, Redis configured
+for BullMQ blocking operations, and a ready consumer. Shutdown stops HTTP and
+reconciliation or the consumer before closing its queue and shared dependency
+connections.
+
 ## Target control and execution planes
 
 The eventual control-plane flow is:
@@ -107,17 +142,14 @@ GitHub signed webhook → API → MongoDB authoritative state
                                             Worker execution plane
 ```
 
-The API validates Phase 2 domain input and persists state. It will request work
-after the Phase 3 queue boundary exists. The worker will
-load authoritative project/deployment state and run the pipeline. Long-running
-CI and deployment operations must never run inside HTTP handlers. Queue,
-signed-webhook receipt, and delivery-processing behavior are future work and are
-not implemented by Phase 2. BullMQ remains the planned queue technology; no
-queue or deployment behavior is implemented yet.
+The flow through the worker's initial authoritative state claim is implemented
+in Phase 3. Later phases extend the worker from `RUNNING/CHECKOUT` into the CI
+and deployment pipeline. Long-running CI and deployment operations must never
+run inside HTTP handlers.
 
 The implemented domain keeps overall deployment status separate from pipeline
-stage and records the exact commit SHA. Phase 3 must use the implemented unique
-delivery constraint to make GitHub delivery processing idempotent. Status
+stage and records the exact commit SHA. Phase 3 uses the unique delivery
+constraint plus recoverable state to make processing idempotent. Status
 (`QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`, `ROLLED_BACK`) describes the outcome;
 the worker will drive stage progress in later phases.
 
@@ -148,8 +180,8 @@ is intentionally deferred until that phase.
 ## Technology direction
 
 The implemented foundation uses Node.js, Express, React, Vite, TypeScript,
-native MongoDB, Redis, Zod, Pino, and ioredis. The product direction retains
-BullMQ for asynchronous jobs; SSH to Linux/EC2, PM2, and Nginx belong to remote
+native MongoDB, Redis, Zod, Pino, ioredis, and BullMQ. SSH to Linux/EC2, PM2,
+and Nginx belong to remote
 release deployment; Server-Sent Events are preferred later for server-to-browser
 status and log streams. Phosphor icons and the shadcn-inspired visual system
 belong to the later dashboard phase. No technology is added solely for résumé
@@ -158,8 +190,8 @@ value.
 ## Architectural guardrails
 
 Keep controllers thin, validate at boundaries, and keep GitHub and queue
-integrations behind focused modules. Prefer identifiers such as `deploymentId`
-in queue payloads so MongoDB remains authoritative. Do not introduce a major
+integrations behind focused modules. Queue payloads contain only `deploymentId`
+so MongoDB remains authoritative. Do not introduce a major
 technology or package for appearance or résumé value. Authentication and
 isolation for untrusted build commands remain explicit future security work. The
 Phase 1 process boundary is useful, but it does not yet provide authentication,

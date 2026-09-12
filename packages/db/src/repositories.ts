@@ -4,9 +4,13 @@ import {
   createProject,
   createQueuedDeployment,
   createWebhookEvent,
+  assertDeploymentState,
+  assertWebhookEventState,
+  normalizeProjectCoordinates,
   DEPLOYMENT_STAGES,
   DEPLOYMENT_STATUSES,
   transitionDeployment,
+  transitionWebhookEvent,
   type Deployment,
   type DeploymentCreateInput,
   type DeploymentTransition,
@@ -15,6 +19,8 @@ import {
   type Provider,
   type WebhookEvent,
   type WebhookEventCreateInput,
+  type WebhookEventTransition,
+  WEBHOOK_PROCESSING_STATUSES,
 } from './domain.js';
 import {
   ConcurrencyError,
@@ -23,6 +29,7 @@ import {
   InvalidTransitionError,
   NotFoundError,
   PersistenceError,
+  ValidationError,
 } from './errors.js';
 import {
   decodeCursor,
@@ -55,6 +62,11 @@ function containsControlCharacter(value: string): boolean {
 export interface ProjectRepository {
   create(input: ProjectCreateInput): Promise<Project>;
   findById(id: string): Promise<Project | null>;
+  findByCoordinates(
+    owner: string,
+    repository: string,
+    provider?: Provider,
+  ): Promise<Project | null>;
   list(options?: PageOptions): Promise<Page<Project>>;
 }
 
@@ -63,6 +75,7 @@ export interface DeploymentRepository {
   /** Compatibility alias for internal callers; new code should use createQueued. */
   create?(input: DeploymentCreateInput): Promise<Deployment>;
   findById(id: string): Promise<Deployment | null>;
+  findBySourceWebhookEventId(sourceWebhookEventId: string): Promise<Deployment | null>;
   listByProject(projectId: string, options?: PageOptions): Promise<Page<Deployment>>;
   transition(id: string, transition: DeploymentTransition): Promise<Deployment>;
 }
@@ -73,7 +86,11 @@ export interface WebhookEventRepository {
     deliveryId: string,
     provider?: Provider,
   ): Promise<WebhookEvent | null>;
+  transition(id: string, transition: WebhookEventTransition): Promise<WebhookEvent>;
+  listPending(limit?: number): Promise<readonly WebhookEvent[]>;
 }
+
+export const WEBHOOK_PENDING_MAX = 100;
 
 export interface DomainRepositories {
   readonly projects: ProjectRepository;
@@ -144,11 +161,14 @@ function deploymentFromDocument(document: Document): Deployment {
     !DEPLOYMENT_STATUSES.includes(value.status as Deployment['status']) ||
     typeof value.stage !== 'string' ||
     !DEPLOYMENT_STAGES.includes(value.stage as Deployment['stage']) ||
-    !Number.isSafeInteger(value.version)
+    !Number.isSafeInteger(value.version) ||
+    (value.sourceWebhookEventId !== undefined &&
+      (typeof value.sourceWebhookEventId !== 'string' ||
+        !UUID_PATTERN.test(value.sourceWebhookEventId)))
   ) {
     throw new PersistenceError();
   }
-  return {
+  const record: Deployment = {
     id: value._id,
     projectId: value.projectId,
     provider: value.provider,
@@ -156,9 +176,18 @@ function deploymentFromDocument(document: Document): Deployment {
     status: value.status as Deployment['status'],
     stage: value.stage as Deployment['stage'],
     version: value.version as number,
+    ...(value.sourceWebhookEventId === undefined
+      ? {}
+      : { sourceWebhookEventId: value.sourceWebhookEventId }),
     createdAt: asDate(value.createdAt),
     updatedAt: asDate(value.updatedAt),
   };
+  try {
+    assertDeploymentState(record.status, record.stage);
+  } catch {
+    throw new PersistenceError();
+  }
+  return record;
 }
 
 function webhookFromDocument(document: Document): WebhookEvent {
@@ -196,15 +225,71 @@ function webhookFromDocument(document: Document): WebhookEvent {
   ) {
     throw new PersistenceError();
   }
-  return {
+  const processingStatus = value.processingStatus ?? 'RECEIVED';
+  if (!WEBHOOK_PROCESSING_STATUSES.includes(processingStatus)) {
+    throw new PersistenceError();
+  }
+  const version = value.version ?? 1;
+  const updatedAt = value.updatedAt ?? value.createdAt;
+  if (
+    typeof value.payloadSha256 !== 'undefined' &&
+    (typeof value.payloadSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(value.payloadSha256))
+  ) {
+    throw new PersistenceError();
+  }
+  if (value.ignoredReason !== undefined && typeof value.ignoredReason !== 'string') {
+    throw new PersistenceError();
+  }
+  if (
+    typeof version !== 'number' ||
+    !Number.isSafeInteger(version) ||
+    version < 1 ||
+    !updatedAt
+  ) {
+    throw new PersistenceError();
+  }
+  const optionalUuid = (field: unknown): boolean =>
+    field === undefined || (typeof field === 'string' && UUID_PATTERN.test(field));
+  if (
+    !optionalUuid(value.projectId) ||
+    !optionalUuid(value.deploymentId) ||
+    (value.commitSha !== undefined &&
+      (typeof value.commitSha !== 'string' || !/^[0-9a-f]{40}$/.test(value.commitSha)))
+  ) {
+    throw new PersistenceError();
+  }
+  const ignoredReason =
+    typeof value.ignoredReason === 'string'
+      ? (value.ignoredReason as NonNullable<WebhookEvent['ignoredReason']>)
+      : undefined;
+  const record: WebhookEvent = {
     id: value._id,
     provider: value.provider,
     deliveryId: value.deliveryId,
     eventName: value.eventName,
     ...(typeof value.action === 'string' ? { action: value.action } : {}),
     metadata: { ...value.metadata },
+    ...(typeof value.payloadSha256 === 'string'
+      ? { payloadSha256: value.payloadSha256.toLowerCase() }
+      : {}),
+    processingStatus,
+    version,
+    updatedAt: asDate(updatedAt),
+    ...(typeof value.projectId === 'string' ? { projectId: value.projectId } : {}),
+    ...(typeof value.commitSha === 'string' ? { commitSha: value.commitSha } : {}),
+    ...(typeof value.deploymentId === 'string'
+      ? { deploymentId: value.deploymentId }
+      : {}),
+    ...(ignoredReason === undefined ? {} : { ignoredReason }),
     createdAt: asDate(value.createdAt),
   };
+  try {
+    assertWebhookEventState(record);
+  } catch {
+    throw new PersistenceError();
+  }
+  return record;
 }
 
 function listFilter(
@@ -280,6 +365,21 @@ function createProjectsRepository(
         mapMongoError(error);
       }
     },
+    async findByCoordinates(owner, repository, provider = 'github') {
+      if (provider !== 'github') throw new PersistenceError();
+      const { owner: normalizedOwner, repository: normalizedRepository } =
+        normalizeProjectCoordinates({ owner, repository });
+      try {
+        const document = await collection.findOne({
+          provider,
+          owner: normalizedOwner,
+          repository: normalizedRepository,
+        });
+        return document ? projectFromDocument(document) : null;
+      } catch (error) {
+        mapMongoError(error);
+      }
+    },
     list(options) {
       return newestFirstPage(collection, {}, options, projectFromDocument);
     },
@@ -304,6 +404,16 @@ function createDeploymentsRepository(
     async findById(id) {
       try {
         const document = await collection.findOne({ _id: id });
+        return document ? deploymentFromDocument(document) : null;
+      } catch (error) {
+        mapMongoError(error);
+      }
+    },
+    async findBySourceWebhookEventId(sourceWebhookEventId) {
+      if (!UUID_PATTERN.test(sourceWebhookEventId))
+        throw new ValidationError('source webhook event ID is invalid');
+      try {
+        const document = await collection.findOne({ sourceWebhookEventId });
         return document ? deploymentFromDocument(document) : null;
       } catch (error) {
         mapMongoError(error);
@@ -367,6 +477,63 @@ function createWebhookEventsRepository(
       try {
         const document = await collection.findOne({ provider, deliveryId });
         return document ? webhookFromDocument(document) : null;
+      } catch (error) {
+        mapMongoError(error);
+      }
+    },
+    async transition(id, requested) {
+      if (!UUID_PATTERN.test(id)) throw new PersistenceError();
+      try {
+        const currentDocument = await collection.findOne({ _id: id });
+        if (!currentDocument) throw new NotFoundError();
+        const current = webhookFromDocument(currentDocument);
+        if (requested.expectedVersion !== current.version) throw new ConcurrencyError();
+        const next = transitionWebhookEvent(current, requested);
+        const set: Document = {
+          processingStatus: next.processingStatus,
+          updatedAt: next.updatedAt,
+        };
+        const unset: Document = {};
+        if (next.projectId === undefined) unset.projectId = '';
+        else set.projectId = next.projectId;
+        if (next.commitSha === undefined) unset.commitSha = '';
+        else set.commitSha = next.commitSha;
+        if (next.deploymentId === undefined) unset.deploymentId = '';
+        else set.deploymentId = next.deploymentId;
+        if (next.ignoredReason === undefined) unset.ignoredReason = '';
+        else set.ignoredReason = next.ignoredReason;
+        const update: UpdateFilter<StoredWebhookEvent> = {
+          $set: set,
+          $inc: { version: 1 },
+          ...(Object.keys(unset).length === 0 ? {} : { $unset: unset }),
+        };
+        const result = await collection.updateOne(
+          { _id: id, version: requested.expectedVersion },
+          update,
+        );
+        if (result.matchedCount !== 1) throw new ConcurrencyError();
+        return next;
+      } catch (error) {
+        if (error instanceof NotFoundError || error instanceof ConcurrencyError)
+          throw error;
+        if (error instanceof InvalidTransitionError) throw error;
+        mapMongoError(error);
+      }
+    },
+    async listPending(limit = 25) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > WEBHOOK_PENDING_MAX) {
+        throw new ValidationError('pending webhook limit must be between 1 and 100');
+      }
+      try {
+        const documents = await collection
+          .find({
+            processingStatus: { $in: ['RECEIVED', 'QUEUE_PENDING'] },
+            payloadSha256: { $exists: true },
+          })
+          .sort({ updatedAt: 1, createdAt: 1, _id: 1 })
+          .limit(limit)
+          .toArray();
+        return documents.map(webhookFromDocument);
       } catch (error) {
         mapMongoError(error);
       }

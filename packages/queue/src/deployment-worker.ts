@@ -1,0 +1,65 @@
+import { Worker, type Job, type Processor, type WorkerOptions } from 'bullmq';
+
+import {
+  DEPLOYMENT_QUEUE_NAME,
+  parseDeploymentJobData,
+  type DeploymentJobData,
+  type QueueConnection,
+} from './deployment-queue.js';
+
+export interface WorkerLike {
+  waitUntilReady(): Promise<unknown>;
+  close(): Promise<void>;
+}
+
+export type DeploymentJobProcessor = (job: DeploymentJobData) => Promise<void>;
+
+export interface DeploymentWorkerDependencies {
+  createWorker?: (
+    name: string,
+    processor: Processor<DeploymentJobData, void>,
+    options: WorkerOptions,
+  ) => WorkerLike;
+}
+
+function defaultWorker(
+  name: string,
+  processor: Processor<DeploymentJobData, void>,
+  options: WorkerOptions,
+): WorkerLike {
+  return new Worker<DeploymentJobData, void>(name, processor, options);
+}
+
+export interface DeploymentWorker {
+  waitUntilReady(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export function createDeploymentWorker(
+  connection: QueueConnection,
+  processor: DeploymentJobProcessor,
+  options: Pick<WorkerOptions, 'concurrency' | 'prefix'> = {},
+  dependencies: DeploymentWorkerDependencies = {},
+): DeploymentWorker {
+  const worker = (dependencies.createWorker ?? defaultWorker)(
+    DEPLOYMENT_QUEUE_NAME,
+    async (job: Job<DeploymentJobData>) => {
+      await processor(parseDeploymentJobData(job.data));
+    },
+    {
+      connection,
+      concurrency: options.concurrency ?? 1,
+      ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
+    },
+  );
+  let closing: Promise<void> | undefined;
+  return {
+    async waitUntilReady() {
+      await worker.waitUntilReady();
+    },
+    close() {
+      closing ??= worker.close();
+      return closing;
+    },
+  };
+}

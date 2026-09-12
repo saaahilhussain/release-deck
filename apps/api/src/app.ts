@@ -9,9 +9,16 @@ import {
   isNotFoundError,
   NotFoundError,
   PayloadTooLargeError,
+  UnsupportedMediaTypeError,
 } from './errors.js';
 import { createApiRouter } from './routes.js';
 import type { ApiRepositories } from './services.js';
+import {
+  createGithubWebhookRouter,
+  GithubWebhookProcessor,
+  githubWebhookRawBodyParser,
+  type DeploymentQueueProducer,
+} from './webhooks.js';
 
 export interface HealthDependency {
   ping(): Promise<void>;
@@ -23,11 +30,34 @@ export interface AppDependencies {
   logger: Logger;
   healthTimeoutMs?: number;
   repositories?: ApiRepositories;
+  githubWebhookSecret?: string;
+  deploymentQueue?: DeploymentQueueProducer;
+  githubWebhookProcessor?: GithubWebhookProcessor;
 }
 
 export function createApp(dependencies: AppDependencies): Express {
   const app = express();
   app.disable('x-powered-by');
+
+  // Preserve exact webhook bytes for HMAC verification before JSON parsing.
+  if (dependencies.repositories) {
+    const webhookProcessor =
+      dependencies.githubWebhookProcessor ??
+      new GithubWebhookProcessor(dependencies.repositories, {
+        ...(dependencies.githubWebhookSecret === undefined
+          ? {}
+          : { secret: dependencies.githubWebhookSecret }),
+        ...(dependencies.deploymentQueue === undefined
+          ? {}
+          : { queue: dependencies.deploymentQueue }),
+      });
+    app.use(
+      '/api/webhooks/github',
+      githubWebhookRawBodyParser(),
+      createGithubWebhookRouter(webhookProcessor),
+    );
+  }
+
   app.use(express.json({ limit: '64kb' }));
 
   app.get('/health', async (_request, response) => {
@@ -83,6 +113,8 @@ function apiErrorHandler(logger: Logger): ErrorRequestHandler {
       error = new PayloadTooLargeError();
     } else if (parserError.type === 'entity.parse.failed') {
       error = new BadRequestError('malformed JSON');
+    } else if (parserError.type === 'entity.unsupported') {
+      error = new UnsupportedMediaTypeError();
     }
 
     if (!(error instanceof ApiError)) {

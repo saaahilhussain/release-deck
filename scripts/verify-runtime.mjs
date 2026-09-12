@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { startApi } from '../apps/api/dist/server.js';
 
 // Opt-in integration checks. Requires built apps and running development services.
-// API startup ensures Phase 2 indexes; no domain records or Redis keys are written.
+// API startup ensures domain indexes and initializes the Phase 3 queue boundary.
 const root = new URL('../', import.meta.url);
 const environment = {
   ...process.env,
@@ -17,6 +17,8 @@ const environment = {
   HOST: '127.0.0.1',
   MONGODB_URI: process.env.MONGODB_URI ?? 'mongodb://127.0.0.1:27017/releasedeck',
   REDIS_URL: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+  GITHUB_WEBHOOK_SECRET:
+    process.env.GITHUB_WEBHOOK_SECRET ?? 'releasedeck-runtime-verification-secret',
 };
 const children = new Set();
 
@@ -120,10 +122,10 @@ try {
 
   const worker = launch('worker', {}, true);
   await waitFor(
-    () => worker.output().includes('worker connected and waiting'),
+    () => worker.output().includes('worker connected and consuming deployment jobs'),
     'worker startup',
   );
-  console.log('PASS worker: connects and waits without starting deployment jobs');
+  console.log('PASS worker: connects and consumes the deployment queue');
 
   await expectFailure('api', { PORT: String(port) }, 'occupied listen port');
   for (const app of ['api', 'worker']) {

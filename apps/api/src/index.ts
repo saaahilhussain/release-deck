@@ -1,4 +1,5 @@
 import { connectMongo, initializeDomainRepositories } from '@releasedeck/db';
+import { createDeploymentQueue } from '@releasedeck/queue';
 import {
   connectRedis,
   createLogger,
@@ -18,6 +19,7 @@ try {
   const started = await startApi(environment, {
     connectMongo,
     connectRedis,
+    createDeploymentQueue,
     initializeDomainRepositories,
     logger,
   });

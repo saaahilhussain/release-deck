@@ -9,12 +9,26 @@ const validEnvironment = {
   LOG_LEVEL: 'info',
   MONGODB_URI: 'mongodb://user:secret@127.0.0.1:27017/releasedeck',
   REDIS_URL: 'redis://default:secret@127.0.0.1:6379',
+  GITHUB_WEBHOOK_SECRET: 'phase3-test-webhook-secret',
 };
 
 test('parses API defaults', () => {
   const environment = parseApiEnvironment(validEnvironment);
   assert.equal(environment.HOST, '127.0.0.1');
   assert.equal(environment.PORT, 3_000);
+});
+
+test('requires a sufficiently long GitHub webhook secret', () => {
+  assert.equal(
+    parseApiEnvironment(validEnvironment).GITHUB_WEBHOOK_SECRET,
+    'phase3-test-webhook-secret',
+  );
+  assert.throws(
+    () => parseApiEnvironment({ ...validEnvironment, GITHUB_WEBHOOK_SECRET: 'short' }),
+    (error: unknown) =>
+      error instanceof ConfigurationError &&
+      /GITHUB_WEBHOOK_SECRET/.test(error.message),
+  );
 });
 
 for (const [field, value] of [

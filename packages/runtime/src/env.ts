@@ -61,6 +61,7 @@ const commonEnvironmentSchema = z.object({
 const apiEnvironmentSchema = commonEnvironmentSchema.extend({
   HOST: z.string().min(1).default('127.0.0.1'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
+  GITHUB_WEBHOOK_SECRET: z.string().min(16),
 });
 
 export type RuntimeEnvironment = z.infer<typeof commonEnvironmentSchema>;
