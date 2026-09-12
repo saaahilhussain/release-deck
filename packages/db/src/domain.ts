@@ -102,9 +102,11 @@ export const CI_FAILURE_KINDS = [
 export type CiFailureKind = (typeof CI_FAILURE_KINDS)[number];
 
 export const MAX_CI_STEP_RESULTS = 4;
-export const MAX_CI_OUTPUT_BYTES = 262_144;
+export const MAX_CI_OUTPUT_BYTES = 1_048_576;
 export const MAX_CI_MESSAGE_BYTES = 2_000;
-export const DEFAULT_CI_LEASE_MS = 30_000;
+// Keep persistence bounds aligned with the runtime's configured CI lease range.
+export const DEFAULT_CI_LEASE_MS = 60_000;
+export const MIN_CI_LEASE_MS = 10_000;
 export const MAX_CI_LEASE_MS = 300_000;
 
 export interface CiFailure {
@@ -113,6 +115,14 @@ export interface CiFailure {
   readonly retryable: boolean;
   readonly exitCode?: number;
   readonly signal?: string;
+}
+
+export const CI_CLEANUP_STATUSES = ['CLEANED', 'FAILED'] as const;
+export type CiCleanupStatus = (typeof CI_CLEANUP_STATUSES)[number];
+
+export interface CiCleanupEvidence {
+  readonly status: CiCleanupStatus;
+  readonly completedAt: Date;
 }
 
 export interface CiStepResult {
@@ -155,6 +165,8 @@ export interface DeploymentCiExecution {
   readonly startedAt?: Date;
   readonly finishedAt?: Date;
   readonly failure?: CiFailure;
+  /** Set when the attempt's disposable workspace cleanup has completed. */
+  readonly cleanup?: CiCleanupEvidence;
   readonly stepResults: readonly CiStepResult[];
 }
 
@@ -177,6 +189,8 @@ export interface CiStepOutcomeInput extends CiStepResultInput {
   readonly expectedVersion: number;
   readonly attemptId: string;
   readonly fence: number;
+  /** Required for terminal outcomes and the final BUILD outcome. */
+  readonly cleanup?: CiCleanupEvidence;
 }
 
 export interface WebhookEvent {
@@ -671,7 +685,12 @@ function byteLength(value: string): number {
 
 function assertCiFailure(failure: CiFailure | undefined): void {
   if (failure === undefined) return;
-  if (!CI_FAILURE_KINDS.includes(failure.kind) || typeof failure.message !== 'string') {
+  if (
+    typeof failure !== 'object' ||
+    failure === null ||
+    !CI_FAILURE_KINDS.includes(failure.kind) ||
+    typeof failure.message !== 'string'
+  ) {
     throw new ValidationError('CI failure is invalid');
   }
   if (!failure.message.trim() || byteLength(failure.message) > MAX_CI_MESSAGE_BYTES) {
@@ -682,7 +701,9 @@ function assertCiFailure(failure: CiFailure | undefined): void {
   }
   if (
     failure.exitCode !== undefined &&
-    (!Number.isSafeInteger(failure.exitCode) || failure.exitCode < 0 || failure.exitCode > 255)
+    (!Number.isSafeInteger(failure.exitCode) ||
+      failure.exitCode < 0 ||
+      failure.exitCode > 255)
   ) {
     throw new ValidationError('CI failure exit code is invalid');
   }
@@ -694,8 +715,63 @@ function assertCiFailure(failure: CiFailure | undefined): void {
   }
 }
 
+function failureMatchesStage(
+  stage: CiStage,
+  status: CiStepStatus,
+  failure: CiFailure,
+): boolean {
+  if (status === 'TIMED_OUT') return failure.kind === 'COMMAND_TIMEOUT';
+  if (
+    failure.kind === 'SPAWN_FAILED' ||
+    failure.kind === 'WORKSPACE_FAILED' ||
+    failure.kind === 'LEASE_LOST' ||
+    failure.kind === 'CANCELLED'
+  ) {
+    return true;
+  }
+  return failure.kind === `${stage}_FAILED`;
+}
+
+function sameFailure(
+  left: CiFailure | undefined,
+  right: CiFailure | undefined,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function assertCiCleanupEvidence(cleanup: CiCleanupEvidence | undefined): void {
+  if (cleanup === undefined) return;
+  if (
+    typeof cleanup !== 'object' ||
+    cleanup === null ||
+    !CI_CLEANUP_STATUSES.includes(cleanup.status) ||
+    !isDate(cleanup.completedAt)
+  ) {
+    throw new ValidationError('CI cleanup evidence is invalid');
+  }
+}
+
+export function assertCiOutcomeCleanup(
+  stage: CiStage,
+  status: CiStepStatus,
+  cleanup: CiCleanupEvidence | undefined,
+): void {
+  assertCiCleanupEvidence(cleanup);
+  const requiresCleanup = status !== 'PASSED' || stage === 'BUILD';
+  if (requiresCleanup && cleanup === undefined) {
+    throw new ValidationError('terminal CI outcome requires cleanup evidence');
+  }
+  if (!requiresCleanup && cleanup !== undefined) {
+    throw new ValidationError(
+      'intermediate CI outcome cannot include cleanup evidence',
+    );
+  }
+}
+
 function assertCiStepResult(result: CiStepResult): void {
   if (
+    typeof result !== 'object' ||
+    result === null ||
     !CI_STAGES.includes(result.stage) ||
     !CI_STEP_STATUSES.includes(result.status) ||
     !UUID_PATTERN.test(result.attemptId) ||
@@ -723,6 +799,12 @@ function assertCiStepResult(result: CiStepResult): void {
     throw new ValidationError('failed CI step requires a failure');
   }
   assertCiFailure(result.failure);
+  if (
+    result.failure !== undefined &&
+    !failureMatchesStage(result.stage, result.status, result.failure)
+  ) {
+    throw new ValidationError('CI failure does not match its stage or status');
+  }
 }
 
 /** Validate and normalize one bounded CI result before persistence. */
@@ -732,11 +814,29 @@ export function createCiStepResult(
   input: CiStepResultInput,
 ): CiStepResult {
   const normalizedAttemptId = attemptId.trim().toLowerCase();
-  if (!UUID_PATTERN.test(normalizedAttemptId) || !Number.isSafeInteger(fence) || fence < 1) {
+  if (
+    !UUID_PATTERN.test(normalizedAttemptId) ||
+    !Number.isSafeInteger(fence) ||
+    fence < 1
+  ) {
     throw new ValidationError('CI fencing token is invalid');
   }
-  if (!isDate(input.startedAt) || !isDate(input.finishedAt)) {
+  if (
+    typeof input !== 'object' ||
+    input === null ||
+    !isDate(input.startedAt) ||
+    !isDate(input.finishedAt)
+  ) {
     throw new ValidationError('CI step timestamps are invalid');
+  }
+  if (
+    (input.stdout !== undefined && typeof input.stdout !== 'string') ||
+    (input.stderr !== undefined && typeof input.stderr !== 'string') ||
+    (input.stdoutTruncated !== undefined &&
+      typeof input.stdoutTruncated !== 'boolean') ||
+    (input.stderrTruncated !== undefined && typeof input.stderrTruncated !== 'boolean')
+  ) {
+    throw new ValidationError('CI step output is invalid');
   }
   const result: CiStepResult = {
     stage: input.stage,
@@ -771,6 +871,8 @@ export function assertCiExecutionState(
 ): void {
   if (ci === undefined) return; // Phase 2/3 deployments predate CI persistence.
   if (
+    typeof ci !== 'object' ||
+    ci === null ||
     !CI_EXECUTION_STATUSES.includes(ci.status) ||
     !Number.isSafeInteger(ci.attemptNumber) ||
     ci.attemptNumber < 0 ||
@@ -781,6 +883,8 @@ export function assertCiExecutionState(
   ) {
     throw new ValidationError('CI execution is invalid');
   }
+  assertCiCleanupEvidence(ci.cleanup);
+  assertCiFailure(ci.failure);
   const attemptRequired = ci.status !== 'NOT_STARTED';
   if (attemptRequired) {
     if (
@@ -800,6 +904,7 @@ export function assertCiExecutionState(
     ci.startedAt !== undefined ||
     ci.finishedAt !== undefined ||
     ci.failure !== undefined ||
+    ci.cleanup !== undefined ||
     ci.stepResults.length !== 0
   ) {
     throw new ValidationError('not-started CI execution has runtime state');
@@ -814,9 +919,33 @@ export function assertCiExecutionState(
       throw new ValidationError('CI step result fence does not match execution');
     }
   }
+  const finalResult = ci.stepResults.at(-1);
+  if (
+    ci.cleanup !== undefined &&
+    finalResult !== undefined &&
+    ci.cleanup.completedAt.valueOf() < finalResult.finishedAt.valueOf()
+  ) {
+    throw new ValidationError('CI cleanup cannot precede the final step result');
+  }
+  if (
+    ci.finishedAt !== undefined &&
+    finalResult !== undefined &&
+    ci.finishedAt.valueOf() < finalResult.finishedAt.valueOf()
+  ) {
+    throw new ValidationError('CI completion cannot precede the final step result');
+  }
+  if (
+    ci.cleanup !== undefined &&
+    ci.finishedAt !== undefined &&
+    ci.cleanup.completedAt.valueOf() > ci.finishedAt.valueOf()
+  ) {
+    throw new ValidationError('CI cleanup cannot follow execution completion');
+  }
   if (ci.status === 'NOT_STARTED') {
     if (deploymentStatus !== 'QUEUED' || deploymentStage !== 'QUEUED') {
-      throw new ValidationError('not-started CI execution has invalid deployment state');
+      throw new ValidationError(
+        'not-started CI execution has invalid deployment state',
+      );
     }
     return;
   }
@@ -832,12 +961,14 @@ export function assertCiExecutionState(
       !isDate(ci.startedAt) ||
       ci.finishedAt !== undefined ||
       ci.failure !== undefined ||
+      ci.cleanup !== undefined ||
       ci.stepResults.some((result) => result.status !== 'PASSED') ||
       ci.stepResults.length !== CI_STAGES.indexOf(deploymentStage as CiStage)
     ) {
       throw new ValidationError('running CI execution is invalid');
     }
   } else if (ci.status === 'RETRY_PENDING') {
+    const lastResult = ci.stepResults.at(-1);
     if (
       deploymentStatus !== 'RUNNING' ||
       !CI_STAGES.includes(deploymentStage as CiStage) ||
@@ -846,8 +977,12 @@ export function assertCiExecutionState(
       !isDate(ci.startedAt) ||
       ci.finishedAt !== undefined ||
       ci.failure === undefined ||
+      ci.cleanup === undefined ||
       ci.stepResults.length !== CI_STAGES.indexOf(deploymentStage as CiStage) + 1 ||
-      ci.stepResults.at(-1)?.status === 'PASSED'
+      lastResult?.stage !== deploymentStage ||
+      lastResult?.status === 'PASSED' ||
+      lastResult.failure?.retryable !== true ||
+      !sameFailure(ci.failure, lastResult.failure)
     ) {
       throw new ValidationError('retry-pending CI execution is invalid');
     }
@@ -862,6 +997,7 @@ export function assertCiExecutionState(
       !isDate(ci.startedAt) ||
       !isDate(ci.finishedAt) ||
       ci.failure !== undefined ||
+      ci.cleanup?.status !== 'CLEANED' ||
       ci.stepResults.length !== buildIndex + 1 ||
       ci.stepResults.at(-1)?.stage !== 'BUILD' ||
       ci.stepResults.at(-1)?.status !== 'PASSED'
@@ -869,6 +1005,7 @@ export function assertCiExecutionState(
       throw new ValidationError('passed CI execution is invalid');
     }
   } else {
+    const lastResult = ci.stepResults.at(-1);
     if (
       deploymentStatus !== 'FAILED' ||
       !CI_STAGES.includes(deploymentStage as CiStage) ||
@@ -877,10 +1014,15 @@ export function assertCiExecutionState(
       !isDate(ci.startedAt) ||
       !isDate(ci.finishedAt) ||
       ci.failure === undefined ||
-      ci.stepResults.at(-1)?.status === 'PASSED'
+      ci.cleanup === undefined ||
+      ci.stepResults.length === 0 ||
+      ci.stepResults.length !== CI_STAGES.indexOf(deploymentStage as CiStage) + 1 ||
+      lastResult?.stage !== deploymentStage ||
+      lastResult?.status !== (ci.status === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED') ||
+      ci.failure.retryable !== false ||
+      !sameFailure(ci.failure, lastResult?.failure)
     ) {
       throw new ValidationError('failed CI execution is invalid');
     }
   }
-  assertCiFailure(ci.failure);
 }

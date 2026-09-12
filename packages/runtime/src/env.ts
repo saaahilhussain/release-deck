@@ -97,14 +97,9 @@ const workerEnvironmentSchema = commonEnvironmentSchema
       .number()
       .int()
       .min(1_024)
-      .max(16_777_216)
+      .max(1_048_576)
       .default(1_048_576),
-    CI_LEASE_MS: z.coerce
-      .number()
-      .int()
-      .min(61_000)
-      .max(172_800_000)
-      .default(2_400_000),
+    CI_LEASE_MS: z.coerce.number().int().min(10_000).max(300_000).default(60_000),
     CI_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
   })
   .superRefine((value, context) => {
@@ -113,13 +108,6 @@ const workerEnvironmentSchema = commonEnvironmentSchema
         code: 'custom',
         path: ['CI_TOTAL_TIMEOUT_MS'],
         message: 'must be at least CI_STEP_TIMEOUT_MS',
-      });
-    }
-    if (value.CI_LEASE_MS < value.CI_TOTAL_TIMEOUT_MS + 60_000) {
-      context.addIssue({
-        code: 'custom',
-        path: ['CI_LEASE_MS'],
-        message: 'must exceed CI_TOTAL_TIMEOUT_MS by at least 60000ms',
       });
     }
   });

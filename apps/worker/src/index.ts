@@ -4,7 +4,7 @@ import {
   createLogger,
   errorForLog,
   loadAppEnvironment,
-  parseRuntimeEnvironment,
+  parseWorkerEnvironment,
 } from '@releasedeck/runtime';
 
 import { startWorker } from './worker.js';
@@ -13,7 +13,7 @@ loadAppEnvironment();
 
 let logger = createLogger();
 try {
-  const environment = parseRuntimeEnvironment();
+  const environment = parseWorkerEnvironment();
   logger = createLogger(environment.LOG_LEVEL);
   const worker = await startWorker(environment, { connectMongo, connectRedis, logger });
   logger.info('worker connected and consuming deployment jobs');

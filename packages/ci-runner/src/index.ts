@@ -1,5 +1,6 @@
 export {
   CI_STAGES,
+  CiCleanupError,
   CiStepError,
   createCiRunner,
   type CiLimits,
@@ -23,4 +24,8 @@ export {
   type ProcessResult,
   type ProcessRunner,
 } from './process.js';
-export { createWorkspaceManager, type Workspace, type WorkspaceManager } from './workspace.js';
+export {
+  createWorkspaceManager,
+  type Workspace,
+  type WorkspaceManager,
+} from './workspace.js';

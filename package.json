@@ -8,13 +8,14 @@
   "scripts": {
     "dev": "pnpm run build:dependencies && turbo run dev",
     "build": "turbo run build",
-    "build:dependencies": "pnpm --filter @releasedeck/runtime build && pnpm --filter @releasedeck/db build && pnpm --filter @releasedeck/queue build",
+    "build:dependencies": "pnpm --filter @releasedeck/runtime build && pnpm --filter @releasedeck/db build && pnpm --filter @releasedeck/queue build && pnpm --filter @releasedeck/ci-runner build",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "lint": "turbo run lint && eslint scripts/*.mjs eslint.config.mjs",
     "verify:runtime": "pnpm run build && node scripts/verify-runtime.mjs",
     "verify:persistence": "pnpm run build && node scripts/verify-persistence.mjs",
     "verify:phase3": "pnpm run build && node scripts/verify-phase3.mjs",
+    "verify:phase4": "pnpm run build && node scripts/verify-phase4.mjs",
     "format:check": "prettier --check .",
     "format": "prettier --write ."
   },

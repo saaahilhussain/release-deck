@@ -37,10 +37,9 @@ test('parses worker defaults with an absolute OS-temp workspace root', () => {
   assert.equal(environment.CI_STEP_TIMEOUT_MS, 300_000);
   assert.equal(environment.CI_TOTAL_TIMEOUT_MS, 1_800_000);
   assert.equal(environment.CI_MAX_OUTPUT_BYTES, 1_048_576);
-  assert.equal(environment.CI_LEASE_MS, 2_400_000);
+  assert.equal(environment.CI_LEASE_MS, 60_000);
   assert.equal(environment.CI_CONCURRENCY, 1);
   assert.ok(environment.CI_TOTAL_TIMEOUT_MS >= environment.CI_STEP_TIMEOUT_MS);
-  assert.ok(environment.CI_LEASE_MS >= environment.CI_TOTAL_TIMEOUT_MS + 60_000);
 });
 
 test('accepts bounded worker settings and an absolute workspace root', () => {
@@ -50,13 +49,13 @@ test('accepts bounded worker settings and an absolute workspace root', () => {
     CI_STEP_TIMEOUT_MS: '1000',
     CI_TOTAL_TIMEOUT_MS: '61000',
     CI_MAX_OUTPUT_BYTES: '1024',
-    CI_LEASE_MS: '121000',
+    CI_LEASE_MS: '10000',
     CI_CONCURRENCY: '8',
   });
   assert.equal(environment.CI_STEP_TIMEOUT_MS, 1_000);
   assert.equal(environment.CI_TOTAL_TIMEOUT_MS, 61_000);
   assert.equal(environment.CI_MAX_OUTPUT_BYTES, 1_024);
-  assert.equal(environment.CI_LEASE_MS, 121_000);
+  assert.equal(environment.CI_LEASE_MS, 10_000);
   assert.equal(environment.CI_CONCURRENCY, 8);
 });
 
@@ -66,9 +65,9 @@ for (const [field, value] of [
   ['CI_STEP_TIMEOUT_MS', '86400001'],
   ['CI_TOTAL_TIMEOUT_MS', '86400001'],
   ['CI_MAX_OUTPUT_BYTES', '1023'],
-  ['CI_MAX_OUTPUT_BYTES', '16777217'],
-  ['CI_LEASE_MS', '60999'],
-  ['CI_LEASE_MS', '172800001'],
+  ['CI_MAX_OUTPUT_BYTES', '1048577'],
+  ['CI_LEASE_MS', '9999'],
+  ['CI_LEASE_MS', '300001'],
   ['CI_CONCURRENCY', '0'],
   ['CI_CONCURRENCY', '9'],
 ] as const) {
@@ -83,7 +82,7 @@ for (const [field, value] of [
   });
 }
 
-test('rejects worker cross-field timeout and lease violations', () => {
+test('rejects a total timeout shorter than a step timeout', () => {
   assert.throws(
     () =>
       parseWorkerEnvironment({
@@ -95,16 +94,6 @@ test('rejects worker cross-field timeout and lease violations', () => {
     (error: unknown) =>
       error instanceof ConfigurationError &&
       error.fields.includes('CI_TOTAL_TIMEOUT_MS'),
-  );
-  assert.throws(
-    () =>
-      parseWorkerEnvironment({
-        ...validWorkerEnvironment,
-        CI_TOTAL_TIMEOUT_MS: '120000',
-        CI_LEASE_MS: '179999',
-      }),
-    (error: unknown) =>
-      error instanceof ConfigurationError && error.fields.includes('CI_LEASE_MS'),
   );
 });
 

@@ -9,11 +9,14 @@ import {
 
 export interface WorkerLike {
   waitUntilReady(): Promise<unknown>;
+  cancelAllJobs(reason?: string): void;
   close(): Promise<void>;
 }
 
 export interface DeploymentJobContext {
   readonly signal?: AbortSignal;
+  readonly attemptsMade: number;
+  readonly maxAttempts: number;
 }
 
 export type DeploymentJobProcessor = (
@@ -51,10 +54,11 @@ export function createDeploymentWorker(
   const worker = (dependencies.createWorker ?? defaultWorker)(
     DEPLOYMENT_QUEUE_NAME,
     async (job: Job<DeploymentJobData>, _token?: string, signal?: AbortSignal) => {
-      await processor(
-        parseDeploymentJobData(job.data),
-        signal === undefined ? {} : { signal },
-      );
+      await processor(parseDeploymentJobData(job.data), {
+        attemptsMade: job.attemptsMade,
+        maxAttempts: job.opts.attempts ?? 1,
+        ...(signal === undefined ? {} : { signal }),
+      });
     },
     {
       connection,
@@ -68,7 +72,10 @@ export function createDeploymentWorker(
       await worker.waitUntilReady();
     },
     close() {
-      closing ??= worker.close();
+      if (!closing) {
+        worker.cancelAllJobs('ReleaseDeck worker is shutting down');
+        closing = worker.close();
+      }
       return closing;
     },
   };

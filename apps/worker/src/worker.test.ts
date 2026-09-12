@@ -7,16 +7,22 @@ import {
   DependencyError,
   errorForLog,
   type RedisConnection,
-  type RuntimeEnvironment,
+  type WorkerEnvironment,
 } from '@releasedeck/runtime';
 
 import { startWorker } from './worker.js';
 
-const environment: RuntimeEnvironment = {
+const environment: WorkerEnvironment = {
   NODE_ENV: 'test',
   LOG_LEVEL: 'silent',
   MONGODB_URI: 'mongodb://127.0.0.1/releasedeck',
   REDIS_URL: 'redis://127.0.0.1',
+  CI_WORKSPACE_ROOT: 'D:\\releasedeck-test-workspaces',
+  CI_STEP_TIMEOUT_MS: 5_000,
+  CI_TOTAL_TIMEOUT_MS: 10_000,
+  CI_MAX_OUTPUT_BYTES: 16_384,
+  CI_LEASE_MS: 30_000,
+  CI_CONCURRENCY: 2,
 };
 
 function repositories(): DomainRepositories {
@@ -106,6 +112,7 @@ test('worker uses BullMQ-safe Redis retry and blocking-command settings', async 
   let workerCloses = 0;
   let redisCloses = 0;
   let mongoCloses = 0;
+  let workerConcurrency: number | undefined;
   const mongo = {
     db: {},
     close: async () => {
@@ -125,16 +132,19 @@ test('worker uses BullMQ-safe Redis retry and blocking-command settings', async 
       redisOptions = options;
       return redis;
     },
-    createDeploymentWorker: () =>
-      workerStub(async () => {
+    createDeploymentWorker: (_connection, _processor, options) => {
+      workerConcurrency = options.concurrency;
+      return workerStub(async () => {
         workerCloses += 1;
-      }),
+      });
+    },
     logger: createLogger('silent'),
   });
   assert.deepEqual(redisOptions, {
     commandTimeoutMs: null,
     maxRetriesPerRequest: null,
   });
+  assert.equal(workerConcurrency, 2);
   await Promise.all([worker.close(), worker.close()]);
   assert.equal(workerCloses, 1);
   assert.equal(redisCloses, 1);

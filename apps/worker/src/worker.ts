@@ -1,9 +1,11 @@
 import {
   connectMongo,
   initializeDomainRepositories,
+  type DeploymentRepositoryWithCi,
   type DomainRepositories,
   type MongoConnection,
 } from '@releasedeck/db';
+import { createCiRunner, type CiRunner } from '@releasedeck/ci-runner';
 import {
   createDeploymentWorker as createQueueWorker,
   type DeploymentJobProcessor,
@@ -16,7 +18,7 @@ import {
   type Logger,
   type RedisConnection,
   type RedisConnectionOptions,
-  type RuntimeEnvironment,
+  type WorkerEnvironment,
 } from '@releasedeck/runtime';
 
 import { processDeploymentJob } from './processor.js';
@@ -36,18 +38,21 @@ export interface WorkerStartupDependencies {
   createDeploymentWorker?(
     connection: RedisConnection['client'],
     processor: DeploymentJobProcessor,
+    options: { readonly concurrency: number },
   ): DeploymentWorker;
+  createCiRunner?: typeof createCiRunner;
   logger: Logger;
 }
 
 export async function startWorker(
-  environment: RuntimeEnvironment,
+  environment: WorkerEnvironment,
   dependencies: WorkerStartupDependencies = {
     connectMongo,
     initializeDomainRepositories,
     connectRedis,
-    createDeploymentWorker: (connection, processor) =>
-      createQueueWorker(connection, processor),
+    createDeploymentWorker: (connection, processor, options) =>
+      createQueueWorker(connection, processor, options),
+    createCiRunner,
     logger: createLogger(environment.LOG_LEVEL),
   },
 ): Promise<WorkerRuntime> {
@@ -80,12 +85,35 @@ export async function startWorker(
     const connectedMongo = mongo;
     const connectedRedis = redis;
     const connectedRepositories = repositories;
-    const processJob: DeploymentJobProcessor = (job) =>
-      processDeploymentJob(job, connectedRepositories.deployments);
+    const runner: CiRunner = (dependencies.createCiRunner ?? createCiRunner)({
+      workspaceRoot: environment.CI_WORKSPACE_ROOT,
+      limits: {
+        checkoutTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
+        installTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
+        testTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
+        buildTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
+        totalTimeoutMs: environment.CI_TOTAL_TIMEOUT_MS,
+        outputLimitBytes: environment.CI_MAX_OUTPUT_BYTES,
+      },
+    });
+    const processJob: DeploymentJobProcessor = (job, context) =>
+      processDeploymentJob(
+        job,
+        context,
+        {
+          deployments: connectedRepositories.deployments as DeploymentRepositoryWithCi,
+          projects: connectedRepositories.projects,
+        },
+        runner,
+        { leaseMs: environment.CI_LEASE_MS },
+      );
     deploymentWorker = (
       dependencies.createDeploymentWorker ??
-      ((connection, processor) => createQueueWorker(connection, processor))
-    )(connectedRedis.client, processJob);
+      ((connection, processor, options) =>
+        createQueueWorker(connection, processor, options))
+    )(connectedRedis.client, processJob, {
+      concurrency: environment.CI_CONCURRENCY,
+    });
     await deploymentWorker.waitUntilReady();
 
     const connectedWorker = deploymentWorker;

@@ -20,6 +20,11 @@ export const DOMAIN_INDEXES = {
       key: { projectId: 1, createdAt: -1, _id: -1 },
       name: 'deployments_project_created_at_id',
     },
+    {
+      key: { 'ci.status': 1, 'ci.leaseExpiresAt': 1, _id: 1 },
+      name: 'deployments_ci_lease_expiry',
+      partialFilterExpression: { 'ci.status': { $exists: true } },
+    },
     { key: { createdAt: -1, _id: -1 }, name: 'deployments_created_at_id' },
   ],
   webhookEvents: [

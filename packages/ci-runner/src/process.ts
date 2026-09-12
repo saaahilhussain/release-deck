@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { delimiter, dirname, join } from 'node:path';
 
 export const DEFAULT_OUTPUT_LIMIT_BYTES = 256 * 1024;
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -26,7 +27,11 @@ export interface ProcessOptions {
 }
 
 export interface ProcessRunner {
-  run(command: string, args: readonly string[], options: ProcessOptions): Promise<ProcessResult>;
+  run(
+    command: string,
+    args: readonly string[],
+    options: ProcessOptions,
+  ): Promise<ProcessResult>;
 }
 
 export class ProcessTimeoutError extends Error {
@@ -47,34 +52,59 @@ export class ProcessCancelledError extends Error {
   }
 }
 
-function launchName(command: string): string {
-  if (process.platform !== 'win32') return command;
-  if (command === 'pnpm' || command === 'npm') return `${command}.cmd`;
-  return command;
+const FORCE_SETTLE_GRACE_MS = 1_000;
+
+function launch(
+  command: string,
+  args: readonly string[],
+): { command: string; args: readonly string[] } {
+  if (process.platform !== 'win32' || (command !== 'pnpm' && command !== 'npm')) {
+    return { command, args };
+  }
+  const scriptName = command === 'npm' ? 'npm-cli.js' : 'pnpm.cjs';
+  const candidates = [
+    join(dirname(process.execPath), 'node_modules', command, 'bin', scriptName),
+    ...(process.env.PATH ?? '')
+      .split(delimiter)
+      .map((entry) => join(entry, 'node_modules', command, 'bin', scriptName)),
+  ];
+  const script = candidates.find((candidate) => existsSync(candidate));
+  if (!script) throw new Error(`could not locate the fixed ${command} launcher`);
+  return { command: process.execPath, args: [script, ...args] };
 }
 
 function safeEnvironment(cwd: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error('PATH is not configured');
   const temp = join(cwd, '.tmp');
+  mkdirSync(temp, { recursive: true });
+  const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
   const env: NodeJS.ProcessEnv = {
     CI: 'true',
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: nullDevice,
     PATH: path,
     HOME: cwd,
+    TEMP: temp,
+    TMP: temp,
     TMPDIR: temp,
-    npm_config_cache: join(cwd, '.npm-cache'),
-    npm_config_userconfig: join(cwd, '.npmrc'),
-    npm_config_global: 'false',
+    NPM_CONFIG_CACHE: join(cwd, '.npm-cache'),
+    NPM_CONFIG_USERCONFIG: nullDevice,
+    NPM_CONFIG_GLOBAL: 'false',
+    COREPACK_HOME: join(cwd, '.corepack-cache'),
   };
-  for (const key of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'PATHEXT', 'ComSpec']) {
+  for (const key of ['SystemRoot', 'WINDIR', 'PATHEXT', 'ComSpec']) {
     if (process.env[key]) env[key] = process.env[key];
   }
   return env;
 }
 
-function appendOutput(state: { chunks: Buffer[]; bytes: number; truncated: boolean }, chunk: Buffer, limit: number): void {
+function appendOutput(
+  state: { chunks: Buffer[]; bytes: number; truncated: boolean },
+  chunk: Buffer,
+  limit: number,
+): void {
   if (state.bytes >= limit) {
     state.truncated = true;
     return;
@@ -87,20 +117,55 @@ function appendOutput(state: { chunks: Buffer[]; bytes: number; truncated: boole
 
 function sendSignal(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
+  const fallback = () => {
+    try {
+      child.kill(signal);
+    } catch {
+      // The child may have exited between taskkill and the fallback.
+    }
+  };
   if (process.platform === 'win32') {
-    const taskkill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-      shell: false,
-      windowsHide: true,
-      stdio: 'ignore',
-    });
-    taskkill.unref();
+    try {
+      const taskkill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+        shell: false,
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      taskkill.once('error', fallback);
+      taskkill.once('close', (exitCode) => {
+        if (exitCode !== 0) fallback();
+      });
+      taskkill.unref();
+    } catch {
+      fallback();
+    }
     return;
   }
   try {
     process.kill(-child.pid, signal);
   } catch {
-    child.kill(signal);
+    fallback();
   }
+}
+
+export function boundedUtf8(
+  bytes: Buffer,
+  limit: number,
+): { text: string; truncated: boolean } {
+  const clipped = bytes.subarray(0, limit);
+  let text = clipped.toString('utf8');
+  const encodedBytes = Buffer.byteLength(text, 'utf8');
+  if (encodedBytes > limit) {
+    let low = 0;
+    let high = text.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(text.slice(0, middle), 'utf8') <= limit) low = middle;
+      else high = middle - 1;
+    }
+    text = text.slice(0, low);
+  }
+  return { text, truncated: bytes.byteLength > limit || encodedBytes > limit };
 }
 
 function baseResult(
@@ -111,16 +176,19 @@ function baseResult(
   startedAt: number,
   exitCode: number | null,
   signal: NodeJS.Signals | null,
+  limit: number,
 ): ProcessResult {
+  const boundedStdout = boundedUtf8(Buffer.concat(stdout.chunks), limit);
+  const boundedStderr = boundedUtf8(Buffer.concat(stderr.chunks), limit);
   return {
     command,
     args: [...args],
     exitCode,
     signal,
-    stdout: Buffer.concat(stdout.chunks).toString('utf8'),
-    stderr: Buffer.concat(stderr.chunks).toString('utf8'),
-    stdoutTruncated: stdout.truncated,
-    stderrTruncated: stderr.truncated,
+    stdout: boundedStdout.text,
+    stderr: boundedStderr.text,
+    stdoutTruncated: stdout.truncated || boundedStdout.truncated,
+    stderrTruncated: stderr.truncated || boundedStderr.truncated,
     durationMs: Date.now() - startedAt,
   };
 }
@@ -130,15 +198,35 @@ export const defaultProcessRunner: ProcessRunner = {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const graceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const limit = options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError('process timeout is invalid');
-    if (!Number.isSafeInteger(graceMs) || graceMs < 0) throw new TypeError('kill grace period is invalid');
-    if (!Number.isSafeInteger(limit) || limit <= 0) throw new TypeError('output limit is invalid');
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)
+      throw new TypeError('process timeout is invalid');
+    if (!Number.isSafeInteger(graceMs) || graceMs < 0)
+      throw new TypeError('kill grace period is invalid');
+    if (!Number.isSafeInteger(limit) || limit <= 0)
+      throw new TypeError('output limit is invalid');
+
+    if (options.signal?.aborted) {
+      return Promise.reject(
+        new ProcessCancelledError({
+          command,
+          args: [...args],
+          exitCode: null,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          durationMs: 0,
+        }),
+      );
+    }
 
     return new Promise<ProcessResult>((resolve, reject) => {
       const startedAt = Date.now();
       const stdout = { chunks: [] as Buffer[], bytes: 0, truncated: false };
       const stderr = { chunks: [] as Buffer[], bytes: 0, truncated: false };
-      const child = spawn(launchName(command), [...args], {
+      const launched = launch(command, args);
+      const child = spawn(launched.command, [...launched.args], {
         cwd: options.cwd,
         env: safeEnvironment(options.cwd),
         shell: false,
@@ -148,15 +236,26 @@ export const defaultProcessRunner: ProcessRunner = {
       });
       let settled = false;
       let reason: 'timeout' | 'cancelled' | undefined;
-      let timer: NodeJS.Timeout | undefined;
+      const timer = setTimeout(() => terminate('timeout'), timeoutMs);
       let graceTimer: NodeJS.Timeout | undefined;
+      let forceTimer: NodeJS.Timeout | undefined;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
         if (graceTimer) clearTimeout(graceTimer);
+        if (forceTimer) clearTimeout(forceTimer);
         options.signal?.removeEventListener('abort', cancel);
-        const result = baseResult(command, args, stdout, stderr, startedAt, child.exitCode, child.signalCode);
+        const result = baseResult(
+          command,
+          args,
+          stdout,
+          stderr,
+          startedAt,
+          child.exitCode,
+          child.signalCode,
+          limit,
+        );
         if (error) reject(error);
         else if (reason === 'timeout') reject(new ProcessTimeoutError(result));
         else if (reason === 'cancelled') reject(new ProcessCancelledError(result));
@@ -166,17 +265,24 @@ export const defaultProcessRunner: ProcessRunner = {
         if (settled || reason) return;
         reason = why;
         sendSignal(child, 'SIGTERM');
-        graceTimer = setTimeout(() => sendSignal(child, 'SIGKILL'), graceMs);
+        graceTimer = setTimeout(() => {
+          sendSignal(child, 'SIGKILL');
+          forceTimer = setTimeout(() => finish(), FORCE_SETTLE_GRACE_MS);
+          forceTimer.unref();
+        }, graceMs);
         graceTimer.unref();
       };
       function cancel() {
         terminate('cancelled');
       }
-      child.stdout?.on('data', (chunk: Buffer | string) => appendOutput(stdout, Buffer.from(chunk), limit));
-      child.stderr?.on('data', (chunk: Buffer | string) => appendOutput(stderr, Buffer.from(chunk), limit));
+      child.stdout?.on('data', (chunk: Buffer | string) =>
+        appendOutput(stdout, Buffer.from(chunk), limit),
+      );
+      child.stderr?.on('data', (chunk: Buffer | string) =>
+        appendOutput(stderr, Buffer.from(chunk), limit),
+      );
       child.once('error', (error) => finish(error));
       child.once('close', () => finish());
-      timer = setTimeout(() => terminate('timeout'), timeoutMs);
       timer.unref();
       if (options.signal?.aborted) cancel();
       else options.signal?.addEventListener('abort', cancel, { once: true });

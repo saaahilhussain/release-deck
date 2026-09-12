@@ -3,8 +3,10 @@ export {
   loadAppEnvironment,
   parseApiEnvironment,
   parseRuntimeEnvironment,
+  parseWorkerEnvironment,
   type ApiEnvironment,
   type RuntimeEnvironment,
+  type WorkerEnvironment,
 } from './env.js';
 export { createLogger, DependencyError, errorForLog } from './logger.js';
 export {

@@ -12,6 +12,7 @@
     "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
+    "@releasedeck/ci-runner": "workspace:*",
     "@releasedeck/db": "workspace:*",
     "@releasedeck/queue": "workspace:*",
     "@releasedeck/runtime": "workspace:*"

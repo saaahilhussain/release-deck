@@ -7,7 +7,9 @@ import {
   createWebhookEvent,
   assertDeploymentState,
   assertCiExecutionState,
+  assertCiOutcomeCleanup,
   createCiStepResult,
+  nextCiStage,
   assertWebhookEventState,
   normalizeProjectCoordinates,
   DEPLOYMENT_STAGES,
@@ -15,12 +17,15 @@ import {
   transitionDeployment,
   transitionWebhookEvent,
   DEFAULT_CI_LEASE_MS,
+  MIN_CI_LEASE_MS,
   MAX_CI_LEASE_MS,
   CI_STAGES,
   type CiExecutionClaim,
   type CiExecutionLeaseInput,
   type CiStepOutcomeInput,
   type DeploymentCiExecution,
+  type DeploymentStage,
+  type DeploymentStatus,
   type Deployment,
   type DeploymentCreateInput,
   type DeploymentTransition,
@@ -88,6 +93,38 @@ export interface DeploymentRepository {
   findBySourceWebhookEventId(sourceWebhookEventId: string): Promise<Deployment | null>;
   listByProject(projectId: string, options?: PageOptions): Promise<Page<Deployment>>;
   transition(id: string, transition: DeploymentTransition): Promise<Deployment>;
+  claimCiExecution?(
+    id: string,
+    options?: CiExecutionClaimOptions,
+  ): Promise<CiExecutionClaim | null>;
+  reclaimExpiredCiExecution?(
+    id: string,
+    options?: CiExecutionReclaimOptions,
+  ): Promise<CiExecutionClaim | null>;
+  renewCiExecution?(
+    id: string,
+    lease: CiExecutionLeaseInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordCiStepOutcome?(
+    id: string,
+    outcome: CiStepOutcomeInput,
+    now?: Date,
+  ): Promise<Deployment>;
+}
+
+export interface CiExecutionClaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
+}
+
+export interface CiExecutionReclaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
+}
+
+/** Complete CI-capable repository contract; the base contract keeps Phase 2 mocks source-compatible. */
+export interface CiDeploymentRepository {
   claimCiExecution(
     id: string,
     options?: CiExecutionClaimOptions,
@@ -108,15 +145,7 @@ export interface DeploymentRepository {
   ): Promise<Deployment>;
 }
 
-export interface CiExecutionClaimOptions {
-  readonly now?: Date;
-  readonly leaseMs?: number;
-}
-
-export interface CiExecutionReclaimOptions {
-  readonly now?: Date;
-  readonly leaseMs?: number;
-}
+export type DeploymentRepositoryWithCi = DeploymentRepository & CiDeploymentRepository;
 
 export interface WebhookEventRepository {
   create(input: WebhookEventCreateInput): Promise<WebhookEvent>;
@@ -165,7 +194,11 @@ function ciNow(value: Date | undefined): Date {
 
 function ciLeaseMs(value: number | undefined): number {
   const leaseMs = value ?? DEFAULT_CI_LEASE_MS;
-  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > MAX_CI_LEASE_MS) {
+  if (
+    !Number.isSafeInteger(leaseMs) ||
+    leaseMs < MIN_CI_LEASE_MS ||
+    leaseMs > MAX_CI_LEASE_MS
+  ) {
     throw new ValidationError('CI lease duration is invalid');
   }
   return leaseMs;
@@ -464,6 +497,322 @@ function createDeploymentsRepository(
       mapMongoError(error);
     }
   };
+
+  const updateCiDeployment = async (
+    current: Deployment,
+    next: Deployment,
+    extraFilter: Document,
+  ): Promise<boolean> => {
+    const result = await collection.updateOne(
+      { _id: current.id, version: current.version, ...extraFilter },
+      {
+        $set: {
+          status: next.status,
+          stage: next.stage,
+          ci: next.ci as DeploymentCiExecution,
+          updatedAt: next.updatedAt,
+        },
+        $inc: { version: 1 },
+      },
+    );
+    return result.matchedCount === 1;
+  };
+
+  const claim = async (
+    id: string,
+    options: CiExecutionClaimOptions | undefined,
+    reclaimOnly: boolean,
+  ): Promise<CiExecutionClaim | null> => {
+    try {
+      const now = ciNow(options?.now);
+      const leaseMs = ciLeaseMs(options?.leaseMs);
+      if (!UUID_PATTERN.test(id)) throw new ValidationError('deployment ID is invalid');
+      const currentDocument = await collection.findOne({ _id: id });
+      if (!currentDocument) throw new NotFoundError();
+      const current = deploymentFromDocument(currentDocument);
+      const existing = current.ci;
+      if (existing?.status === 'RUNNING') {
+        if (
+          !reclaimOnly ||
+          existing.leaseExpiresAt === undefined ||
+          existing.leaseExpiresAt.valueOf() > now.valueOf()
+        ) {
+          return null;
+        }
+      } else if (reclaimOnly) {
+        return null;
+      }
+      if (
+        current.status === 'SUCCESS' ||
+        current.status === 'FAILED' ||
+        current.status === 'ROLLED_BACK' ||
+        existing?.status === 'PASSED' ||
+        existing?.status === 'FAILED' ||
+        existing?.status === 'TIMED_OUT'
+      ) {
+        return null;
+      }
+      const isQueued = current.status === 'QUEUED' && current.stage === 'QUEUED';
+      const isLegacyRunning =
+        existing === undefined &&
+        current.status === 'RUNNING' &&
+        CI_STAGES.includes(current.stage as (typeof CI_STAGES)[number]);
+      const retrying = existing?.status === 'RETRY_PENDING';
+      if (
+        !isQueued &&
+        !isLegacyRunning &&
+        !retrying &&
+        existing?.status !== 'NOT_STARTED' &&
+        !reclaimOnly
+      ) {
+        return null;
+      }
+      if (reclaimOnly && existing?.status !== 'RUNNING') return null;
+      const attemptId = randomUUID();
+      const fence = (existing?.fence ?? 0) + 1;
+      const attemptNumber = (existing?.attemptNumber ?? 0) + 1;
+      // Each attempt receives a disposable workspace and therefore always starts
+      // from checkout, including recovery after a crash at a later step.
+      const stage = 'CHECKOUT' as (typeof CI_STAGES)[number];
+      if (!CI_STAGES.includes(stage)) return null;
+      const ci: DeploymentCiExecution = {
+        status: 'RUNNING',
+        attemptNumber,
+        fence,
+        attemptId,
+        leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+        heartbeatAt: now,
+        startedAt: now,
+        stepResults: [],
+      };
+      const next: Deployment = {
+        ...current,
+        status: isQueued ? 'RUNNING' : current.status,
+        stage,
+        ci,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertDeploymentState(next.status, next.stage);
+      assertCiExecutionState(next.status, next.stage, ci);
+      const tokenFilter: Document = existing
+        ? {
+            'ci.status': existing.status,
+            'ci.fence': existing.fence,
+            ...(existing.attemptId === undefined
+              ? {}
+              : { 'ci.attemptId': existing.attemptId }),
+            ...(reclaimOnly ? { 'ci.leaseExpiresAt': { $lte: now } } : {}),
+          }
+        : { ci: { $exists: false } };
+      if (!(await updateCiDeployment(current, next, tokenFilter))) return null;
+      return {
+        attemptId,
+        fence,
+        attemptNumber,
+        leaseExpiresAt: ci.leaseExpiresAt!,
+        deployment: next,
+      };
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+
+  const renew = async (
+    id: string,
+    lease: CiExecutionLeaseInput,
+    nowInput: Date | undefined,
+  ): Promise<Deployment> => {
+    try {
+      const now = ciNow(nowInput);
+      const leaseMs = ciLeaseMs(lease.leaseMs);
+      if (
+        !UUID_PATTERN.test(id) ||
+        !Number.isSafeInteger(lease.expectedVersion) ||
+        lease.expectedVersion < 1 ||
+        !ciTokenValid(lease.attemptId, lease.fence)
+      ) {
+        throw new ValidationError('CI lease token is invalid');
+      }
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.ci;
+      if (
+        lease.expectedVersion !== current.version ||
+        existing?.status !== 'RUNNING' ||
+        existing.attemptId !== lease.attemptId.toLowerCase() ||
+        existing.fence !== lease.fence ||
+        existing.leaseExpiresAt === undefined ||
+        existing.leaseExpiresAt.valueOf() <= now.valueOf()
+      ) {
+        throw new ConcurrencyError();
+      }
+      const ci: DeploymentCiExecution = {
+        ...existing,
+        leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+        heartbeatAt: now,
+      };
+      const next: Deployment = {
+        ...current,
+        ci,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertCiExecutionState(next.status, next.stage, ci);
+      if (
+        !(await updateCiDeployment(current, next, {
+          'ci.status': 'RUNNING',
+          'ci.attemptId': lease.attemptId.toLowerCase(),
+          'ci.fence': lease.fence,
+          'ci.leaseExpiresAt': { $gt: now },
+        }))
+      ) {
+        throw new ConcurrencyError();
+      }
+      return next;
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+
+  const sameResult = (left: unknown, right: unknown): boolean =>
+    JSON.stringify(left, (_key, value: unknown) =>
+      value instanceof Date ? value.toISOString() : value,
+    ) ===
+    JSON.stringify(right, (_key, value: unknown) =>
+      value instanceof Date ? value.toISOString() : value,
+    );
+
+  const recordOutcome = async (
+    id: string,
+    outcome: CiStepOutcomeInput,
+    nowInput: Date | undefined,
+  ): Promise<Deployment> => {
+    try {
+      const now = ciNow(nowInput);
+      if (
+        !UUID_PATTERN.test(id) ||
+        !Number.isSafeInteger(outcome.expectedVersion) ||
+        outcome.expectedVersion < 1 ||
+        !ciTokenValid(outcome.attemptId, outcome.fence)
+      ) {
+        throw new ValidationError('CI outcome token is invalid');
+      }
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.ci;
+      if (
+        existing?.attemptId !== outcome.attemptId.toLowerCase() ||
+        existing.fence !== outcome.fence
+      ) {
+        throw new ConcurrencyError();
+      }
+      const prior = existing.stepResults.find(
+        (result) => result.stage === outcome.stage,
+      );
+      const normalized = createCiStepResult(outcome.attemptId, outcome.fence, outcome);
+      assertCiOutcomeCleanup(outcome.stage, normalized.status, outcome.cleanup);
+      if (prior !== undefined) {
+        if (
+          sameResult(prior, normalized) &&
+          (normalized.status === 'PASSED' && outcome.stage !== 'BUILD'
+            ? true
+            : sameResult(current.ci?.cleanup, outcome.cleanup))
+        ) {
+          return current;
+        }
+        throw new ConcurrencyError();
+      }
+      if (
+        existing.status !== 'RUNNING' ||
+        outcome.expectedVersion !== current.version ||
+        existing.leaseExpiresAt === undefined ||
+        existing.leaseExpiresAt.valueOf() <= now.valueOf() ||
+        current.stage !== outcome.stage
+      ) {
+        throw new ConcurrencyError();
+      }
+      const stageIndex = CI_STAGES.indexOf(outcome.stage);
+      if (stageIndex < 0 || existing.stepResults.length !== stageIndex) {
+        throw new InvalidTransitionError('CI steps must be recorded contiguously');
+      }
+      const stepResults = [...existing.stepResults, normalized];
+      let status: DeploymentStatus = current.status;
+      let stage: DeploymentStage = current.stage;
+      let ciStatus: DeploymentCiExecution['status'] = 'RUNNING';
+      let failure: DeploymentCiExecution['failure'];
+      let leaseExpiresAt: Date | undefined = existing.leaseExpiresAt;
+      let heartbeatAt: Date | undefined = now;
+      let finishedAt: Date | undefined;
+      let cleanup: DeploymentCiExecution['cleanup'];
+      if (normalized.status === 'PASSED') {
+        const nextStage = nextCiStage(outcome.stage);
+        if (nextStage === null) {
+          ciStatus = 'PASSED';
+          leaseExpiresAt = undefined;
+          heartbeatAt = undefined;
+          finishedAt = now;
+          cleanup = outcome.cleanup;
+        } else {
+          stage = nextStage;
+        }
+      } else if (normalized.failure!.retryable) {
+        ciStatus = 'RETRY_PENDING';
+        failure = normalized.failure;
+        leaseExpiresAt = undefined;
+        heartbeatAt = undefined;
+        cleanup = outcome.cleanup;
+      } else {
+        status = 'FAILED';
+        ciStatus = normalized.status === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED';
+        failure = normalized.failure;
+        leaseExpiresAt = undefined;
+        heartbeatAt = undefined;
+        finishedAt = now;
+        cleanup = outcome.cleanup;
+      }
+      const ci = { ...existing, status: ciStatus, stepResults } as {
+        -readonly [Key in keyof DeploymentCiExecution]?: DeploymentCiExecution[Key];
+      };
+      if (leaseExpiresAt === undefined) delete ci.leaseExpiresAt;
+      else ci.leaseExpiresAt = leaseExpiresAt;
+      if (heartbeatAt === undefined) delete ci.heartbeatAt;
+      else ci.heartbeatAt = heartbeatAt;
+      if (finishedAt === undefined) delete ci.finishedAt;
+      else ci.finishedAt = finishedAt;
+      if (failure === undefined) delete ci.failure;
+      else ci.failure = failure;
+      if (cleanup === undefined) delete ci.cleanup;
+      else ci.cleanup = cleanup;
+      const nextCi = ci as DeploymentCiExecution;
+      const next: Deployment = {
+        ...current,
+        status,
+        stage,
+        ci: nextCi,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertDeploymentState(next.status, next.stage);
+      assertCiExecutionState(next.status, next.stage, nextCi);
+      if (
+        !(await updateCiDeployment(current, next, {
+          'ci.status': 'RUNNING',
+          'ci.attemptId': outcome.attemptId.toLowerCase(),
+          'ci.fence': outcome.fence,
+          'ci.leaseExpiresAt': { $gt: now },
+        }))
+      ) {
+        throw new ConcurrencyError();
+      }
+      return next;
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+
   return {
     createQueued,
     create: createQueued,
@@ -506,6 +855,7 @@ function createDeploymentsRepository(
         const current = deploymentFromDocument(currentDocument);
         if (requested.expectedVersion !== current.version) throw new ConcurrencyError();
         const next = transitionDeployment(current, requested);
+        assertCiExecutionState(next.status, next.stage, next.ci);
         const update: UpdateFilter<StoredDeployment> = {
           $set: { status: next.status, stage: next.stage, updatedAt: next.updatedAt },
           $inc: { version: 1 },
@@ -523,6 +873,10 @@ function createDeploymentsRepository(
         mapMongoError(error);
       }
     },
+    claimCiExecution: (id, options) => claim(id, options, false),
+    reclaimExpiredCiExecution: (id, options) => claim(id, options, true),
+    renewCiExecution: renew,
+    recordCiStepOutcome: recordOutcome,
   };
 }
 

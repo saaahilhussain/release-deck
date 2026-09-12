@@ -7,11 +7,12 @@ verified.
 ## Current state
 
 The repository contains the approved Phase 1 process foundation, Phase 2 API
-domain/persistence work at commit `447435f`, and approved Phase 3
-GitHub-to-queue work at commit `c096926`. It is a pnpm/Turborepo monorepo with
-three applications and four useful shared packages. Build, typecheck, test,
-lint, formatting, runtime verification, isolated persistence verification, and
-a real-service Phase 3 flow are supported by root commands.
+domain/persistence work at commit `447435f`, approved Phase 3 GitHub-to-queue
+work at commit `c096926`, and the approved Phase 4 CI runner. It is a
+pnpm/Turborepo monorepo with three
+applications and five useful shared packages. Build, typecheck, test, lint,
+formatting, runtime verification, isolated persistence verification, and
+real-service Phase 3 and Phase 4 flows are supported by root commands.
 
 ## Implemented Phase 1 foundation
 
@@ -119,14 +120,45 @@ consumer construction, deterministic job IDs, retries, and lifecycle. A job
 contains only `{ deploymentId }`; completed and failed jobs are retained so the
 deterministic ID remains the duplicate boundary. The worker reloads authoritative
 MongoDB state and atomically claims only `QUEUED/QUEUED` deployments as
-`RUNNING/CHECKOUT`. Duplicate or stale jobs do not move state backward. Checkout,
-CI execution, and target deployment remain future work.
+`RUNNING/CHECKOUT`. Duplicate or stale jobs do not move state backward. Phase 4
+extends this worker claim through CI execution; target deployment remains future
+work.
 
 API startup now requires MongoDB/indexes, Redis, and a ready queue before the
 HTTP listener binds. Worker startup requires MongoDB/indexes, Redis configured
 for BullMQ blocking operations, and a ready consumer. Shutdown stops HTTP and
-reconciliation or the consumer before closing its queue and shared dependency
-connections.
+reconciliation or cancels/drains the consumer before closing its queue and
+shared dependency connections.
+
+## Implemented Phase 4 CI execution boundary
+
+`packages/ci-runner` owns disposable workspace allocation, exact full-SHA Git
+checkout, fixed lockfile-selected pnpm/npm commands, bounded stdout/stderr,
+per-stage and total deadlines, process-tree cancellation, and verified cleanup.
+Commands use argument arrays rather than shell text. Their minimal environment
+omits control-plane credentials and points temporary-file variables into the
+allocated workspace. Cleanup validates the canonical allocated path and reports
+an explicit failure without hiding an earlier CI error.
+
+The worker reloads project coordinates and the deployment commit from MongoDB,
+then runs `CHECKOUT`, `INSTALL`, `TEST`, and `BUILD`. It records every result
+through versioned compare-and-swap operations guarded by an attempt UUID, lease,
+and monotonically increasing fencing token. Only one fresh claim wins; active
+duplicates wait for authoritative completion, expired attempts can be reclaimed,
+and stale credentials cannot renew or write. Lease renewal rechecks expiry in
+the atomic update filter.
+
+CI state includes bounded output, exit/signal/duration/failure details and
+durable cleanup evidence. A terminal command failure preserves its exact stage
+and skips later commands. A successful build ends at deployment
+`RUNNING/BUILD` with CI status `PASSED`; it does not move to `DEPLOY` or mark the
+deployment `SUCCESS`. Queue shutdown first aborts active BullMQ processors and
+then drains the consumer before Redis and MongoDB close.
+
+These workspaces provide lifecycle and path isolation, not a security sandbox.
+Build commands still run with the worker account's OS privileges. Container or
+OS isolation for hostile repositories, target deployment, release management,
+health-gated promotion, and rollback remain later phases.
 
 ## Target control and execution planes
 
@@ -142,13 +174,15 @@ GitHub signed webhook → API → MongoDB authoritative state
 ```
 
 The flow through the worker's initial authoritative state claim is implemented
-in Phase 3. Later phases extend the worker from `RUNNING/CHECKOUT` into the CI
-and deployment pipeline. Long-running CI and deployment operations must never
-run inside HTTP handlers.
+in Phase 3, and Phase 4 implements the worker-owned CI portion through
+`RUNNING/BUILD` plus CI `PASSED`. Later phases extend the worker into deployment.
+Long-running CI and deployment operations must never run inside HTTP handlers.
 
 The implemented domain keeps overall deployment status separate from pipeline
 stage and records the exact commit SHA. Phase 3 uses the unique delivery
-constraint plus recoverable state to make processing idempotent. Status
+constraint plus recoverable state to make processing idempotent. Phase 4 adds
+leased, fenced CI attempt state so stale workers cannot advance a reclaimed
+attempt. Status
 (`QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`, `ROLLED_BACK`) describes the outcome;
 the worker will drive stage progress in later phases.
 
@@ -178,8 +212,9 @@ is intentionally deferred until that phase.
 
 ## Technology direction
 
-The implemented foundation uses Node.js, Express, React, Vite, TypeScript,
-native MongoDB, Redis, Zod, Pino, ioredis, and BullMQ. SSH to Linux/EC2, PM2,
+The implemented system uses Node.js, Express, React, Vite, TypeScript, native
+MongoDB, Redis, Zod, Pino, ioredis, BullMQ, Git, and fixed npm/pnpm CI commands.
+SSH to Linux/EC2, PM2,
 and Nginx belong to remote
 release deployment; Server-Sent Events are preferred later for server-to-browser
 status and log streams. Phosphor icons and the shadcn-inspired visual system
@@ -192,7 +227,8 @@ Keep controllers thin, validate at boundaries, and keep GitHub and queue
 integrations behind focused modules. Queue payloads contain only `deploymentId`
 so MongoDB remains authoritative. Do not introduce a major
 technology or package for appearance or résumé value. Authentication and
-isolation for untrusted build commands remain explicit future security work. The
-Phase 1 process boundary is useful, but it does not yet provide authentication,
-authorization, sandboxing, secret isolation, or production-grade reconnect and
-telemetry behavior.
+isolation for untrusted build commands remain explicit future security work.
+Phase 4 removes control-plane credentials from child environments and confines
+workspace lifecycle beneath a validated root, but it does not provide a hostile-
+code sandbox. The system still lacks broader authentication, authorization,
+production-grade reconnect, target release deployment, and telemetry behavior.
