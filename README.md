@@ -7,9 +7,9 @@ ReleaseDeck is a learning-focused, self-hosted release and deployment platform.
 The long-term product will accept verified GitHub webhooks, create asynchronous
 deployment jobs, run CI in isolated workspaces, publish immutable releases,
 health-check candidates, and promote or roll back safely. Implementation and
-verification for **Phase 3 — GitHub to queue** are complete and awaiting the
-commit/push checkpoint. Verified webhook receipt now ends at the worker's
-initial deployment claim; CI commands and target deployment do not exist yet.
+verification for **Phase 3 — GitHub to queue** are complete, approved, and
+pushed. Verified webhook receipt now ends at the worker's initial deployment
+claim; CI commands and target deployment do not exist yet.
 
 This project values understanding over rapid code generation. The public
 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

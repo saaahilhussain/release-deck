@@ -6,13 +6,12 @@ verified.
 
 ## Current state
 
-The repository contains the approved Phase 1 process foundation and Phase 2 API
-domain/persistence work at commit `447435f`, plus implemented and verified
-Phase 3 GitHub-to-queue work awaiting commit/push approval. It is a
-pnpm/Turborepo monorepo with three applications and four useful shared packages.
-Build, typecheck, test, lint, formatting, runtime verification, isolated
-persistence verification, and a real-service Phase 3 flow are supported by root
-commands.
+The repository contains the approved Phase 1 process foundation, Phase 2 API
+domain/persistence work at commit `447435f`, and approved Phase 3
+GitHub-to-queue work at commit `c096926`. It is a pnpm/Turborepo monorepo with
+three applications and four useful shared packages. Build, typecheck, test,
+lint, formatting, runtime verification, isolated persistence verification, and
+a real-service Phase 3 flow are supported by root commands.
 
 ## Implemented Phase 1 foundation
 
