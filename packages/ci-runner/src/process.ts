@@ -53,6 +53,8 @@ export class ProcessCancelledError extends Error {
 }
 
 const FORCE_SETTLE_GRACE_MS = 1_000;
+const TREE_KILL_COMMAND_TIMEOUT_MS = 5_000;
+const TREE_EXIT_POLL_MS = 10;
 
 function launch(
   command: string,
@@ -115,8 +117,36 @@ function appendOutput(
   if (chunk.byteLength > remaining) state.truncated = true;
 }
 
-function sendSignal(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (!child.pid) return;
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function processTreeIsRunning(child: ChildProcess): boolean {
+  if (!child.pid) return false;
+  if (process.platform === 'win32') return child.exitCode === null;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function waitForProcessTreeExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (processTreeIsRunning(child)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(TREE_EXIT_POLL_MS, remaining));
+  }
+  return true;
+}
+
+function sendSignal(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
+  if (!child.pid) return Promise.resolve();
   const fallback = () => {
     try {
       child.kill(signal);
@@ -125,27 +155,44 @@ function sendSignal(child: ChildProcess, signal: NodeJS.Signals): void {
     }
   };
   if (process.platform === 'win32') {
-    try {
-      const taskkill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-        shell: false,
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-      taskkill.once('error', fallback);
-      taskkill.once('close', (exitCode) => {
-        if (exitCode !== 0) fallback();
-      });
-      taskkill.unref();
-    } catch {
-      fallback();
-    }
-    return;
+    return new Promise((resolve) => {
+      let complete = false;
+      let taskkill: ChildProcess | undefined;
+      const finish = (useFallback: boolean) => {
+        if (complete) return;
+        complete = true;
+        clearTimeout(commandTimer);
+        if (useFallback) fallback();
+        resolve();
+      };
+      const commandTimer = setTimeout(() => {
+        try {
+          taskkill?.kill('SIGKILL');
+        } catch {
+          // The taskkill helper may have exited as its timeout fired.
+        }
+        finish(true);
+      }, TREE_KILL_COMMAND_TIMEOUT_MS);
+      commandTimer.unref();
+      try {
+        taskkill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+          shell: false,
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        taskkill.once('error', () => finish(true));
+        taskkill.once('close', (exitCode) => finish(exitCode !== 0));
+      } catch {
+        finish(true);
+      }
+    });
   }
   try {
     process.kill(-child.pid, signal);
   } catch {
     fallback();
   }
+  return Promise.resolve();
 }
 
 export function boundedUtf8(
@@ -237,14 +284,10 @@ export const defaultProcessRunner: ProcessRunner = {
       let settled = false;
       let reason: 'timeout' | 'cancelled' | undefined;
       const timer = setTimeout(() => terminate('timeout'), timeoutMs);
-      let graceTimer: NodeJS.Timeout | undefined;
-      let forceTimer: NodeJS.Timeout | undefined;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
-        if (graceTimer) clearTimeout(graceTimer);
-        if (forceTimer) clearTimeout(forceTimer);
         options.signal?.removeEventListener('abort', cancel);
         const result = baseResult(
           command,
@@ -264,13 +307,17 @@ export const defaultProcessRunner: ProcessRunner = {
       const terminate = (why: 'timeout' | 'cancelled') => {
         if (settled || reason) return;
         reason = why;
-        sendSignal(child, 'SIGTERM');
-        graceTimer = setTimeout(() => {
-          sendSignal(child, 'SIGKILL');
-          forceTimer = setTimeout(() => finish(), FORCE_SETTLE_GRACE_MS);
-          forceTimer.unref();
-        }, graceMs);
-        graceTimer.unref();
+        void (async () => {
+          await sendSignal(child, 'SIGTERM');
+          if (process.platform !== 'win32') {
+            const terminated = await waitForProcessTreeExit(child, graceMs);
+            if (!terminated) {
+              await sendSignal(child, 'SIGKILL');
+              await waitForProcessTreeExit(child, FORCE_SETTLE_GRACE_MS);
+            }
+          }
+          finish();
+        })();
       };
       function cancel() {
         terminate('cancelled');
@@ -282,7 +329,9 @@ export const defaultProcessRunner: ProcessRunner = {
         appendOutput(stderr, Buffer.from(chunk), limit),
       );
       child.once('error', (error) => finish(error));
-      child.once('close', () => finish());
+      child.once('close', () => {
+        if (!reason) finish();
+      });
       timer.unref();
       if (options.signal?.aborted) cancel();
       else options.signal?.addEventListener('abort', cancel, { once: true });

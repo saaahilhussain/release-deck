@@ -5,6 +5,7 @@ import {
   CI_STAGES,
   ConcurrencyError,
   DOMAIN_INDEXES,
+  MAX_CI_EXIT_CODE,
   MAX_CI_MESSAGE_BYTES,
   MAX_CI_OUTPUT_BYTES,
   PersistenceError,
@@ -151,6 +152,8 @@ function step(
     startedAt: baseTime,
     finishedAt: new Date(baseTime.valueOf() + 10),
     durationMs: 10,
+    exitCode: status === 'PASSED' ? 0 : (failure?.exitCode ?? null),
+    signal: failure?.signal ?? null,
     ...(failure === undefined ? {} : { failure }),
     ...(cleanup === undefined ? {} : { cleanup }),
   } as const;
@@ -164,6 +167,85 @@ const cleaned = {
 test('CI domain enforces bounded output, contiguous steps, and state combinations', () => {
   const valid = createCiStepResult(attemptId, 1, step('CHECKOUT'));
   assert.equal(valid.stdout, '');
+  assert.equal(valid.exitCode, 0);
+  assert.equal(valid.signal, null);
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT'),
+        exitCode: undefined,
+      } as never),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT'),
+        signal: undefined,
+      } as never),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT'),
+        exitCode: MAX_CI_EXIT_CODE + 1,
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT'),
+        signal: 'sigterm',
+      }),
+    ValidationError,
+  );
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT'),
+        exitCode: 1,
+      }),
+    ValidationError,
+  );
+  const signalled = createCiStepResult(
+    attemptId,
+    1,
+    step('CHECKOUT', 'FAILED', {
+      kind: 'CHECKOUT_FAILED',
+      message: 'terminated',
+      retryable: true,
+      signal: 'SIGTERM',
+    }),
+  );
+  assert.equal(signalled.exitCode, null);
+  assert.equal(signalled.signal, 'SIGTERM');
+  const windowsExit = createCiStepResult(
+    attemptId,
+    1,
+    step('CHECKOUT', 'FAILED', {
+      kind: 'CHECKOUT_FAILED',
+      message: 'native process failure',
+      retryable: true,
+      exitCode: 300,
+    }),
+  );
+  assert.equal(windowsExit.exitCode, 300);
+  assert.equal(windowsExit.failure?.exitCode, 300);
+  assert.throws(
+    () =>
+      createCiStepResult(attemptId, 1, {
+        ...step('CHECKOUT', 'FAILED', {
+          kind: 'CHECKOUT_FAILED',
+          message: 'invalid native process failure',
+          retryable: true,
+          exitCode: MAX_CI_EXIT_CODE + 1,
+        }),
+        exitCode: null,
+      }),
+    ValidationError,
+  );
   assert.throws(
     () =>
       createCiStepResult(attemptId, 1, {
@@ -330,6 +412,16 @@ test('CI claim, fencing, and successful contiguous execution are CAS guarded', a
   assert.equal(current.ci?.status, 'PASSED');
   assert.deepEqual(current.ci?.cleanup, cleaned);
   assert.equal(current.ci?.stepResults.length, 4);
+  assert.deepEqual(
+    current.ci?.stepResults.map(({ stage, exitCode, signal }) => ({
+      stage,
+      exitCode,
+      signal,
+    })),
+    CI_STAGES.map((stage) => ({ stage, exitCode: 0, signal: null })),
+  );
+  const persisted = await repos.deployments.findById(deployment.id);
+  assert.deepEqual(persisted?.ci?.stepResults, current.ci?.stepResults);
   const duplicate = await repos.deployments.recordCiStepOutcome(
     deployment.id,
     {
@@ -341,6 +433,20 @@ test('CI claim, fencing, and successful contiguous execution are CAS guarded', a
     baseTime,
   );
   assert.equal(duplicate.version, current.version);
+  await assert.rejects(
+    repos.deployments.recordCiStepOutcome(
+      deployment.id,
+      {
+        expectedVersion: 1,
+        attemptId: claim.attemptId,
+        fence: claim.fence,
+        ...step('CHECKOUT'),
+        stdout: 'different replay',
+      },
+      baseTime,
+    ),
+    ConcurrencyError,
+  );
   await assert.rejects(
     repos.deployments.recordCiStepOutcome(deployment.id, {
       expectedVersion: current.version,

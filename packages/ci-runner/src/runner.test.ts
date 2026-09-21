@@ -42,6 +42,43 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `releasedeck-${prefix}-`));
 }
 
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function stopProcess(pid: number): Promise<void> {
+  if (!processIsRunning(pid)) return;
+  if (process.platform === 'win32') {
+    await execFileAsync('taskkill.exe', ['/PID', String(pid), '/T', '/F']).catch(
+      () => undefined,
+    );
+  } else {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // The process may have exited after the liveness check.
+    }
+  }
+}
+
+async function waitForFile(path: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      await fileAccess(path);
+      return;
+    } catch {
+      await delay(10);
+    }
+  }
+  await fileAccess(path);
+}
+
 test('workspaces are unique, constrained, idempotently cleaned, and preserve siblings', async () => {
   const root = await temporaryDirectory('workspace');
   try {
@@ -172,6 +209,45 @@ test('already-aborted and cancelled processes do not run past bounded terminatio
     );
     assert.ok(Date.now() - started < 2_000);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('cancellation settles only after descendants exit and the workspace is removable', async () => {
+  const root = await temporaryDirectory('cancel-tree');
+  const workspace = join(root, 'workspace');
+  const pidFile = join(workspace, 'descendant.pid');
+  let descendantPid: number | undefined;
+  try {
+    await mkdir(workspace);
+    const descendantCode = [
+      'const fs = require("node:fs");',
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+      'setInterval(() => {}, 5000);',
+    ].join('');
+    const parentCode = [
+      'const { spawn } = require("node:child_process");',
+      `spawn(process.execPath, ["-e", ${JSON.stringify(descendantCode)}], { stdio: "ignore" });`,
+      'setInterval(() => {}, 5000);',
+    ].join('');
+    const controller = new AbortController();
+    const cancellation = defaultProcessRunner.run(
+      process.execPath,
+      ['-e', parentCode],
+      { cwd: workspace, signal: controller.signal, killGraceMs: 100 },
+    );
+    await waitForFile(pidFile);
+    descendantPid = Number(await readFile(pidFile, 'utf8'));
+    assert.equal(Number.isSafeInteger(descendantPid), true);
+
+    controller.abort();
+    await assert.rejects(cancellation, ProcessCancelledError);
+
+    assert.equal(processIsRunning(descendantPid), false);
+    await rm(workspace, { recursive: true });
+    await assert.rejects(fileAccess(workspace));
+  } finally {
+    if (descendantPid !== undefined) await stopProcess(descendantPid);
     await rm(root, { recursive: true, force: true });
   }
 });

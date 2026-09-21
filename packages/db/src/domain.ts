@@ -104,6 +104,7 @@ export type CiFailureKind = (typeof CI_FAILURE_KINDS)[number];
 export const MAX_CI_STEP_RESULTS = 4;
 export const MAX_CI_OUTPUT_BYTES = 1_048_576;
 export const MAX_CI_MESSAGE_BYTES = 2_000;
+export const MAX_CI_EXIT_CODE = 0xffff_ffff;
 // Keep persistence bounds aligned with the runtime's configured CI lease range.
 export const DEFAULT_CI_LEASE_MS = 60_000;
 export const MIN_CI_LEASE_MS = 10_000;
@@ -133,6 +134,8 @@ export interface CiStepResult {
   readonly startedAt: Date;
   readonly finishedAt: Date;
   readonly durationMs: number;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
   readonly stdout: string;
   readonly stderr: string;
   readonly stdoutTruncated: boolean;
@@ -146,6 +149,8 @@ export interface CiStepResultInput {
   readonly startedAt: Date;
   readonly finishedAt: Date;
   readonly durationMs: number;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
   readonly stdout?: string;
   readonly stderr?: string;
   readonly stdoutTruncated?: boolean;
@@ -703,7 +708,7 @@ function assertCiFailure(failure: CiFailure | undefined): void {
     failure.exitCode !== undefined &&
     (!Number.isSafeInteger(failure.exitCode) ||
       failure.exitCode < 0 ||
-      failure.exitCode > 255)
+      failure.exitCode > MAX_CI_EXIT_CODE)
   ) {
     throw new ValidationError('CI failure exit code is invalid');
   }
@@ -783,6 +788,16 @@ function assertCiStepResult(result: CiStepResult): void {
     !Number.isSafeInteger(result.durationMs) ||
     result.durationMs < 0 ||
     result.durationMs > 86_400_000 ||
+    !(
+      result.exitCode === null ||
+      (Number.isSafeInteger(result.exitCode) &&
+        result.exitCode >= 0 &&
+        result.exitCode <= MAX_CI_EXIT_CODE)
+    ) ||
+    !(
+      result.signal === null ||
+      (typeof result.signal === 'string' && /^[A-Z0-9_]{1,32}$/.test(result.signal))
+    ) ||
     typeof result.stdout !== 'string' ||
     typeof result.stderr !== 'string' ||
     byteLength(result.stdout) > MAX_CI_OUTPUT_BYTES ||
@@ -794,6 +809,9 @@ function assertCiStepResult(result: CiStepResult): void {
   }
   if (result.status === 'PASSED' && result.failure !== undefined) {
     throw new ValidationError('passed CI step cannot have a failure');
+  }
+  if (result.status === 'PASSED' && (result.exitCode !== 0 || result.signal !== null)) {
+    throw new ValidationError('passed CI step must exit successfully');
   }
   if (result.status !== 'PASSED' && result.failure === undefined) {
     throw new ValidationError('failed CI step requires a failure');
@@ -846,6 +864,8 @@ export function createCiStepResult(
     startedAt: input.startedAt,
     finishedAt: input.finishedAt,
     durationMs: input.durationMs,
+    exitCode: input.exitCode,
+    signal: input.signal,
     stdout: input.stdout ?? '',
     stderr: input.stderr ?? '',
     stdoutTruncated: input.stdoutTruncated ?? false,

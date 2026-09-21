@@ -394,6 +394,11 @@ try {
     STAGES,
   );
   assert.ok(passed.ci?.stepResults.every((result) => result.status === 'PASSED'));
+  assert.ok(
+    passed.ci?.stepResults.every(
+      (result) => result.exitCode === 0 && result.signal === null,
+    ),
+  );
   assert.equal(passed.ci?.cleanup?.status, 'CLEANED');
   assert.ok(passed.ci?.cleanup?.completedAt instanceof Date);
   assert.match(passed.ci?.stepResults[0]?.stdout ?? '', new RegExp(source.firstSha));
@@ -426,6 +431,8 @@ try {
   assert.equal(failed.ci?.failure?.retryable, false);
   assert.equal(failed.ci?.cleanup?.status, 'CLEANED');
   assert.equal(failed.ci?.stepResults.at(-1)?.stage, 'TEST');
+  assert.equal(failed.ci?.stepResults.at(-1)?.exitCode, 7);
+  assert.equal(failed.ci?.stepResults.at(-1)?.signal, null);
   assert.equal(failed.ci?.stepResults.at(-1)?.stdoutTruncated, true);
   assert.equal(
     failed.ci?.stepResults.some((result) => result.stage === 'BUILD'),

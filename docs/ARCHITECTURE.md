@@ -134,7 +134,8 @@ shared dependency connections.
 
 `packages/ci-runner` owns disposable workspace allocation, exact full-SHA Git
 checkout, fixed lockfile-selected pnpm/npm commands, bounded stdout/stderr,
-per-stage and total deadlines, process-tree cancellation, and verified cleanup.
+per-stage and total deadlines, process-tree cancellation that settles only after
+bounded tree termination, and verified cleanup.
 Commands use argument arrays rather than shell text. Their minimal environment
 omits control-plane credentials and points temporary-file variables into the
 allocated workspace. Cleanup validates the canonical allocated path and reports
@@ -148,9 +149,10 @@ duplicates wait for authoritative completion, expired attempts can be reclaimed,
 and stale credentials cannot renew or write. Lease renewal rechecks expiry in
 the atomic update filter.
 
-CI state includes bounded output, exit/signal/duration/failure details and
-durable cleanup evidence. A terminal command failure preserves its exact stage
-and skips later commands. A successful build ends at deployment
+CI step state includes bounded output, explicit exit code and signal values,
+duration and failure details, and durable cleanup evidence. Unavailable exit or
+signal values are stored explicitly as `null`. A terminal command failure
+preserves its exact stage and skips later commands. A successful build ends at deployment
 `RUNNING/BUILD` with CI status `PASSED`; it does not move to `DEPLOY` or mark the
 deployment `SUCCESS`. Queue shutdown first aborts active BullMQ processors and
 then drains the consumer before Redis and MongoDB close.

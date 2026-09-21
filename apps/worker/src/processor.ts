@@ -222,6 +222,8 @@ function outcomeFor(
     startedAt,
     finishedAt,
     durationMs,
+    exitCode: result?.exitCode ?? null,
+    signal: result?.signal ?? null,
     stdout: result?.stdout ?? '',
     stderr: result?.stderr ?? '',
     stdoutTruncated: result?.stdoutTruncated ?? false,

@@ -75,13 +75,17 @@ function claim(deployment = runningDeployment()): CiExecutionClaim {
   };
 }
 
-function stageResult(stage: CiStage, exitCode = 0): CiStageResult {
+function stageResult(
+  stage: CiStage,
+  exitCode: number | null = 0,
+  signal: CiStageResult['signal'] = null,
+): CiStageResult {
   return {
     stage,
     command: stage === 'CHECKOUT' ? 'git' : 'npm',
     args: [],
     exitCode,
-    signal: null,
+    signal,
     stdout: `${stage.toLowerCase()} output`,
     stderr: '',
     stdoutTruncated: false,
@@ -100,6 +104,8 @@ function applyOutcome(current: Deployment, outcome: CiStepOutcomeInput): Deploym
     startedAt: outcome.startedAt,
     finishedAt: outcome.finishedAt,
     durationMs: outcome.durationMs,
+    exitCode: outcome.exitCode,
+    signal: outcome.signal,
     stdout: outcome.stdout ?? '',
     stderr: outcome.stderr ?? '',
     stdoutTruncated: outcome.stdoutTruncated ?? false,
@@ -244,6 +250,10 @@ test('worker runs exact repository input through all CI stages and persists PASS
   assert.equal(state.current().stage, 'BUILD');
   assert.equal(state.current().ci?.status, 'PASSED');
   assert.equal(state.current().ci?.cleanup?.status, 'CLEANED');
+  assert.deepEqual(
+    state.outcomes.map(({ exitCode, signal }) => ({ exitCode, signal })),
+    Array.from({ length: 4 }, () => ({ exitCode: 0, signal: null })),
+  );
 });
 
 test('a test failure is terminal at TEST and later stages do not run', async () => {
@@ -271,10 +281,16 @@ test('a test failure is terminal at TEST and later stages do not run', async () 
   assert.equal(state.current().stage, 'TEST');
   assert.equal(state.current().ci?.failure?.kind, 'TEST_FAILED');
   assert.equal(state.current().ci?.cleanup?.status, 'CLEANED');
+  assert.equal(state.current().ci?.stepResults.at(-1)?.exitCode, 1);
+  assert.equal(state.current().ci?.stepResults.at(-1)?.signal, null);
 });
 
 test('workspace cleanup failure is persisted without losing the failed stage output', async () => {
-  const original = new CiStepError('TEST', 'CI test failed', stageResult('TEST', 1));
+  const original = new CiStepError(
+    'TEST',
+    'CI test failed',
+    stageResult('TEST', null, 'SIGTERM'),
+  );
   const runner: CiRunner = {
     async run(_input, hooks = {}) {
       for (const stage of ['CHECKOUT', 'INSTALL'] as const) {
@@ -299,6 +315,8 @@ test('workspace cleanup failure is persisted without losing the failed stage out
   assert.equal(state.current().ci?.failure?.kind, 'WORKSPACE_FAILED');
   assert.equal(state.current().ci?.cleanup?.status, 'FAILED');
   assert.equal(state.current().ci?.stepResults.at(-1)?.stdout, 'test output');
+  assert.equal(state.current().ci?.stepResults.at(-1)?.exitCode, null);
+  assert.equal(state.current().ci?.stepResults.at(-1)?.signal, 'SIGTERM');
 });
 
 test('a retryable checkout timeout is persisted and rejected for BullMQ retry', async () => {
@@ -398,4 +416,6 @@ test('a missing project becomes a terminal checkout failure', async () => {
   assert.equal(state.runs(), 0);
   assert.equal(state.current().status, 'FAILED');
   assert.equal(state.current().stage, 'CHECKOUT');
+  assert.equal(state.outcomes[0]?.exitCode, null);
+  assert.equal(state.outcomes[0]?.signal, null);
 });
