@@ -50,10 +50,20 @@ export interface CiRunResult {
   readonly stages: readonly CiStageResult[];
 }
 
+export interface CiBuildReadyContext {
+  readonly deploymentId: string;
+  readonly commitSha: string;
+  readonly workspacePath: string;
+  readonly packageManager: PackageManager;
+  readonly buildResult: CiStageResult;
+}
+
 export interface CiRunnerHooks {
   onStageStarted?(stage: CiStage): Promise<void> | void;
   onStageCompleted?(result: CiStageResult): Promise<void> | void;
   onStageFailed?(stage: CiStage, error: unknown): Promise<void> | void;
+  /** Prepare a durable release artifact while the successful build still exists. */
+  onBuildReady?(context: CiBuildReadyContext): Promise<void> | void;
 }
 
 export interface CiRunnerOptions {
@@ -66,8 +76,13 @@ export interface CiRunnerOptions {
 export class CiStepError extends Error {
   readonly stage: CiStage;
   readonly result: CiStageResult | undefined;
-  constructor(stage: CiStage, message: string, result?: CiStageResult) {
-    super(message);
+  constructor(
+    stage: CiStage,
+    message: string,
+    result?: CiStageResult,
+    cause?: unknown,
+  ) {
+    super(message, cause === undefined ? undefined : { cause });
     this.name = 'CiStepError';
     this.stage = stage;
     this.result = result;
@@ -350,6 +365,26 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
             );
             await hooks.onStageFailed?.(stage, error);
             throw error;
+          }
+          if (stage === 'BUILD' && hooks.onBuildReady) {
+            try {
+              await hooks.onBuildReady({
+                deploymentId: input.deploymentId,
+                commitSha: input.commitSha,
+                workspacePath: workspace.path,
+                packageManager,
+                buildResult: stageResult,
+              });
+            } catch (cause) {
+              const error = new CiStepError(
+                'BUILD',
+                'CI release artifact preparation failed',
+                stageResult,
+                cause,
+              );
+              await hooks.onStageFailed?.('BUILD', error);
+              throw error;
+            }
           }
           await hooks.onStageCompleted?.(stageResult);
         }

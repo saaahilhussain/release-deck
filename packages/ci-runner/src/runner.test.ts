@@ -415,6 +415,7 @@ test('runner fetches the requested commit and runs fixed npm CI stages in order'
 
     const stages: string[] = [];
     const completed: string[] = [];
+    let preparedWorkspace: string | undefined;
     const result = await createCiRunner({
       workspaceRoot: workspaces,
       limits: {
@@ -437,6 +438,17 @@ test('runner fetches the requested commit and runs fixed npm CI stages in order'
         onStageCompleted: (stage) => {
           completed.push(stage.stage);
         },
+        async onBuildReady(context) {
+          preparedWorkspace = context.workspacePath;
+          assert.equal(context.deploymentId, deploymentId);
+          assert.equal(context.commitSha, firstSha);
+          assert.equal(context.packageManager, 'npm');
+          assert.equal(context.buildResult.stage, 'BUILD');
+          assert.equal(
+            await readFile(join(context.workspacePath, 'README.md'), 'utf8'),
+            'first',
+          );
+        },
       },
     );
     assert.equal(result.commitSha, firstSha);
@@ -446,8 +458,71 @@ test('runner fetches the requested commit and runs fixed npm CI stages in order'
       result.stages.map((stage) => stage.stage),
       ['CHECKOUT', 'INSTALL', 'TEST', 'BUILD'],
     );
+    assert.equal(preparedWorkspace, result.workspacePath);
     await assert.rejects(fileAccess(result.workspacePath));
     assert.notEqual(firstSha, secondSha);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('artifact preparation failure is a BUILD failure and still cleans the workspace', async () => {
+  const root = await temporaryDirectory('artifact-failure');
+  const workspaceRoot = join(root, 'workspaces');
+  const preparationFailure = new Error('archive unavailable');
+  let failedStage: string | undefined;
+  let failedError: unknown;
+  try {
+    const runner = createCiRunner({
+      workspaceRoot,
+      processRunner: {
+        async run(command, args, options) {
+          if (args[0] === 'init') {
+            await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+          }
+          return {
+            command,
+            args,
+            exitCode: 0,
+            signal: null,
+            stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+            stderr: '',
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            durationMs: 0,
+          };
+        },
+      },
+    });
+    await assert.rejects(
+      runner.run(
+        {
+          deploymentId,
+          repositoryUrl: 'file:///fixture.git',
+          commitSha: 'a'.repeat(40),
+        },
+        {
+          onBuildReady() {
+            throw preparationFailure;
+          },
+          onStageFailed(stage, error) {
+            failedStage = stage;
+            failedError = error;
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof CiStepError &&
+        error.stage === 'BUILD' &&
+        error.result?.exitCode === 0 &&
+        error.cause === preparationFailure,
+    );
+    assert.equal(failedStage, 'BUILD');
+    assert.equal(failedError instanceof CiStepError, true);
+    const entries = await import('node:fs/promises').then(({ readdir }) =>
+      readdir(workspaceRoot),
+    );
+    assert.deepEqual(entries, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

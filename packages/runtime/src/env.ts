@@ -1,5 +1,6 @@
 import { tmpdir } from 'node:os';
-import { isAbsolute, resolve } from 'node:path';
+import { isIP } from 'node:net';
+import { isAbsolute, posix, resolve } from 'node:path';
 
 import dotenv from 'dotenv';
 import { z } from 'zod';
@@ -52,6 +53,45 @@ const mongoUrl = z.string().min(1).refine(isMongoUrl);
 
 const redisUrl = z.string().min(1).refine(isRedisUrl);
 
+const sshHost = z
+  .string()
+  .min(1)
+  .max(253)
+  .refine((value) => {
+    if (isIP(value) > 0) return true;
+    if (/^\d+(?:\.\d+){3}$/.test(value)) return false;
+    return /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(
+      value,
+    );
+  });
+
+const posixAbsolutePath = z
+  .string()
+  .min(1)
+  .max(4_096)
+  .refine((value) => value.startsWith('/') && value !== '/')
+  .refine((value) => posix.normalize(value) === value)
+  .refine((value) => /^[A-Za-z0-9._/-]+$/.test(value))
+  .refine((value) => !value.split('/').includes('..'));
+
+const localAbsolutePath = z
+  .string()
+  .min(1)
+  .max(4_096)
+  .refine(
+    (value) =>
+      ![...value].some(
+        (character) => character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127,
+      ),
+  )
+  .refine(isAbsolute, 'must be an absolute path');
+
+const posixUsername = z
+  .string()
+  .min(1)
+  .max(32)
+  .regex(/^[a-z_][a-z0-9_-]*$/);
+
 const commonEnvironmentSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(logLevels).default('info'),
@@ -67,6 +107,29 @@ const apiEnvironmentSchema = commonEnvironmentSchema.extend({
 
 const workerEnvironmentSchema = commonEnvironmentSchema
   .extend({
+    RELEASE_SSH_HOST: sshHost,
+    RELEASE_SSH_PORT: z.coerce.number().int().min(1).max(65_535).default(22),
+    RELEASE_SSH_USER: posixUsername,
+    RELEASE_SSH_PRIVATE_KEY_PATH: localAbsolutePath,
+    RELEASE_SSH_KNOWN_HOSTS_PATH: localAbsolutePath,
+    RELEASE_REMOTE_ROOT: posixAbsolutePath.default('/srv/apps'),
+    RELEASE_ARTIFACT_ROOT: localAbsolutePath.default(
+      resolve(tmpdir(), 'releasedeck-artifacts'),
+    ),
+    RELEASE_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(86_400_000)
+      .default(600_000),
+    RELEASE_MAX_OUTPUT_BYTES: z.coerce
+      .number()
+      .int()
+      .min(1_024)
+      .max(1_048_576)
+      .default(65_536),
+    RELEASE_LEASE_MS: z.coerce.number().int().min(10_000).max(300_000).default(60_000),
+    RELEASE_RETENTION: z.coerce.number().int().min(2).max(20).default(5),
     CI_WORKSPACE_ROOT: z
       .string()
       .trim()

@@ -32,8 +32,87 @@ export interface Deployment {
   readonly version: number;
   readonly sourceWebhookEventId?: string;
   readonly ci?: DeploymentCiExecution;
+  readonly release?: DeploymentReleaseExecution;
   readonly createdAt: Date;
   readonly updatedAt: Date;
+}
+
+export const RELEASE_EXECUTION_STATUSES = [
+  'RUNNING',
+  'RETRY_PENDING',
+  'DEPLOYED',
+  'FAILED',
+] as const;
+export type ReleaseExecutionStatus = (typeof RELEASE_EXECUTION_STATUSES)[number];
+export const RELEASE_FAILURE_KINDS = [
+  'TRANSPORT_FAILED',
+  'REMOTE_FAILED',
+  'PACKAGE_FAILED',
+  'LEASE_LOST',
+  'CANCELLED',
+] as const;
+export type ReleaseFailureKind = (typeof RELEASE_FAILURE_KINDS)[number];
+export const DEFAULT_RELEASE_LEASE_MS = 60_000;
+export const MIN_RELEASE_LEASE_MS = 10_000;
+export const MAX_RELEASE_LEASE_MS = 300_000;
+export const MAX_RELEASE_PATH_BYTES = 1_024;
+export const MAX_RELEASE_PROCESS_NAME_BYTES = 128;
+export interface ReleaseFailure {
+  readonly kind: ReleaseFailureKind;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly exitCode?: number;
+  readonly signal?: string;
+}
+export interface ReleaseNginxEvidence {
+  readonly validated: boolean;
+  readonly reloaded: boolean;
+}
+export interface ReleaseSuccessProof {
+  readonly releaseId: string;
+  readonly commitSha: string;
+  readonly remoteReleasePath: string;
+  readonly activeTarget: string;
+  readonly pm2ProcessName: string;
+  readonly pm2Pid: number;
+  readonly nginx: ReleaseNginxEvidence;
+  readonly completedAt: Date;
+}
+export interface DeploymentReleaseExecution {
+  readonly status: ReleaseExecutionStatus;
+  readonly releaseId: string;
+  readonly attemptNumber: number;
+  readonly fence: number;
+  readonly attemptId?: string;
+  readonly leaseExpiresAt?: Date;
+  readonly heartbeatAt?: Date;
+  readonly startedAt?: Date;
+  readonly finishedAt?: Date;
+  readonly failure?: ReleaseFailure;
+  readonly success?: ReleaseSuccessProof;
+}
+export interface ReleaseExecutionClaim {
+  readonly attemptId: string;
+  readonly fence: number;
+  readonly attemptNumber: number;
+  readonly leaseExpiresAt: Date;
+  readonly deployment: Deployment;
+}
+export interface ReleaseExecutionClaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
+}
+export interface ReleaseExecutionLeaseInput {
+  readonly expectedVersion: number;
+  readonly attemptId: string;
+  readonly fence: number;
+  readonly leaseMs?: number;
+}
+export interface ReleaseSuccessInput extends ReleaseExecutionLeaseInput {
+  readonly proof: ReleaseSuccessProof;
+}
+export interface ReleaseFailureInput extends ReleaseExecutionLeaseInput {
+  readonly failure: ReleaseFailure;
 }
 
 export interface DeploymentCreateInput {
@@ -720,6 +799,154 @@ function assertCiFailure(failure: CiFailure | undefined): void {
   }
 }
 
+function assertReleaseFailure(failure: ReleaseFailure | undefined): void {
+  if (failure === undefined) return;
+  if (
+    typeof failure !== 'object' ||
+    failure === null ||
+    !RELEASE_FAILURE_KINDS.includes(failure.kind) ||
+    typeof failure.message !== 'string' ||
+    !failure.message.trim() ||
+    byteLength(failure.message) > MAX_CI_MESSAGE_BYTES ||
+    typeof failure.retryable !== 'boolean'
+  )
+    throw new ValidationError('release failure is invalid');
+  if (
+    failure.exitCode !== undefined &&
+    (!Number.isSafeInteger(failure.exitCode) ||
+      failure.exitCode < 0 ||
+      failure.exitCode > MAX_CI_EXIT_CODE)
+  )
+    throw new ValidationError('release failure exit code is invalid');
+  if (
+    failure.signal !== undefined &&
+    (typeof failure.signal !== 'string' || !/^[A-Z0-9_]{1,32}$/.test(failure.signal))
+  )
+    throw new ValidationError('release failure signal is invalid');
+}
+
+function isSafeReleasePath(value: string): boolean {
+  return (
+    /^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(value) &&
+    !value.split('/').includes('..')
+  );
+}
+
+function assertReleaseProof(proof: ReleaseSuccessProof | undefined): void {
+  if (proof === undefined) return;
+  if (
+    typeof proof !== 'object' ||
+    proof === null ||
+    !UUID_PATTERN.test(proof.releaseId) ||
+    !/^[0-9a-f]{40}$/.test(proof.commitSha) ||
+    typeof proof.remoteReleasePath !== 'string' ||
+    !isSafeReleasePath(proof.remoteReleasePath) ||
+    byteLength(proof.remoteReleasePath) > MAX_RELEASE_PATH_BYTES ||
+    typeof proof.activeTarget !== 'string' ||
+    proof.activeTarget !== proof.remoteReleasePath ||
+    byteLength(proof.activeTarget) > MAX_RELEASE_PATH_BYTES ||
+    typeof proof.pm2ProcessName !== 'string' ||
+    !/^releasedeck-[0-9a-f-]{36}$/.test(proof.pm2ProcessName) ||
+    byteLength(proof.pm2ProcessName) > MAX_RELEASE_PROCESS_NAME_BYTES ||
+    !Number.isSafeInteger(proof.pm2Pid) ||
+    proof.pm2Pid < 1 ||
+    !proof.nginx ||
+    typeof proof.nginx.validated !== 'boolean' ||
+    typeof proof.nginx.reloaded !== 'boolean' ||
+    !proof.nginx.validated ||
+    !proof.nginx.reloaded ||
+    !isDate(proof.completedAt)
+  )
+    throw new ValidationError('release success proof is invalid');
+}
+
+export function assertReleaseExecutionState(
+  deploymentId: string,
+  deploymentCommitSha: string,
+  deploymentStatus: DeploymentStatus,
+  deploymentStage: DeploymentStage,
+  release: DeploymentReleaseExecution | undefined,
+): void {
+  if (release === undefined) return;
+  if (
+    !RELEASE_EXECUTION_STATUSES.includes(release.status) ||
+    release.releaseId !== deploymentId ||
+    !Number.isSafeInteger(release.attemptNumber) ||
+    release.attemptNumber < 1 ||
+    !Number.isSafeInteger(release.fence) ||
+    release.fence < 1 ||
+    typeof release.attemptId !== 'string' ||
+    !UUID_PATTERN.test(release.attemptId)
+  )
+    throw new ValidationError('release execution fencing state is invalid');
+  if (release.status === 'RUNNING') {
+    if (
+      deploymentStatus !== 'RUNNING' ||
+      deploymentStage !== 'DEPLOY' ||
+      !release.attemptId ||
+      !isDate(release.leaseExpiresAt) ||
+      !isDate(release.heartbeatAt) ||
+      !isDate(release.startedAt) ||
+      release.heartbeatAt.valueOf() < release.startedAt.valueOf() ||
+      release.leaseExpiresAt.valueOf() <= release.heartbeatAt.valueOf() ||
+      release.finishedAt !== undefined ||
+      release.failure !== undefined ||
+      release.success !== undefined
+    )
+      throw new ValidationError('running release execution is invalid');
+  } else if (release.status === 'RETRY_PENDING') {
+    if (
+      deploymentStatus !== 'RUNNING' ||
+      deploymentStage !== 'DEPLOY' ||
+      !isDate(release.startedAt) ||
+      release.leaseExpiresAt !== undefined ||
+      release.heartbeatAt !== undefined ||
+      release.finishedAt !== undefined ||
+      release.failure === undefined ||
+      !release.failure.retryable ||
+      release.success !== undefined
+    )
+      throw new ValidationError('retry-pending release execution is invalid');
+  } else if (release.status === 'DEPLOYED') {
+    if (
+      deploymentStatus !== 'SUCCESS' ||
+      deploymentStage !== 'COMPLETE' ||
+      !isDate(release.startedAt) ||
+      !isDate(release.finishedAt) ||
+      release.finishedAt.valueOf() < release.startedAt.valueOf() ||
+      release.leaseExpiresAt !== undefined ||
+      release.heartbeatAt !== undefined ||
+      release.failure !== undefined ||
+      release.success === undefined
+    )
+      throw new ValidationError('deployed release execution is invalid');
+    assertReleaseProof(release.success);
+    if (
+      release.success!.releaseId !== deploymentId ||
+      release.success!.commitSha !== deploymentCommitSha ||
+      !release.success!.remoteReleasePath.endsWith(`/releases/${deploymentId}`) ||
+      release.success!.completedAt.valueOf() < release.startedAt.valueOf() ||
+      release.success!.completedAt.valueOf() > release.finishedAt.valueOf()
+    )
+      throw new ValidationError('release proof identity is invalid');
+  } else if (
+    deploymentStatus !== 'FAILED' ||
+    deploymentStage !== 'DEPLOY' ||
+    !isDate(release.startedAt) ||
+    !isDate(release.finishedAt) ||
+    release.finishedAt.valueOf() < release.startedAt.valueOf() ||
+    release.leaseExpiresAt !== undefined ||
+    release.heartbeatAt !== undefined ||
+    release.failure === undefined ||
+    release.failure.retryable ||
+    release.success !== undefined
+  ) {
+    throw new ValidationError('failed release execution is invalid');
+  }
+  assertReleaseFailure(release.failure);
+  assertReleaseProof(release.success);
+}
+
 function failureMatchesStage(
   stage: CiStage,
   status: CiStepStatus,
@@ -1009,9 +1236,13 @@ export function assertCiExecutionState(
   } else if (ci.status === 'PASSED') {
     const buildIndex = CI_STAGES.indexOf('BUILD');
     if (
-      deploymentStatus !== 'RUNNING' ||
+      !(['RUNNING', 'SUCCESS', 'FAILED'] as readonly DeploymentStatus[]).includes(
+        deploymentStatus,
+      ) ||
       stageOrder.get(deploymentStage) === undefined ||
       (stageOrder.get(deploymentStage) ?? -1) < stageOrder.get('BUILD')! ||
+      (deploymentStatus === 'SUCCESS' && deploymentStage !== 'COMPLETE') ||
+      (deploymentStatus === 'FAILED' && deploymentStage !== 'DEPLOY') ||
       ci.leaseExpiresAt !== undefined ||
       ci.heartbeatAt !== undefined ||
       !isDate(ci.startedAt) ||

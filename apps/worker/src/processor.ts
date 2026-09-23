@@ -7,7 +7,7 @@ import {
   type CiStage,
   type CiStepOutcomeInput,
   type Deployment,
-  type DeploymentRepositoryWithCi,
+  type DeploymentRepositoryWithCiAndRelease,
   type ProjectRepository,
 } from '@releasedeck/db';
 import {
@@ -16,24 +16,45 @@ import {
   ProcessCancelledError,
   ProcessTimeoutError,
   type CiRunner,
+  type CiBuildReadyContext,
   type CiStageResult,
 } from '@releasedeck/ci-runner';
 import type { DeploymentJobContext, DeploymentJobData } from '@releasedeck/queue';
+import type {
+  PreparedRelease,
+  PrepareReleaseInput,
+} from '@releasedeck/release-deployer';
+
+import {
+  processReleaseDeployment,
+  type ReleaseOperations,
+  type ReleaseProcessorOptions,
+} from './release.js';
+
+export interface DeploymentReleaseOperations extends ReleaseOperations {
+  prepareRelease(input: PrepareReleaseInput): Promise<PreparedRelease>;
+}
 
 export interface DeploymentProcessorRepositories {
   readonly deployments: Pick<
-    DeploymentRepositoryWithCi,
+    DeploymentRepositoryWithCiAndRelease,
     | 'findById'
     | 'claimCiExecution'
     | 'reclaimExpiredCiExecution'
     | 'renewCiExecution'
     | 'recordCiStepOutcome'
+    | 'claimReleaseExecution'
+    | 'reclaimExpiredReleaseExecution'
+    | 'renewReleaseExecution'
+    | 'recordReleaseSuccess'
+    | 'recordReleaseFailure'
   >;
   readonly projects: Pick<ProjectRepository, 'findById'>;
 }
 
 export interface DeploymentProcessorOptions {
   readonly leaseMs: number;
+  readonly release: ReleaseProcessorOptions;
   readonly now?: () => Date;
   readonly activeLeasePollMs?: number;
 }
@@ -154,6 +175,9 @@ function canRetry(
   }
   if (!(error instanceof CiStepError)) return true;
   if (error.result === undefined) return false;
+  if (stage === 'BUILD' && error.message === 'CI release artifact preparation failed') {
+    return true;
+  }
   if (stage === 'CHECKOUT') {
     return error.message !== 'checked out revision did not match requested SHA';
   }
@@ -241,6 +265,7 @@ export async function processDeploymentJob(
   context: DeploymentJobContext,
   repositories: DeploymentProcessorRepositories,
   runner: CiRunner,
+  releaseOperations: DeploymentReleaseOperations,
   options: DeploymentProcessorOptions,
 ): Promise<void> {
   const now = options.now ?? (() => new Date());
@@ -250,7 +275,24 @@ export async function processDeploymentJob(
     options,
     context.signal,
   );
-  if (!owned) return;
+  if (!owned) {
+    const current = await repositories.deployments.findById(job.deploymentId);
+    if (current?.ci?.status === 'PASSED') {
+      await processReleaseDeployment(
+        job.deploymentId,
+        context,
+        repositories,
+        releaseOperations,
+        options.release,
+      );
+    } else if (current?.status === 'FAILED' || current?.status === 'ROLLED_BACK') {
+      await releaseOperations.cleanupPreparedRelease(
+        options.release.artifactRoot,
+        job.deploymentId,
+      );
+    }
+    return;
+  }
 
   const controller = new AbortController();
   const forwardAbort = () => controller.abort();
@@ -370,6 +412,18 @@ export async function processDeploymentJob(
         onStageFailed(stage, error) {
           observedFailure = { stage, error };
         },
+        async onBuildReady(build: CiBuildReadyContext) {
+          await releaseOperations.prepareRelease({
+            projectId: owned.deployment.projectId,
+            deploymentId: job.deploymentId,
+            commitSha: owned.deployment.commitSha,
+            workspacePath: build.workspacePath,
+            artifactRoot: options.release.artifactRoot,
+            signal: controller.signal,
+            timeoutMs: options.release.target.timeoutMs,
+            outputLimitBytes: options.release.target.outputLimitBytes,
+          });
+        },
       },
     );
     if (!completedBuild) throw new Error('CI runner returned without a build result');
@@ -403,7 +457,13 @@ export async function processDeploymentJob(
       cleanupFailed ? 'FAILED' : 'CLEANED',
     );
     if (owned.deployment.ci?.status === 'RETRY_PENDING') throw error;
-    if (owned.deployment.status === 'FAILED') return;
+    if (owned.deployment.status === 'FAILED') {
+      await releaseOperations.cleanupPreparedRelease(
+        options.release.artifactRoot,
+        job.deploymentId,
+      );
+      return;
+    }
     throw error;
   } finally {
     stopped = true;
@@ -411,4 +471,12 @@ export async function processDeploymentJob(
     context.signal?.removeEventListener('abort', forwardAbort);
     await mutation;
   }
+
+  await processReleaseDeployment(
+    job.deploymentId,
+    context,
+    repositories,
+    releaseOperations,
+    options.release,
+  );
 }

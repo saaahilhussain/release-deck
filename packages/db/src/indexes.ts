@@ -25,6 +25,11 @@ export const DOMAIN_INDEXES = {
       name: 'deployments_ci_lease_expiry',
       partialFilterExpression: { 'ci.status': { $exists: true } },
     },
+    {
+      key: { 'release.status': 1, 'release.leaseExpiresAt': 1, _id: 1 },
+      name: 'deployments_release_lease_expiry',
+      partialFilterExpression: { 'release.status': { $exists: true } },
+    },
     { key: { createdAt: -1, _id: -1 }, name: 'deployments_created_at_id' },
   ],
   webhookEvents: [

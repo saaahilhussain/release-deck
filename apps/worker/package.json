@@ -15,6 +15,7 @@
     "@releasedeck/ci-runner": "workspace:*",
     "@releasedeck/db": "workspace:*",
     "@releasedeck/queue": "workspace:*",
+    "@releasedeck/release-deployer": "workspace:*",
     "@releasedeck/runtime": "workspace:*"
   },
   "devDependencies": {

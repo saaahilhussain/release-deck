@@ -1,7 +1,7 @@
 import {
   connectMongo,
   initializeDomainRepositories,
-  type DeploymentRepositoryWithCi,
+  type DeploymentRepositoryWithCiAndRelease,
   type DomainRepositories,
   type MongoConnection,
 } from '@releasedeck/db';
@@ -20,8 +20,15 @@ import {
   type RedisConnectionOptions,
   type WorkerEnvironment,
 } from '@releasedeck/runtime';
+import {
+  activateRelease,
+  cleanupPreparedRelease,
+  openPreparedRelease,
+  prepareRelease,
+  stageRelease,
+} from '@releasedeck/release-deployer';
 
-import { processDeploymentJob } from './processor.js';
+import { processDeploymentJob, type DeploymentReleaseOperations } from './processor.js';
 
 export interface WorkerRuntime {
   readonly mongo: MongoConnection;
@@ -41,6 +48,7 @@ export interface WorkerStartupDependencies {
     options: { readonly concurrency: number },
   ): DeploymentWorker;
   createCiRunner?: typeof createCiRunner;
+  releaseOperations?: DeploymentReleaseOperations;
   logger: Logger;
 }
 
@@ -96,16 +104,43 @@ export async function startWorker(
         outputLimitBytes: environment.CI_MAX_OUTPUT_BYTES,
       },
     });
+    const releaseOperations: DeploymentReleaseOperations =
+      dependencies.releaseOperations ?? {
+        prepareRelease,
+        openPreparedRelease,
+        stageRelease,
+        activateRelease,
+        cleanupPreparedRelease,
+      };
     const processJob: DeploymentJobProcessor = (job, context) =>
       processDeploymentJob(
         job,
         context,
         {
-          deployments: connectedRepositories.deployments as DeploymentRepositoryWithCi,
+          deployments:
+            connectedRepositories.deployments as DeploymentRepositoryWithCiAndRelease,
           projects: connectedRepositories.projects,
         },
         runner,
-        { leaseMs: environment.CI_LEASE_MS },
+        releaseOperations,
+        {
+          leaseMs: environment.CI_LEASE_MS,
+          release: {
+            artifactRoot: environment.RELEASE_ARTIFACT_ROOT,
+            leaseMs: environment.RELEASE_LEASE_MS,
+            retention: environment.RELEASE_RETENTION,
+            target: {
+              host: environment.RELEASE_SSH_HOST,
+              port: environment.RELEASE_SSH_PORT,
+              user: environment.RELEASE_SSH_USER,
+              privateKeyPath: environment.RELEASE_SSH_PRIVATE_KEY_PATH,
+              knownHostsPath: environment.RELEASE_SSH_KNOWN_HOSTS_PATH,
+              remoteRoot: environment.RELEASE_REMOTE_ROOT,
+              timeoutMs: environment.RELEASE_TIMEOUT_MS,
+              outputLimitBytes: environment.RELEASE_MAX_OUTPUT_BYTES,
+            },
+          },
+        },
       );
     deploymentWorker = (
       dependencies.createDeploymentWorker ??

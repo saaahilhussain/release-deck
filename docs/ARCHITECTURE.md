@@ -10,9 +10,9 @@ The repository contains the approved Phase 1 process foundation, Phase 2 API
 domain/persistence work at commit `447435f`, approved Phase 3 GitHub-to-queue
 work at commit `c096926`, and the approved Phase 4 CI runner. It is a
 pnpm/Turborepo monorepo with three
-applications and five useful shared packages. Build, typecheck, test, lint,
+applications and six useful shared packages. Build, typecheck, test, lint,
 formatting, runtime verification, isolated persistence verification, and
-real-service Phase 3 and Phase 4 flows are supported by root commands.
+real-service Phase 3, Phase 4, and Phase 5 flows are supported by root commands.
 
 ## Implemented Phase 1 foundation
 
@@ -159,8 +159,51 @@ then drains the consumer before Redis and MongoDB close.
 
 These workspaces provide lifecycle and path isolation, not a security sandbox.
 Build commands still run with the worker account's OS privileges. Container or
-OS isolation for hostile repositories, target deployment, release management,
-health-gated promotion, and rollback remain later phases.
+OS isolation for hostile repositories, health-gated promotion, and rollback
+remain later phases.
+
+## Implemented Phase 5 immutable release deployment
+
+After a successful exact-SHA build, the CI runner invokes a preparation hook
+while the disposable workspace still exists. `packages/release-deployer`
+creates a deterministic archive outside that workspace, embeds bounded project,
+deployment, commit, and digest metadata, and excludes Git state, environment
+files, and local caches. The Phase 4 workspace is then removed normally and CI
+success is persisted before target mutation begins.
+
+The worker claims a separate MongoDB release attempt guarded by an attempt UUID,
+lease, version, and monotonically increasing fencing token. It reopens and
+verifies the durable archive, uploads it using fixed OpenSSH/SCP argument arrays,
+and runs fixed POSIX scripts on one configured Linux target. Strict known-hosts
+checking, identity-only batch authentication, bounded output and time, and
+process-tree cancellation apply to transport commands. Password prompts and
+arbitrary remote command text are not supported.
+
+The remote layout is implemented as:
+
+```text
+<remoteRoot>/<projectId>/
+  releases/<deploymentId>/
+  shared/.env
+  current → releases/<deploymentId>
+```
+
+Staging validates the archive digest and embedded identity before publishing an
+immutable release directory. An existing directory is reusable only when all
+identity and digest metadata match. A per-project remote lock serializes
+activations and retention across deployment IDs. Activation atomically replaces `current`,
+reloads the fixed project PM2 process, validates and reloads pre-provisioned
+Nginx, proves the active target and PM2 PID, and removes only surplus validated
+inactive release directories while retaining the active release and at least
+one predecessor. Bounded proof is persisted before the deployment reaches
+`SUCCESS/COMPLETE`; transport and remote failures follow the worker retry budget
+and end at `RETRY_PENDING` or `FAILED/DEPLOY`.
+
+Operators must pre-provision the target account, SSH key and known-hosts file,
+`shared/.env`, POSIX `flock`, PM2, the application ecosystem file, and passwordless permission
+for only the required Nginx validation/reload operations. Phase 5 activates
+directly after infrastructure proof. It does not perform application health
+checks, designate a known-good release, or roll back; those remain Phase 6.
 
 ## Target control and execution planes
 
@@ -176,8 +219,8 @@ GitHub signed webhook → API → MongoDB authoritative state
 ```
 
 The flow through the worker's initial authoritative state claim is implemented
-in Phase 3, and Phase 4 implements the worker-owned CI portion through
-`RUNNING/BUILD` plus CI `PASSED`. Later phases extend the worker into deployment.
+in Phase 3, Phase 4 implements the worker-owned CI portion, and Phase 5 extends
+the worker through immutable release activation and `SUCCESS/COMPLETE`.
 Long-running CI and deployment operations must never run inside HTTP handlers.
 
 The implemented domain keeps overall deployment status separate from pipeline
@@ -188,9 +231,9 @@ attempt. Status
 (`QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`, `ROLLED_BACK`) describes the outcome;
 the worker will drive stage progress in later phases.
 
-## Target deployment and release model
+## Implemented deployment and target release evolution
 
-Later phases target immutable versioned releases on Linux/EC2:
+Phase 5 implements immutable versioned releases on one configured Linux target:
 
 ```text
 /srv/apps/<project>/
@@ -199,11 +242,10 @@ Later phases target immutable versioned releases on Linux/EC2:
   current → releases/<active-release>
 ```
 
-Each successful build will create a distinct release. Health-gated promotion
-will switch `current`; rollback will activate an already-built known-good
-release without rebuilding the old commit. The repository does not implement
-SSH, Linux/EC2 deployment, PM2, Nginx, release switching, health checks, or
-rollback yet.
+Each successful build creates a release keyed by deployment UUID and Phase 5
+directly switches `current` after PM2/Nginx infrastructure checks. Phase 6 will
+add application health-gated promotion and rollback to an already-built
+known-good release without rebuilding the old commit.
 
 ## Target observability boundary
 
@@ -216,9 +258,8 @@ is intentionally deferred until that phase.
 
 The implemented system uses Node.js, Express, React, Vite, TypeScript, native
 MongoDB, Redis, Zod, Pino, ioredis, BullMQ, Git, and fixed npm/pnpm CI commands.
-SSH to Linux/EC2, PM2,
-and Nginx belong to remote
-release deployment; Server-Sent Events are preferred later for server-to-browser
+Remote release deployment uses system OpenSSH, POSIX shell tools, PM2, and
+Nginx. Server-Sent Events are preferred later for server-to-browser
 status and log streams. Phosphor icons and the shadcn-inspired visual system
 belong to the later dashboard phase. No technology is added solely for résumé
 value.
@@ -233,4 +274,5 @@ isolation for untrusted build commands remain explicit future security work.
 Phase 4 removes control-plane credentials from child environments and confines
 workspace lifecycle beneath a validated root, but it does not provide a hostile-
 code sandbox. The system still lacks broader authentication, authorization,
-production-grade reconnect, target release deployment, and telemetry behavior.
+production-grade reconnect, application health-gated promotion, rollback, and
+telemetry behavior.

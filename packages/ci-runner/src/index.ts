@@ -4,6 +4,7 @@ export {
   CiStepError,
   createCiRunner,
   type CiLimits,
+  type CiBuildReadyContext,
   type CiRunInput,
   type CiRunResult,
   type CiRunner,

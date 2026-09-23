@@ -7,6 +7,7 @@ import {
   createWebhookEvent,
   assertDeploymentState,
   assertCiExecutionState,
+  assertReleaseExecutionState,
   assertCiOutcomeCleanup,
   createCiStepResult,
   nextCiStage,
@@ -19,11 +20,20 @@ import {
   DEFAULT_CI_LEASE_MS,
   MIN_CI_LEASE_MS,
   MAX_CI_LEASE_MS,
+  DEFAULT_RELEASE_LEASE_MS,
+  MIN_RELEASE_LEASE_MS,
+  MAX_RELEASE_LEASE_MS,
   CI_STAGES,
   type CiExecutionClaim,
   type CiExecutionLeaseInput,
   type CiStepOutcomeInput,
   type DeploymentCiExecution,
+  type DeploymentReleaseExecution,
+  type ReleaseExecutionClaim,
+  type ReleaseExecutionClaimOptions,
+  type ReleaseExecutionLeaseInput,
+  type ReleaseSuccessInput,
+  type ReleaseFailureInput,
   type DeploymentStage,
   type DeploymentStatus,
   type Deployment,
@@ -111,6 +121,29 @@ export interface DeploymentRepository {
     outcome: CiStepOutcomeInput,
     now?: Date,
   ): Promise<Deployment>;
+  claimReleaseExecution?(
+    id: string,
+    options?: ReleaseExecutionClaimOptions,
+  ): Promise<ReleaseExecutionClaim | null>;
+  reclaimExpiredReleaseExecution?(
+    id: string,
+    options?: ReleaseExecutionClaimOptions,
+  ): Promise<ReleaseExecutionClaim | null>;
+  renewReleaseExecution?(
+    id: string,
+    lease: ReleaseExecutionLeaseInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseSuccess?(
+    id: string,
+    outcome: ReleaseSuccessInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseFailure?(
+    id: string,
+    outcome: ReleaseFailureInput,
+    now?: Date,
+  ): Promise<Deployment>;
 }
 
 export interface CiExecutionClaimOptions {
@@ -146,6 +179,37 @@ export interface CiDeploymentRepository {
 }
 
 export type DeploymentRepositoryWithCi = DeploymentRepository & CiDeploymentRepository;
+
+export interface ReleaseDeploymentRepository {
+  claimReleaseExecution(
+    id: string,
+    options?: ReleaseExecutionClaimOptions,
+  ): Promise<ReleaseExecutionClaim | null>;
+  reclaimExpiredReleaseExecution(
+    id: string,
+    options?: ReleaseExecutionClaimOptions,
+  ): Promise<ReleaseExecutionClaim | null>;
+  renewReleaseExecution(
+    id: string,
+    lease: ReleaseExecutionLeaseInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseSuccess(
+    id: string,
+    outcome: ReleaseSuccessInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseFailure(
+    id: string,
+    outcome: ReleaseFailureInput,
+    now?: Date,
+  ): Promise<Deployment>;
+}
+
+export type DeploymentRepositoryWithRelease = DeploymentRepository &
+  ReleaseDeploymentRepository;
+export type DeploymentRepositoryWithCiAndRelease = DeploymentRepositoryWithCi &
+  ReleaseDeploymentRepository;
 
 export interface WebhookEventRepository {
   create(input: WebhookEventCreateInput): Promise<WebhookEvent>;
@@ -202,6 +266,23 @@ function ciLeaseMs(value: number | undefined): number {
     throw new ValidationError('CI lease duration is invalid');
   }
   return leaseMs;
+}
+
+function releaseNow(value: Date | undefined): Date {
+  const now = value ?? new Date();
+  if (!(now instanceof Date) || Number.isNaN(now.valueOf()))
+    throw new ValidationError('release timestamp is invalid');
+  return now;
+}
+function releaseLeaseMs(value: number | undefined): number {
+  const ms = value ?? DEFAULT_RELEASE_LEASE_MS;
+  if (
+    !Number.isSafeInteger(ms) ||
+    ms < MIN_RELEASE_LEASE_MS ||
+    ms > MAX_RELEASE_LEASE_MS
+  )
+    throw new ValidationError('release lease duration is invalid');
+  return ms;
 }
 
 function ciTokenValid(attemptId: string, fence: number): boolean {
@@ -271,6 +352,9 @@ function deploymentFromDocument(document: Document): Deployment {
       ? {}
       : { sourceWebhookEventId: value.sourceWebhookEventId }),
     ...(value.ci === undefined ? {} : { ci: value.ci as DeploymentCiExecution }),
+    ...(value.release === undefined
+      ? {}
+      : { release: value.release as DeploymentReleaseExecution }),
     createdAt: asDate(value.createdAt),
     updatedAt: asDate(value.updatedAt),
   };
@@ -283,6 +367,13 @@ function deploymentFromDocument(document: Document): Deployment {
       throw new ValidationError('CI execution is invalid');
     }
     assertCiExecutionState(record.status, record.stage, record.ci);
+    assertReleaseExecutionState(
+      record.id,
+      record.commitSha,
+      record.status,
+      record.stage,
+      record.release,
+    );
   } catch {
     throw new PersistenceError();
   }
@@ -813,6 +904,334 @@ function createDeploymentsRepository(
     }
   };
 
+  const updateRelease = async (
+    current: Deployment,
+    next: Deployment,
+    extra: Document,
+  ): Promise<boolean> => {
+    const result = await collection.updateOne(
+      { _id: current.id, version: current.version, ...extra },
+      {
+        $set: {
+          status: next.status,
+          stage: next.stage,
+          release: next.release as DeploymentReleaseExecution,
+          ...(next.ci === undefined ? {} : { ci: next.ci }),
+          updatedAt: next.updatedAt,
+        },
+        $inc: { version: 1 },
+      },
+    );
+    return result.matchedCount === 1;
+  };
+  const claimRelease = async (
+    id: string,
+    options: ReleaseExecutionClaimOptions | undefined,
+    reclaimOnly: boolean,
+  ): Promise<ReleaseExecutionClaim | null> => {
+    try {
+      const now = releaseNow(options?.now);
+      const leaseMs = releaseLeaseMs(options?.leaseMs);
+      if (!UUID_PATTERN.test(id)) throw new ValidationError('deployment ID is invalid');
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.release;
+      if (existing?.status === 'RUNNING') {
+        if (
+          !reclaimOnly ||
+          !existing.leaseExpiresAt ||
+          existing.leaseExpiresAt.valueOf() > now.valueOf()
+        )
+          return null;
+      } else if (reclaimOnly) return null;
+      const ciPassed =
+        current.ci?.status === 'PASSED' &&
+        current.stage === 'BUILD' &&
+        current.status === 'RUNNING';
+      const reclaiming =
+        reclaimOnly &&
+        existing?.status === 'RUNNING' &&
+        current.stage === 'DEPLOY' &&
+        current.status === 'RUNNING';
+      const retrying =
+        existing?.status === 'RETRY_PENDING' &&
+        current.stage === 'DEPLOY' &&
+        current.status === 'RUNNING';
+      if (
+        (!ciPassed && !retrying && !reclaiming) ||
+        existing?.status === 'DEPLOYED' ||
+        existing?.status === 'FAILED'
+      )
+        return null;
+      if (reclaimOnly && existing?.status !== 'RUNNING') return null;
+      const attemptId = randomUUID();
+      const fence = (existing?.fence ?? 0) + 1;
+      const attemptNumber = (existing?.attemptNumber ?? 0) + 1;
+      const release: DeploymentReleaseExecution = {
+        status: 'RUNNING',
+        releaseId: current.id,
+        attemptNumber,
+        fence,
+        attemptId,
+        leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+        heartbeatAt: now,
+        startedAt: now,
+      };
+      const next: Deployment = {
+        ...current,
+        stage: 'DEPLOY',
+        release,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertDeploymentState(next.status, next.stage);
+      assertCiExecutionState(next.status, next.stage, next.ci);
+      assertReleaseExecutionState(
+        next.id,
+        next.commitSha,
+        next.status,
+        next.stage,
+        release,
+      );
+      const filter: Document = existing
+        ? {
+            'release.status': existing.status,
+            'release.fence': existing.fence,
+            ...(existing.attemptId ? { 'release.attemptId': existing.attemptId } : {}),
+            ...(reclaimOnly ? { 'release.leaseExpiresAt': { $lte: now } } : {}),
+          }
+        : { release: { $exists: false }, 'ci.status': 'PASSED' };
+      if (!(await updateRelease(current, next, filter))) return null;
+      return {
+        attemptId,
+        fence,
+        attemptNumber,
+        leaseExpiresAt: release.leaseExpiresAt!,
+        deployment: next,
+      };
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+  const renewRelease = async (
+    id: string,
+    lease: ReleaseExecutionLeaseInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    try {
+      const now = releaseNow(nowInput);
+      const leaseMs = releaseLeaseMs(lease.leaseMs);
+      if (
+        !UUID_PATTERN.test(id) ||
+        !Number.isSafeInteger(lease.expectedVersion) ||
+        lease.expectedVersion < 1 ||
+        !ciTokenValid(lease.attemptId, lease.fence)
+      )
+        throw new ValidationError('release lease token is invalid');
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.release;
+      if (
+        lease.expectedVersion !== current.version ||
+        existing?.status !== 'RUNNING' ||
+        existing.attemptId !== lease.attemptId.toLowerCase() ||
+        existing.fence !== lease.fence ||
+        !existing.leaseExpiresAt ||
+        existing.leaseExpiresAt.valueOf() <= now.valueOf()
+      )
+        throw new ConcurrencyError();
+      const release = {
+        ...existing,
+        leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+        heartbeatAt: now,
+      };
+      const next = {
+        ...current,
+        release,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertReleaseExecutionState(
+        next.id,
+        next.commitSha,
+        next.status,
+        next.stage,
+        release,
+      );
+      if (
+        !(await updateRelease(current, next, {
+          'release.status': 'RUNNING',
+          'release.attemptId': lease.attemptId.toLowerCase(),
+          'release.fence': lease.fence,
+          'release.leaseExpiresAt': { $gt: now },
+        }))
+      )
+        throw new ConcurrencyError();
+      return next;
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+  const recordReleaseSuccess = async (
+    id: string,
+    outcome: ReleaseSuccessInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    try {
+      const now = releaseNow(nowInput);
+      if (
+        !UUID_PATTERN.test(id) ||
+        !Number.isSafeInteger(outcome.expectedVersion) ||
+        outcome.expectedVersion < 1 ||
+        !ciTokenValid(outcome.attemptId, outcome.fence)
+      )
+        throw new ValidationError('release success token is invalid');
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.release;
+      if (
+        outcome.expectedVersion !== current.version ||
+        existing?.status !== 'RUNNING' ||
+        existing.attemptId !== outcome.attemptId.toLowerCase() ||
+        existing.fence !== outcome.fence ||
+        !existing.leaseExpiresAt ||
+        existing.leaseExpiresAt.valueOf() <= now.valueOf()
+      )
+        throw new ConcurrencyError();
+      const proof = {
+        ...outcome.proof,
+        releaseId: outcome.proof.releaseId.trim().toLowerCase(),
+        commitSha: outcome.proof.commitSha.trim().toLowerCase(),
+      };
+      const releaseBase = { ...existing } as {
+        -readonly [
+          K in keyof DeploymentReleaseExecution
+        ]?: DeploymentReleaseExecution[K];
+      };
+      delete releaseBase.leaseExpiresAt;
+      delete releaseBase.heartbeatAt;
+      delete releaseBase.failure;
+      const release = {
+        ...releaseBase,
+        releaseId: existing.releaseId,
+        attemptNumber: existing.attemptNumber,
+        fence: existing.fence,
+        status: 'DEPLOYED' as const,
+        finishedAt: now,
+        success: proof,
+      } as DeploymentReleaseExecution;
+      const next = {
+        ...current,
+        status: 'SUCCESS' as const,
+        stage: 'COMPLETE' as const,
+        release,
+        version: current.version + 1,
+        updatedAt: now,
+      };
+      assertCiExecutionState(next.status, next.stage, next.ci);
+      assertReleaseExecutionState(
+        next.id,
+        next.commitSha,
+        next.status,
+        next.stage,
+        release,
+      );
+      if (
+        !(await updateRelease(current, next, {
+          'release.status': 'RUNNING',
+          'release.attemptId': outcome.attemptId.toLowerCase(),
+          'release.fence': outcome.fence,
+          'release.leaseExpiresAt': { $gt: now },
+        }))
+      )
+        throw new ConcurrencyError();
+      return next;
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+  const recordReleaseFailure = async (
+    id: string,
+    outcome: ReleaseFailureInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    try {
+      const now = releaseNow(nowInput);
+      if (
+        !UUID_PATTERN.test(id) ||
+        !Number.isSafeInteger(outcome.expectedVersion) ||
+        outcome.expectedVersion < 1 ||
+        !ciTokenValid(outcome.attemptId, outcome.fence)
+      )
+        throw new ValidationError('release failure token is invalid');
+      const document = await collection.findOne({ _id: id });
+      if (!document) throw new NotFoundError();
+      const current = deploymentFromDocument(document);
+      const existing = current.release;
+      if (
+        outcome.expectedVersion !== current.version ||
+        existing?.status !== 'RUNNING' ||
+        existing.attemptId !== outcome.attemptId.toLowerCase() ||
+        existing.fence !== outcome.fence ||
+        !existing.leaseExpiresAt ||
+        existing.leaseExpiresAt.valueOf() <= now.valueOf()
+      )
+        throw new ConcurrencyError();
+      const failure = outcome.failure;
+      const releaseBase = { ...existing } as {
+        -readonly [
+          K in keyof DeploymentReleaseExecution
+        ]?: DeploymentReleaseExecution[K];
+      };
+      delete releaseBase.leaseExpiresAt;
+      delete releaseBase.heartbeatAt;
+      delete releaseBase.success;
+      delete releaseBase.finishedAt;
+      const release = {
+        ...releaseBase,
+        releaseId: existing.releaseId,
+        attemptNumber: existing.attemptNumber,
+        fence: existing.fence,
+        status: failure.retryable ? ('RETRY_PENDING' as const) : ('FAILED' as const),
+        ...(failure.retryable ? {} : { finishedAt: now }),
+        failure,
+      } as DeploymentReleaseExecution;
+      const next = failure.retryable
+        ? { ...current, release, version: current.version + 1, updatedAt: now }
+        : {
+            ...current,
+            status: 'FAILED' as const,
+            stage: 'DEPLOY' as const,
+            release,
+            version: current.version + 1,
+            updatedAt: now,
+          };
+      assertCiExecutionState(next.status, next.stage, next.ci);
+      assertReleaseExecutionState(
+        next.id,
+        next.commitSha,
+        next.status,
+        next.stage,
+        release,
+      );
+      if (
+        !(await updateRelease(current, next, {
+          'release.status': 'RUNNING',
+          'release.attemptId': outcome.attemptId.toLowerCase(),
+          'release.fence': outcome.fence,
+          'release.leaseExpiresAt': { $gt: now },
+        }))
+      )
+        throw new ConcurrencyError();
+      return next;
+    } catch (error) {
+      mapMongoError(error);
+    }
+  };
+
   return {
     createQueued,
     create: createQueued,
@@ -877,6 +1296,11 @@ function createDeploymentsRepository(
     reclaimExpiredCiExecution: (id, options) => claim(id, options, true),
     renewCiExecution: renew,
     recordCiStepOutcome: recordOutcome,
+    claimReleaseExecution: (id, options) => claimRelease(id, options, false),
+    reclaimExpiredReleaseExecution: (id, options) => claimRelease(id, options, true),
+    renewReleaseExecution: renewRelease,
+    recordReleaseSuccess,
+    recordReleaseFailure,
   };
 }
 

@@ -24,6 +24,11 @@ import {
   createDeploymentWorker,
 } from '../packages/queue/dist/index.js';
 import { connectRedis, createLogger } from '../packages/runtime/dist/index.js';
+import {
+  cleanupPreparedRelease,
+  openPreparedRelease,
+  prepareRelease,
+} from '../packages/release-deployer/dist/index.js';
 import { startWorker } from '../apps/worker/dist/worker.js';
 
 const execFile = promisify(execFileCallback);
@@ -45,6 +50,7 @@ let redisNamespaceOwned = false;
 let fixtureRoot;
 let workspaceRoot;
 let sentinelRoot;
+let artifactRoot;
 
 function requiredEnvironment(name) {
   const value = process.env[name];
@@ -161,6 +167,10 @@ async function createFixture(directory, { testSource, buildSource }) {
   );
   await writeFile(join(directory, 'test.mjs'), `${testSource}\n`);
   await writeFile(join(directory, 'build.mjs'), `${buildSource}\n`);
+  await writeFile(
+    join(directory, 'ecosystem.config.cjs'),
+    'module.exports = { apps: [] };\n',
+  );
 }
 
 async function createTwoCommitFixture() {
@@ -301,6 +311,7 @@ try {
   fixtureRoot = await mkdtemp(join(tmpdir(), 'releasedeck-phase4-fixtures-'));
   workspaceRoot = await mkdtemp(join(tmpdir(), 'releasedeck-phase4-workspaces-'));
   sentinelRoot = await mkdtemp(join(tmpdir(), 'releasedeck-phase4-sentinel-'));
+  artifactRoot = await mkdtemp(join(tmpdir(), 'releasedeck-phase4-artifacts-'));
   await writeFile(join(sentinelRoot, 'keep.txt'), 'must survive workspace cleanup\n');
 
   stage = 'MongoDB isolation check';
@@ -351,6 +362,17 @@ try {
     CI_MAX_OUTPUT_BYTES: 1_024,
     CI_LEASE_MS: 10_000,
     CI_CONCURRENCY: 1,
+    RELEASE_SSH_HOST: 'target.example.com',
+    RELEASE_SSH_PORT: 22,
+    RELEASE_SSH_USER: 'deployer',
+    RELEASE_SSH_PRIVATE_KEY_PATH: join(fixtureRoot, 'key'),
+    RELEASE_SSH_KNOWN_HOSTS_PATH: join(fixtureRoot, 'known_hosts'),
+    RELEASE_REMOTE_ROOT: '/srv/apps',
+    RELEASE_ARTIFACT_ROOT: artifactRoot,
+    RELEASE_TIMEOUT_MS: 30_000,
+    RELEASE_MAX_OUTPUT_BYTES: 4_096,
+    RELEASE_LEASE_MS: 10_000,
+    RELEASE_RETENTION: 5,
   };
   const workerRunner = await startWorker(environment, {
     connectMongo,
@@ -376,6 +398,26 @@ try {
         },
       };
     },
+    releaseOperations: {
+      prepareRelease,
+      openPreparedRelease,
+      stageRelease: async () => undefined,
+      activateRelease: async (input) => {
+        const releasePath = `/srv/apps/${input.projectId}/releases/${input.deploymentId}`;
+        return {
+          projectId: input.projectId,
+          deploymentId: input.deploymentId,
+          commitSha: input.commitSha,
+          remoteReleasePath: releasePath,
+          activeTarget: releasePath,
+          pm2ProcessName: `releasedeck-${input.projectId}`,
+          pm2Pid: 4321,
+          nginx: { validated: true, reloaded: true },
+          completedAt: new Date(),
+        };
+      },
+      cleanupPreparedRelease,
+    },
     logger: createLogger('silent'),
   });
   worker = workerRunner;
@@ -384,10 +426,10 @@ try {
   await queue.enqueueDeployment(deployment.id);
   const passed = await waitFor(async () => {
     const current = await repositories.deployments.findById(deployment.id);
-    return current?.ci?.status === 'PASSED' ? current : undefined;
-  }, 'CI deployment to pass');
-  assert.equal(passed.status, 'RUNNING');
-  assert.equal(passed.stage, 'BUILD');
+    return current?.status === 'SUCCESS' ? current : undefined;
+  }, 'CI deployment to pass and release processing to complete');
+  assert.equal(passed.status, 'SUCCESS');
+  assert.equal(passed.stage, 'COMPLETE');
   assert.equal(passed.commitSha, source.firstSha);
   assert.deepEqual(
     passed.ci?.stepResults.map((result) => result.stage),
@@ -412,7 +454,7 @@ try {
     'retained completed queue job',
   );
   console.log(
-    'PASS Phase 4: worker/queue CI flow checked out the requested older SHA and passed CHECKOUT/INSTALL/TEST/BUILD at RUNNING/BUILD',
+    'PASS Phase 4: worker/queue CI flow checked out the requested older SHA and retained CHECKOUT/INSTALL/TEST/BUILD evidence through current release completion',
   );
 
   stage = 'durable worker failure flow';
@@ -613,7 +655,7 @@ if (mongoConnection) {
     }
   }
 }
-for (const directory of [workspaceRoot, fixtureRoot, sentinelRoot]) {
+for (const directory of [workspaceRoot, artifactRoot, fixtureRoot, sentinelRoot]) {
   if (!directory) continue;
   try {
     await rm(directory, { recursive: true, force: true });
