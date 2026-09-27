@@ -13,6 +13,10 @@ pnpm/Turborepo monorepo with three
 applications and six useful shared packages. Build, typecheck, test, lint,
 formatting, runtime verification, isolated persistence verification, and
 real-service Phase 3, Phase 4, and Phase 5 flows are supported by root commands.
+Phase 6 health-gated promotion and rollback is implemented and verified in the
+current uncommitted worktree; its commit/push awaits explicit approval. The
+Phase 6 verifier uses real MongoDB/Redis/worker/CI with a simulated remote
+operation, while Linux fixture tests exercise the fixed remote scripts.
 
 ## Implemented Phase 1 foundation
 
@@ -159,8 +163,8 @@ then drains the consumer before Redis and MongoDB close.
 
 These workspaces provide lifecycle and path isolation, not a security sandbox.
 Build commands still run with the worker account's OS privileges. Container or
-OS isolation for hostile repositories, health-gated promotion, and rollback
-remain later phases.
+OS isolation for hostile repositories remains future work. Phase 6 adds health
+promotion and rollback beyond this Phase 4 boundary.
 
 ## Implemented Phase 5 immutable release deployment
 
@@ -202,8 +206,37 @@ and end at `RETRY_PENDING` or `FAILED/DEPLOY`.
 Operators must pre-provision the target account, SSH key and known-hosts file,
 `shared/.env`, POSIX `flock`, PM2, the application ecosystem file, and passwordless permission
 for only the required Nginx validation/reload operations. Phase 5 activates
-directly after infrastructure proof. It does not perform application health
-checks, designate a known-good release, or roll back; those remain Phase 6.
+directly after infrastructure proof. The Phase 6 extension below adds
+application health checks and rollback.
+
+## Implemented Phase 6 health promotion and rollback (uncommitted)
+
+The worker configures a loopback-only HTTP health URL, bounded attempts,
+request timeout, interval, and remote deadline. The release-deployer activates a
+candidate under the existing per-project lock, re-proves its immutable identity
+and process/infrastructure state, and uses target-local curl to require a 2xx
+application response before updating `known-good` and `previous-known-good`.
+Health response bodies are not persisted. Curl bypasses proxy settings for the
+loopback probe.
+
+If a candidate is unhealthy, the locked remote operation restores the validated
+previous known-good release directory, reloads PM2/Nginx, repeats health and
+identity proof, and records `ROLLED_BACK/ROLLBACK`. A failed restoration records
+`FAILED/ROLLBACK` without claiming the predecessor is healthy. An unhealthy
+first release has no certified predecessor and records `FAILED/HEALTH_CHECK`.
+Retention protects the active and restorable directories and does not delete
+invalid directory entries. Legacy Phase 5 records stay readable but are not
+implicitly certified healthy.
+
+Manual rollback is an operator-run worker CLI that names the active and desired
+previous deployment IDs. MongoDB claims and renews the operation with version,
+lease, and fencing guards. The remote predecessor pointer and immutable metadata
+must match. A stable request ID is written with source/target identity before
+switching `current`, allowing a reclaimed attempt to re-prove a completed switch
+after a persistence interruption. Stale pre-mutation requests become a durable
+`REJECTED` manual operation while preserving historical deployment success.
+An uncertain post-mutation failure does not claim success. There is no public
+rollback HTTP route or dashboard control yet.
 
 ## Target control and execution planes
 
@@ -219,8 +252,9 @@ GitHub signed webhook → API → MongoDB authoritative state
 ```
 
 The flow through the worker's initial authoritative state claim is implemented
-in Phase 3, Phase 4 implements the worker-owned CI portion, and Phase 5 extends
-the worker through immutable release activation and `SUCCESS/COMPLETE`.
+in Phase 3, Phase 4 implements the worker-owned CI portion, Phase 5 extends the
+worker through immutable release activation, and Phase 6 gates
+`SUCCESS/COMPLETE` on application health and provides rollback outcomes.
 Long-running CI and deployment operations must never run inside HTTP handlers.
 
 The implemented domain keeps overall deployment status separate from pipeline
@@ -229,7 +263,7 @@ constraint plus recoverable state to make processing idempotent. Phase 4 adds
 leased, fenced CI attempt state so stale workers cannot advance a reclaimed
 attempt. Status
 (`QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`, `ROLLED_BACK`) describes the outcome;
-the worker will drive stage progress in later phases.
+the worker drives stage progress through the implemented CI and release flows.
 
 ## Implemented deployment and target release evolution
 
@@ -242,10 +276,9 @@ Phase 5 implements immutable versioned releases on one configured Linux target:
   current → releases/<active-release>
 ```
 
-Each successful build creates a release keyed by deployment UUID and Phase 5
-directly switches `current` after PM2/Nginx infrastructure checks. Phase 6 will
-add application health-gated promotion and rollback to an already-built
-known-good release without rebuilding the old commit.
+Each successful build creates a release keyed by deployment UUID. Phase 6
+health-gates promotion and can restore an already-built known-good release
+without rebuilding the old commit.
 
 ## Target observability boundary
 
@@ -274,5 +307,5 @@ isolation for untrusted build commands remain explicit future security work.
 Phase 4 removes control-plane credentials from child environments and confines
 workspace lifecycle beneath a validated root, but it does not provide a hostile-
 code sandbox. The system still lacks broader authentication, authorization,
-production-grade reconnect, application health-gated promotion, rollback, and
-telemetry behavior.
+production-grade reconnect, and telemetry behavior. The Phase 6 manual CLI is
+operator-controlled; an authorized public rollback route remains future work.

@@ -6,12 +6,13 @@ import {
   type DeploymentRepositoryWithCiAndRelease,
   type ReleaseExecutionClaim,
   type ReleaseFailure,
+  type ReleaseRollbackTarget,
 } from '@releasedeck/db';
 import type { DeploymentJobContext } from '@releasedeck/queue';
 import {
   ReleaseDeployerError,
   type PreparedRelease,
-  type ReleaseProof,
+  type PromotionOutcome,
   type SshTarget,
 } from '@releasedeck/release-deployer';
 
@@ -33,7 +34,7 @@ export interface ReleaseOperations {
     readonly target: SshTarget;
     readonly signal?: AbortSignal;
   }): Promise<void>;
-  activateRelease(input: {
+  promoteRelease(input: {
     readonly projectId: string;
     readonly deploymentId: string;
     readonly commitSha: string;
@@ -42,7 +43,7 @@ export interface ReleaseOperations {
     readonly target: SshTarget;
     readonly signal?: AbortSignal;
     readonly now?: () => Date;
-  }): Promise<ReleaseProof>;
+  }): Promise<PromotionOutcome>;
   cleanupPreparedRelease(artifactRoot: string, deploymentId: string): Promise<void>;
 }
 
@@ -53,7 +54,10 @@ export interface ReleaseProcessorRepositories {
     | 'claimReleaseExecution'
     | 'reclaimExpiredReleaseExecution'
     | 'renewReleaseExecution'
-    | 'recordReleaseSuccess'
+    | 'advanceReleaseStage'
+    | 'recordReleasePromotion'
+    | 'recordReleaseRollback'
+    | 'recordReleaseRollbackFailure'
     | 'recordReleaseFailure'
   >;
 }
@@ -173,6 +177,8 @@ function releaseFailure(
       REMOTE_FAILED: 'remote release operation failed',
       LEASE_LOST: 'release execution lease was lost',
       CANCELLED: 'release operation was cancelled',
+      NO_KNOWN_GOOD: 'no previous healthy release exists',
+      ROLLBACK_FAILED: 'release rollback failed',
     }[kind];
     return {
       kind,
@@ -189,7 +195,28 @@ function releaseFailure(
   };
 }
 
-/** Activate one already-staged immutable release under a fenced DB lease. */
+function rollbackTarget(
+  restored: {
+    readonly deploymentId: string;
+    readonly releaseId?: string;
+    readonly commitSha: string;
+    readonly remoteReleasePath?: string;
+    readonly activeTarget?: string;
+  },
+  projectId: string,
+  remoteRoot: string,
+): ReleaseRollbackTarget {
+  const releasePath = `${remoteRoot}/${projectId}/releases/${restored.deploymentId}`;
+  return {
+    deploymentId: restored.deploymentId,
+    releaseId: restored.releaseId ?? restored.deploymentId,
+    commitSha: restored.commitSha,
+    remoteReleasePath: restored.remoteReleasePath ?? releasePath,
+    activeTarget: restored.activeTarget ?? releasePath,
+  };
+}
+
+/** Health-gate one immutable release under a fenced DB lease. */
 export async function processReleaseDeployment(
   deploymentId: string,
   context: DeploymentJobContext,
@@ -257,7 +284,7 @@ export async function processReleaseDeployment(
   heartbeatTimer.unref();
 
   let operationError: unknown;
-  let proof: ReleaseProof | undefined;
+  let outcome: PromotionOutcome | undefined;
   try {
     const artifact = await operations.openPreparedRelease(options.artifactRoot, {
       projectId: owned.deployment.projectId,
@@ -273,7 +300,19 @@ export async function processReleaseDeployment(
       target: options.target,
       signal: controller.signal,
     });
-    proof = await operations.activateRelease({
+    owned.deployment = await serialize(() =>
+      repositories.deployments.advanceReleaseStage(
+        deploymentId,
+        {
+          expectedVersion: owned.deployment.version,
+          attemptId: owned.attemptId,
+          fence: owned.fence,
+          stage: 'HEALTH_CHECK',
+        },
+        now(),
+      ),
+    );
+    outcome = await operations.promoteRelease({
       projectId: owned.deployment.projectId,
       deploymentId,
       commitSha: owned.deployment.commitSha,
@@ -313,28 +352,116 @@ export async function processReleaseDeployment(
       await operations.cleanupPreparedRelease(options.artifactRoot, deploymentId);
       return;
     }
-    if (!proof) throw new Error('release activation returned no proof');
-    owned.deployment = await serialize(() =>
-      repositories.deployments.recordReleaseSuccess(
-        deploymentId,
-        {
-          expectedVersion: owned.deployment.version,
-          attemptId: owned.attemptId,
-          fence: owned.fence,
-          proof: {
-            releaseId: proof.deploymentId,
-            commitSha: proof.commitSha,
-            remoteReleasePath: proof.remoteReleasePath,
-            activeTarget: proof.activeTarget,
-            pm2ProcessName: proof.pm2ProcessName,
-            pm2Pid: proof.pm2Pid,
-            nginx: proof.nginx,
-            completedAt: proof.completedAt,
+    if (!outcome) throw new Error('release promotion returned no outcome');
+    const releaseOutcome = outcome;
+    if (releaseOutcome.status === 'PROMOTED') {
+      owned.deployment = await serialize(() =>
+        repositories.deployments.advanceReleaseStage(
+          deploymentId,
+          {
+            expectedVersion: owned.deployment.version,
+            attemptId: owned.attemptId,
+            fence: owned.fence,
+            stage: 'PROMOTE',
           },
-        },
-        now(),
-      ),
-    );
+          now(),
+        ),
+      );
+      const proof = releaseOutcome.proof;
+      owned.deployment = await serialize(() =>
+        repositories.deployments.recordReleasePromotion(
+          deploymentId,
+          {
+            expectedVersion: owned.deployment.version,
+            attemptId: owned.attemptId,
+            fence: owned.fence,
+            health: releaseOutcome.healthProof,
+            proof: {
+              releaseId: proof.deploymentId,
+              commitSha: proof.commitSha,
+              remoteReleasePath: proof.remoteReleasePath,
+              activeTarget: proof.activeTarget,
+              pm2ProcessName: proof.pm2ProcessName,
+              pm2Pid: proof.pm2Pid,
+              nginx: proof.nginx,
+              completedAt: proof.completedAt,
+            },
+          },
+          now(),
+        ),
+      );
+    } else if (releaseOutcome.status === 'NO_KNOWN_GOOD') {
+      owned.deployment = await serialize(() =>
+        repositories.deployments.recordReleaseFailure(
+          deploymentId,
+          {
+            expectedVersion: owned.deployment.version,
+            attemptId: owned.attemptId,
+            fence: owned.fence,
+            failure: {
+              kind: 'NO_KNOWN_GOOD',
+              message: 'candidate health failed and no previous healthy release exists',
+              retryable: false,
+            },
+          },
+          now(),
+        ),
+      );
+    } else {
+      owned.deployment = await serialize(() =>
+        repositories.deployments.advanceReleaseStage(
+          deploymentId,
+          {
+            expectedVersion: owned.deployment.version,
+            attemptId: owned.attemptId,
+            fence: owned.fence,
+            stage: 'ROLLBACK',
+          },
+          now(),
+        ),
+      );
+      if (releaseOutcome.status === 'ROLLED_BACK') {
+        owned.deployment = await serialize(() =>
+          repositories.deployments.recordReleaseRollback(
+            deploymentId,
+            {
+              expectedVersion: owned.deployment.version,
+              attemptId: owned.attemptId,
+              fence: owned.fence,
+              target: rollbackTarget(
+                releaseOutcome.restored,
+                owned.deployment.projectId,
+                options.target.remoteRoot,
+              ),
+              health: releaseOutcome.healthProof,
+            },
+            now(),
+          ),
+        );
+      } else {
+        owned.deployment = await serialize(() =>
+          repositories.deployments.recordReleaseRollbackFailure(
+            deploymentId,
+            {
+              expectedVersion: owned.deployment.version,
+              attemptId: owned.attemptId,
+              fence: owned.fence,
+              attemptedTarget: rollbackTarget(
+                releaseOutcome.attemptedRestore,
+                owned.deployment.projectId,
+                options.target.remoteRoot,
+              ),
+              failure: {
+                kind: 'ROLLBACK_FAILED',
+                message: 'automatic restoration of the previous healthy release failed',
+                retryable: false,
+              },
+            },
+            now(),
+          ),
+        );
+      }
+    }
     await operations.cleanupPreparedRelease(options.artifactRoot, deploymentId);
   } finally {
     stopped = true;

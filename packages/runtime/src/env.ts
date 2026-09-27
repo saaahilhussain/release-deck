@@ -49,6 +49,35 @@ function isMongoUrl(value: string): boolean {
   });
 }
 
+function isTargetHealthUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return (
+      value.length <= 300 &&
+      value.startsWith('http://127.0.0.1:') &&
+      value === value.trim() &&
+      !Array.from(value).some((character) => {
+        const code = character.charCodeAt(0);
+        return code < 32 || code === 127;
+      }) &&
+      parsed.protocol === 'http:' &&
+      parsed.hostname === '127.0.0.1' &&
+      parsed.port.length > 0 &&
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.search === '' &&
+      parsed.hash === '' &&
+      !/(?:\/)(?:\.|\.\.)(?:\/|$)/.test(value) &&
+      /^\/[A-Za-z0-9._/-]*$/.test(parsed.pathname) &&
+      !parsed.pathname.split('/').includes('..') &&
+      Number(parsed.port) >= 1 &&
+      Number(parsed.port) <= 65_535
+    );
+  } catch {
+    return false;
+  }
+}
+
 const mongoUrl = z.string().min(1).refine(isMongoUrl);
 
 const redisUrl = z.string().min(1).refine(isRedisUrl);
@@ -130,6 +159,20 @@ const workerEnvironmentSchema = commonEnvironmentSchema
       .default(65_536),
     RELEASE_LEASE_MS: z.coerce.number().int().min(10_000).max(300_000).default(60_000),
     RELEASE_RETENTION: z.coerce.number().int().min(2).max(20).default(5),
+    RELEASE_HEALTH_URL: z.string().refine(isTargetHealthUrl),
+    RELEASE_HEALTH_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+    RELEASE_HEALTH_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .min(100)
+      .max(10_000)
+      .default(1_000),
+    RELEASE_HEALTH_REQUEST_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(100)
+      .max(10_000)
+      .default(2_000),
     CI_WORKSPACE_ROOT: z
       .string()
       .trim()
@@ -171,6 +214,16 @@ const workerEnvironmentSchema = commonEnvironmentSchema
         code: 'custom',
         path: ['CI_TOTAL_TIMEOUT_MS'],
         message: 'must be at least CI_STEP_TIMEOUT_MS',
+      });
+    }
+    const probeBudget =
+      value.RELEASE_HEALTH_ATTEMPTS * value.RELEASE_HEALTH_REQUEST_TIMEOUT_MS +
+      (value.RELEASE_HEALTH_ATTEMPTS - 1) * value.RELEASE_HEALTH_INTERVAL_MS;
+    if (2 * probeBudget > value.RELEASE_TIMEOUT_MS) {
+      context.addIssue({
+        code: 'custom',
+        path: ['RELEASE_TIMEOUT_MS'],
+        message: 'must cover candidate and rollback health probes',
       });
     }
   });

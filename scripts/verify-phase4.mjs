@@ -363,6 +363,10 @@ try {
     CI_LEASE_MS: 10_000,
     CI_CONCURRENCY: 1,
     RELEASE_SSH_HOST: 'target.example.com',
+    RELEASE_HEALTH_URL: 'http://127.0.0.1:3000/health',
+    RELEASE_HEALTH_ATTEMPTS: 5,
+    RELEASE_HEALTH_INTERVAL_MS: 1000,
+    RELEASE_HEALTH_REQUEST_TIMEOUT_MS: 2000,
     RELEASE_SSH_PORT: 22,
     RELEASE_SSH_USER: 'deployer',
     RELEASE_SSH_PRIVATE_KEY_PATH: join(fixtureRoot, 'key'),
@@ -402,18 +406,27 @@ try {
       prepareRelease,
       openPreparedRelease,
       stageRelease: async () => undefined,
-      activateRelease: async (input) => {
+      promoteRelease: async (input) => {
         const releasePath = `/srv/apps/${input.projectId}/releases/${input.deploymentId}`;
         return {
-          projectId: input.projectId,
-          deploymentId: input.deploymentId,
-          commitSha: input.commitSha,
-          remoteReleasePath: releasePath,
-          activeTarget: releasePath,
-          pm2ProcessName: `releasedeck-${input.projectId}`,
-          pm2Pid: 4321,
-          nginx: { validated: true, reloaded: true },
-          completedAt: new Date(),
+          status: 'PROMOTED',
+          proof: {
+            projectId: input.projectId,
+            deploymentId: input.deploymentId,
+            commitSha: input.commitSha,
+            remoteReleasePath: releasePath,
+            activeTarget: releasePath,
+            pm2ProcessName: `releasedeck-${input.projectId}`,
+            pm2Pid: 4321,
+            nginx: { validated: true, reloaded: true },
+            completedAt: new Date(),
+          },
+          healthProof: {
+            url: input.target.healthUrl,
+            statusCode: 200,
+            attempts: 1,
+            completedAt: new Date(),
+          },
         };
       },
       cleanupPreparedRelease,

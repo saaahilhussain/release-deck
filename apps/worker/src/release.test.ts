@@ -5,7 +5,7 @@ import {
   createQueuedDeployment,
   type Deployment,
   type ReleaseFailureInput,
-  type ReleaseSuccessInput,
+  type ReleasePromotionInput,
 } from '@releasedeck/db';
 import { ReleaseDeployerError } from '@releasedeck/release-deployer';
 
@@ -28,6 +28,10 @@ const target = {
   remoteRoot: '/srv/apps',
   timeoutMs: 60_000,
   outputLimitBytes: 65_536,
+  healthUrl: 'http://127.0.0.1:3000/health',
+  healthAttempts: 5,
+  healthIntervalMs: 1000,
+  healthRequestTimeoutMs: 2000,
 };
 const options = {
   artifactRoot: 'D:\\artifacts',
@@ -57,7 +61,11 @@ function ciPassed(): Deployment {
   };
 }
 
-function harness(activationError?: unknown, successError?: unknown) {
+function harness(
+  activationError?: unknown,
+  successError?: unknown,
+  promotionOutcome?: Awaited<ReturnType<ReleaseOperations['promoteRelease']>>,
+) {
   let current = ciPassed();
   const calls: string[] = [];
   const repositories: ReleaseProcessorRepositories = {
@@ -90,7 +98,11 @@ function harness(activationError?: unknown, successError?: unknown) {
       },
       reclaimExpiredReleaseExecution: async () => null,
       renewReleaseExecution: async () => current,
-      recordReleaseSuccess: async (_id, input: ReleaseSuccessInput) => {
+      advanceReleaseStage: async (_id, input) => {
+        current = { ...current, stage: input.stage, version: current.version + 1 };
+        return current;
+      },
+      recordReleasePromotion: async (_id, input: ReleasePromotionInput) => {
         if (successError) throw successError;
         current = {
           ...current,
@@ -101,7 +113,48 @@ function harness(activationError?: unknown, successError?: unknown) {
             ...current.release!,
             status: 'DEPLOYED',
             success: input.proof,
+            health: input.health,
             finishedAt: new Date(),
+          },
+        };
+        return current;
+      },
+      recordReleaseRollback: async (_id, input) => {
+        current = {
+          ...current,
+          status: 'ROLLED_BACK',
+          stage: 'ROLLBACK',
+          version: current.version + 1,
+          release: {
+            ...current.release!,
+            status: 'ROLLED_BACK',
+            rollback: {
+              mode: 'AUTOMATIC',
+              outcome: 'RESTORED',
+              target: input.target,
+              health: input.health,
+              completedAt: new Date(),
+            },
+          },
+        };
+        return current;
+      },
+      recordReleaseRollbackFailure: async (_id, input) => {
+        current = {
+          ...current,
+          status: 'FAILED',
+          stage: 'ROLLBACK',
+          version: current.version + 1,
+          release: {
+            ...current.release!,
+            status: 'ROLLBACK_FAILED',
+            rollback: {
+              mode: 'AUTOMATIC',
+              outcome: 'FAILED',
+              target: input.attemptedTarget,
+              failure: input.failure,
+              completedAt: new Date(),
+            },
           },
         };
         return current;
@@ -110,7 +163,7 @@ function harness(activationError?: unknown, successError?: unknown) {
         current = {
           ...current,
           status: input.failure.retryable ? 'RUNNING' : 'FAILED',
-          stage: 'DEPLOY',
+          stage: input.failure.kind === 'NO_KNOWN_GOOD' ? 'HEALTH_CHECK' : 'DEPLOY',
           version: current.version + 1,
           release: {
             ...current.release!,
@@ -138,20 +191,30 @@ function harness(activationError?: unknown, successError?: unknown) {
     async stageRelease() {
       calls.push('stage');
     },
-    async activateRelease() {
+    async promoteRelease() {
       calls.push('activate');
       if (activationError) throw activationError;
+      if (promotionOutcome) return promotionOutcome;
       const releasePath = `/srv/apps/${projectId}/releases/${deploymentId}`;
       return {
-        projectId,
-        deploymentId,
-        commitSha,
-        remoteReleasePath: releasePath,
-        activeTarget: releasePath,
-        pm2ProcessName: `releasedeck-${projectId}`,
-        pm2Pid: 123,
-        nginx: { validated: true, reloaded: true },
-        completedAt: new Date(),
+        status: 'PROMOTED',
+        proof: {
+          projectId,
+          deploymentId,
+          commitSha,
+          remoteReleasePath: releasePath,
+          activeTarget: releasePath,
+          pm2ProcessName: `releasedeck-${projectId}`,
+          pm2Pid: 123,
+          nginx: { validated: true, reloaded: true },
+          completedAt: new Date(),
+        },
+        healthProof: {
+          url: target.healthUrl,
+          statusCode: 200,
+          attempts: 1,
+          completedAt: new Date(),
+        },
       };
     },
     async cleanupPreparedRelease() {
@@ -251,4 +314,82 @@ test('a nonterminal deployment without a release claim preserves its artifact', 
     options,
   );
   assert.deepEqual(calls, []);
+});
+
+test('an unhealthy candidate records the restored predecessor without success', async () => {
+  const predecessorId = '550e8400-e29b-41d4-a716-446655440003';
+  const releasePath = `/srv/apps/${projectId}/releases/${predecessorId}`;
+  const state = harness(undefined, undefined, {
+    status: 'ROLLED_BACK',
+    candidate: { projectId, deploymentId, commitSha },
+    restored: {
+      projectId,
+      deploymentId: predecessorId,
+      releaseId: predecessorId,
+      commitSha: 'b'.repeat(40),
+      remoteReleasePath: releasePath,
+      activeTarget: releasePath,
+    },
+    healthProof: {
+      url: target.healthUrl,
+      statusCode: 200,
+      attempts: 2,
+      completedAt: new Date(),
+    },
+  });
+  await processReleaseDeployment(
+    deploymentId,
+    { attemptsMade: 0, maxAttempts: 3 },
+    state.repositories,
+    state.operations,
+    options,
+  );
+  assert.equal(state.current().status, 'ROLLED_BACK');
+  assert.equal(state.current().stage, 'ROLLBACK');
+  assert.equal(state.current().release?.rollback?.target.deploymentId, predecessorId);
+  assert.equal(state.current().release?.success, undefined);
+  assert.deepEqual(state.calls, ['open', 'stage', 'activate', 'cleanup']);
+});
+
+test('failed restoration records rollback failure without claiming a healthy target', async () => {
+  const predecessorId = '550e8400-e29b-41d4-a716-446655440003';
+  const state = harness(undefined, undefined, {
+    status: 'ROLLBACK_FAILED',
+    candidate: { projectId, deploymentId, commitSha },
+    attemptedRestore: {
+      projectId,
+      deploymentId: predecessorId,
+      commitSha: 'b'.repeat(40),
+    },
+    failureCode: 'restore_unhealthy',
+  });
+  await processReleaseDeployment(
+    deploymentId,
+    { attemptsMade: 0, maxAttempts: 3 },
+    state.repositories,
+    state.operations,
+    options,
+  );
+  assert.equal(state.current().status, 'FAILED');
+  assert.equal(state.current().stage, 'ROLLBACK');
+  assert.equal(state.current().release?.status, 'ROLLBACK_FAILED');
+  assert.equal(state.current().release?.rollback?.health, undefined);
+});
+
+test('an unhealthy first release records no known-good predecessor', async () => {
+  const state = harness(undefined, undefined, {
+    status: 'NO_KNOWN_GOOD',
+    candidate: { projectId, deploymentId, commitSha },
+    failureCode: 'no_known_good',
+  });
+  await processReleaseDeployment(
+    deploymentId,
+    { attemptsMade: 0, maxAttempts: 3 },
+    state.repositories,
+    state.operations,
+    options,
+  );
+  assert.equal(state.current().status, 'FAILED');
+  assert.equal(state.current().stage, 'HEALTH_CHECK');
+  assert.equal(state.current().release?.failure?.kind, 'NO_KNOWN_GOOD');
 });

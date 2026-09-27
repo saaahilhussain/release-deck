@@ -46,7 +46,10 @@ export interface DeploymentProcessorRepositories {
     | 'claimReleaseExecution'
     | 'reclaimExpiredReleaseExecution'
     | 'renewReleaseExecution'
-    | 'recordReleaseSuccess'
+    | 'advanceReleaseStage'
+    | 'recordReleasePromotion'
+    | 'recordReleaseRollback'
+    | 'recordReleaseRollbackFailure'
     | 'recordReleaseFailure'
   >;
   readonly projects: Pick<ProjectRepository, 'findById'>;

@@ -10,6 +10,8 @@ import test from 'node:test';
 
 import {
   ACTIVATE_REMOTE_SCRIPT,
+  MANUAL_ROLLBACK_REMOTE_SCRIPT,
+  PROMOTE_REMOTE_SCRIPT,
   ReleaseDeployerError,
   STAGE_REMOTE_SCRIPT,
   activateRelease,
@@ -19,7 +21,9 @@ import {
   defaultCommandExecutor,
   openPreparedRelease,
   parseReleaseProof,
+  promoteRelease,
   prepareRelease,
+  rollbackRelease,
   stageRelease,
   validateReleaseMetadata,
   validateRemoteRoot,
@@ -63,6 +67,10 @@ function target(root: string): SshTarget {
     privateKeyPath: resolve(root, 'key'),
     knownHostsPath: resolve(root, 'known_hosts'),
     remoteRoot: '/srv/apps',
+    healthUrl: 'http://127.0.0.1:3000/health',
+    healthAttempts: 3,
+    healthIntervalMs: 100,
+    healthRequestTimeoutMs: 200,
     timeoutMs: 10_000,
     outputLimitBytes: 4_096,
   };
@@ -95,6 +103,11 @@ test('validates release identity, remote roots, and strict OpenSSH arguments', (
   assert.ok(scp.includes('-B'));
   assert.throws(
     () => buildScpArgs(sshTarget, 'relative', '/tmp/release.tar.gz'),
+    ReleaseDeployerError,
+  );
+  assert.throws(
+    () =>
+      buildSshArgs({ ...sshTarget, healthUrl: 'http://example.com/health' }, 'safe'),
     ReleaseDeployerError,
   );
 });
@@ -203,6 +216,79 @@ test('stages separately, then activates with exact bounded proof', async () => {
     nginx: { validated: true, reloaded: true },
     completedAt,
   });
+});
+
+test('promotion and manual rollback parse health and prior-release outcomes strictly', async () => {
+  const root = resolve(tmpdir(), 'releasedeck-outcome-parse');
+  const sshTarget = target(root);
+  const prior = {
+    ...metadata,
+    deploymentId: '88888888-8888-4888-8888-888888888888',
+    commitSha: 'b'.repeat(40),
+  };
+  const activePath = `${sshTarget.remoteRoot}/${metadata.projectId}/releases/${metadata.deploymentId}`;
+  const executor: CommandExecutor = {
+    async run(command, args, options) {
+      const output =
+        options.input === PROMOTE_REMOTE_SCRIPT
+          ? `PROMOTION_ROLLBACK_FAILED project=${metadata.projectId} deployment=${prior.deploymentId} sha=${prior.commitSha} candidate=${metadata.deploymentId} candidateSha=${metadata.commitSha} failureCode=restore_unhealthy\n`
+          : `MANUAL_ROLLBACK_ACTIVE_RESTORED project=${metadata.projectId} deployment=${metadata.deploymentId} sha=${metadata.commitSha} path=${activePath} active=${activePath} pm2=releasedeck-${metadata.projectId} pid=8 nginxValidated=1 nginxReloaded=1 attempted=${prior.deploymentId} attemptedSha=${prior.commitSha} healthStatus=204 healthAttempts=2\n`;
+      return commandResult(command, args, output);
+    },
+  };
+  const promotion = await promoteRelease(
+    { ...metadata, attemptId, target: sshTarget, retention: 5 },
+    executor,
+  );
+  assert.equal(promotion.status, 'ROLLBACK_FAILED');
+  if (promotion.status === 'ROLLBACK_FAILED')
+    assert.deepEqual(promotion.attemptedRestore, prior);
+  const rollback = await rollbackRelease(
+    {
+      ...metadata,
+      targetDeploymentId: prior.deploymentId,
+      targetCommitSha: prior.commitSha,
+      requestId: '44444444-4444-4444-8444-444444444444',
+      attemptId,
+      target: sshTarget,
+      retention: 5,
+    },
+    executor,
+  );
+  assert.equal(rollback.status, 'FAILED_ACTIVE_RESTORED');
+  if (rollback.status === 'FAILED_ACTIVE_RESTORED') {
+    assert.deepEqual(rollback.attemptedRestore, prior);
+    assert.equal(rollback.healthProof.statusCode, 204);
+  }
+});
+
+test('promotion rejects truncated or mismatched remote outcome proof', async () => {
+  const sshTarget = target(resolve(tmpdir(), 'releasedeck-outcome-truncation'));
+  const output = `PROMOTION_NO_KNOWN_GOOD project=${metadata.projectId} deployment=${metadata.deploymentId} sha=${metadata.commitSha} candidate=${metadata.deploymentId} candidateSha=${metadata.commitSha} failureCode=no_known_good\n`;
+  const input = { ...metadata, attemptId, target: sshTarget, retention: 5 };
+  await assert.rejects(
+    promoteRelease(input, {
+      async run(command, args) {
+        return { ...commandResult(command, args, output), stdoutTruncated: true };
+      },
+    }),
+    ReleaseDeployerError,
+  );
+  await assert.rejects(
+    promoteRelease(input, {
+      async run(command, args) {
+        return commandResult(
+          command,
+          args,
+          output.replace(
+            `candidate=${metadata.deploymentId}`,
+            `candidate=${attemptId}`,
+          ),
+        );
+      },
+    }),
+    ReleaseDeployerError,
+  );
 });
 
 test('proof parsing rejects missing, duplicate, or mismatched evidence', () => {
@@ -417,6 +503,293 @@ printf '%s' "$target_id" > "$base/releases/$target_id/.releasedeck-release/deplo
         currentDeploymentId,
       );
     }
+  } finally {
+    await runLinuxShell('rm -rf -- "$1"\n', [root]).catch(() => undefined);
+  }
+});
+
+test('promotion restores and rechecks healthy A after candidate B fails', async (t) => {
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('wsl.exe', ['sh', '-c', 'command -v flock >/dev/null']);
+    } catch {
+      t.skip('WSL with POSIX flock is unavailable');
+      return;
+    }
+  }
+  const root = `/tmp/releasedeck-promotion-${randomUUID()}`;
+  const idA = metadata.deploymentId;
+  const idB = '88888888-8888-4888-8888-888888888888';
+  const shaB = 'b'.repeat(40);
+  try {
+    await runLinuxShell(
+      [
+        'set -eu',
+        'root=$1 project=$2 a=$3 b=$4 sha_a=$5 sha_b=$6',
+        'base="$root/$project"; mkdir -p "$base/shared" "$base/releases/$a/.releasedeck-release" "$base/releases/$b/.releasedeck-release" "$root/bin"',
+        'printf x > "$base/shared/.env"',
+        'for id in "$a" "$b"; do d="$base/releases/$id"; printf %s "$project" > "$d/.releasedeck-release/project-id"; printf %s "$id" > "$d/.releasedeck-release/deployment-id"; printf x > "$d/.releasedeck-release/archive-sha256"; ln -s "$base/shared/.env" "$d/.env"; printf x > "$d/ecosystem.config.cjs"; done',
+        'printf %s "$sha_a" > "$base/releases/$a/.releasedeck-release/commit-sha"; printf %s "$sha_b" > "$base/releases/$b/.releasedeck-release/commit-sha"',
+        'printf 200 > "$base/releases/$a/.health"; printf 503 > "$base/releases/$b/.health"',
+        'ln -s "releases/$a" "$base/current"',
+        "printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = pid ]; then echo 4321; fi' > \"$root/bin/pm2\"",
+        "printf '%s\\n' '#!/bin/sh' 'test \"$1\" = -n && shift' 'exec \"$@\"' > \"$root/bin/sudo\"",
+        "printf '%s\\n' '#!/bin/sh' 'exit 0' > \"$root/bin/nginx\"",
+        'printf \'%s\\n\' \'#!/bin/sh\' \'test "$1" = --noproxy && test "$2" = "*" || exit 7\' \'id=$(basename "$(readlink "$FIXTURE_BASE/current")")\' \'code=$(cat "$FIXTURE_BASE/releases/$id/.health")\' \'printf %s "$code"\' \'test "$code" -lt 400\' > "$root/bin/curl"',
+        'chmod +x "$root/bin/pm2" "$root/bin/sudo" "$root/bin/nginx" "$root/bin/curl"',
+      ].join('\n'),
+      [root, metadata.projectId, idA, idB, metadata.commitSha, shaB],
+    );
+    const promote = (id: string, sha: string, attempt: string) =>
+      runLinuxShell(
+        `PATH="\${11}/bin:$PATH" FIXTURE_BASE="\${11}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${PROMOTE_REMOTE_SCRIPT}`,
+        [
+          metadata.projectId,
+          id,
+          sha,
+          root,
+          '5',
+          attempt,
+          'http://127.0.0.1:3000/health',
+          '3',
+          '100',
+          '200',
+          root,
+        ],
+      );
+    const legacyCandidate = await promote(
+      idB,
+      shaB,
+      '66666666-6666-4666-8666-666666666666',
+    );
+    assert.match(
+      legacyCandidate.stdout,
+      /PROMOTION_NO_KNOWN_GOOD .*failureCode=no_known_good/,
+    );
+    const legacyCheck = await runLinuxShell(
+      'set -eu\nbase=$1; test "$(readlink "$base/current")" = "releases/$2"; test ! -e "$base/known-good"\n',
+      [`${root}/${metadata.projectId}`, idB],
+    );
+    assert.equal(legacyCheck.stdout, '');
+    const first = await promote(idA, metadata.commitSha, attemptId);
+    assert.match(first.stdout, /PROMOTION_PROMOTED .*healthStatus=200/);
+    const candidate = await promote(idB, shaB, '77777777-7777-4777-8777-777777777777');
+    assert.match(
+      candidate.stdout,
+      /PROMOTION_ROLLED_BACK .*candidate=88888888-8888-4888-8888-888888888888 .*healthStatus=200/,
+    );
+    const check = await runLinuxShell(
+      'set -eu\nbase=$1; test "$(readlink "$base/current")" = "releases/$2"; code=$(FIXTURE_BASE="$base" PATH="$3/bin:$PATH" curl --noproxy "*" http://127.0.0.1:3000/health); test "$code" = 200; printf "%s %s\\n" "$(readlink "$base/current")" "$code"\n',
+      [`${root}/${metadata.projectId}`, idA, root],
+    );
+    assert.equal(check.stdout.trim(), `releases/${idA} 200`);
+    await runLinuxShell('printf 200 > "$1/$2/releases/$3/.health"\n', [
+      root,
+      metadata.projectId,
+      idB,
+    ]);
+    const recoveredCandidate = await promote(
+      idB,
+      shaB,
+      '99999999-9999-4999-8999-999999999999',
+    );
+    assert.match(
+      recoveredCandidate.stdout,
+      /PROMOTION_PROMOTED .*deployment=88888888-8888-4888-8888-888888888888/,
+    );
+    const firstRollbackArgs = (
+      attempt: string,
+      request = '44444444-4444-4444-8444-444444444444',
+    ) => [
+      metadata.projectId,
+      idB,
+      shaB,
+      idA,
+      metadata.commitSha,
+      root,
+      '5',
+      attempt,
+      'http://127.0.0.1:3000/health',
+      '3',
+      '100',
+      '200',
+      request,
+      root,
+    ];
+    const manual = await runLinuxShell(
+      `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+      firstRollbackArgs('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+    );
+    assert.match(
+      manual.stdout,
+      /MANUAL_ROLLBACK_RESTORED .*deployment=22222222-2222-4222-8222-222222222222 .*healthStatus=200/,
+    );
+    const replay = await runLinuxShell(
+      `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+      firstRollbackArgs('dddddddd-dddd-4ddd-8ddd-dddddddddddd'),
+    );
+    assert.match(replay.stdout, /MANUAL_ROLLBACK_RESTORED .*healthStatus=200/);
+    await runLinuxShell(
+      'set -eu\nbase=$1; printf "%s\\n" "$2" > "$base/known-good"; printf "%s\\n" "$3" > "$base/previous-known-good"\n',
+      [`${root}/${metadata.projectId}`, idB, idA],
+    );
+    const replayAfterPointerSwitch = await runLinuxShell(
+      `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+      firstRollbackArgs('ffffffff-ffff-4fff-8fff-ffffffffffff'),
+    );
+    assert.match(
+      replayAfterPointerSwitch.stdout,
+      /MANUAL_ROLLBACK_RESTORED .*healthStatus=200/,
+    );
+    await runLinuxShell('rm -f -- "$1/$2/current"\n', [root, metadata.projectId]);
+    await assert.rejects(
+      runLinuxShell(
+        `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+        firstRollbackArgs('acacacac-acac-4aca-8aca-acacacacacac'),
+      ),
+      /Linux fixture failed \(74\)/,
+    );
+    await runLinuxShell('ln -s "releases/$3" "$1/$2/current"\n', [
+      root,
+      metadata.projectId,
+      idA,
+    ]);
+    await assert.rejects(
+      runLinuxShell(
+        `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+        firstRollbackArgs(
+          'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+          '66666666-6666-4666-8666-666666666666',
+        ),
+      ),
+      /Linux fixture failed \(74\)/,
+    );
+    await runLinuxShell('rm -f -- "$1/$2/.manual-rollback-request"\n', [
+      root,
+      metadata.projectId,
+    ]);
+    await assert.rejects(
+      runLinuxShell(
+        `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+        firstRollbackArgs('abababab-abab-4bab-8bab-abababababab'),
+      ),
+      /Linux fixture failed \(74\)/,
+    );
+    const manualArgs = (attempt: string) => [
+      metadata.projectId,
+      idA,
+      metadata.commitSha,
+      idB,
+      shaB,
+      root,
+      '5',
+      attempt,
+      'http://127.0.0.1:3000/health',
+      '3',
+      '100',
+      '200',
+      '55555555-5555-4555-8555-555555555555',
+      root,
+    ];
+    const stalePreconditionArgs = manualArgs('bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc');
+    stalePreconditionArgs[4] = 'c'.repeat(40);
+    await assert.rejects(
+      runLinuxShell(
+        `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+        stalePreconditionArgs,
+      ),
+      /Linux fixture failed \(66\)/,
+    );
+    await runLinuxShell('printf 503 > "$1/$2/releases/$3/.health"\n', [
+      root,
+      metadata.projectId,
+      idB,
+    ]);
+    const activeRestored = await runLinuxShell(
+      `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+      manualArgs('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+    );
+    assert.match(
+      activeRestored.stdout,
+      /MANUAL_ROLLBACK_ACTIVE_RESTORED .*deployment=22222222-2222-4222-8222-222222222222 .*attempted=88888888-8888-4888-8888-888888888888/,
+    );
+    await runLinuxShell('printf 503 > "$1/$2/releases/$3/.health"\n', [
+      root,
+      metadata.projectId,
+      idA,
+    ]);
+    const rollbackFailed = await runLinuxShell(
+      `PATH="\${14}/bin:$PATH" FIXTURE_BASE="\${14}/${metadata.projectId}"\nexport PATH FIXTURE_BASE\n${MANUAL_ROLLBACK_REMOTE_SCRIPT}`,
+      manualArgs('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+    );
+    assert.match(
+      rollbackFailed.stdout,
+      /MANUAL_ROLLBACK_FAILED .*failureCode=active_restore_failed/,
+    );
+    await runLinuxShell('printf 200 > "$1/$2/releases/$3/.health"\n', [
+      root,
+      metadata.projectId,
+      idA,
+    ]);
+    const server = await runLinuxShell(
+      [
+        'set -eu',
+        'root=$1; project=$2',
+        'cat > "$root/server.py" <<\'PY\'',
+        'from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer',
+        'from pathlib import Path',
+        'import sys, time',
+        'base = Path(sys.argv[1])',
+        'class Handler(BaseHTTPRequestHandler):',
+        '    def do_GET(self):',
+        '        release = (base / "current").resolve()',
+        '        delay = release / ".delay"',
+        '        if delay.exists(): time.sleep(float(delay.read_text()))',
+        '        self.send_response(int((release / ".health").read_text()))',
+        '        self.end_headers()',
+        '    def log_message(self, *args): pass',
+        'server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)',
+        'Path(sys.argv[2]).write_text(str(server.server_port))',
+        'server.serve_forever()',
+        'PY',
+        'cat > "$root/promote.sh" <<\'REMOTE\'',
+        PROMOTE_REMOTE_SCRIPT,
+        'REMOTE',
+        'mv "$root/bin/curl" "$root/bin/curl-stub"',
+      ].join('\n'),
+      [root, metadata.projectId],
+    );
+    assert.equal(server.stdout, '');
+    const promoteReal = (attempt: string) =>
+      runLinuxShell(
+        [
+          'set -eu',
+          'root=$1 project=$2 id=$3 sha=$4 attempt=$5',
+          'PATH="$root/bin:$PATH"; export PATH',
+          'port_file="$root/port-$attempt"; rm -f -- "$port_file"',
+          'python3 "$root/server.py" "$root/$project" "$port_file" </dev/null >/dev/null 2>&1 & server_pid=$!',
+          'trap \'kill "$server_pid" 2>/dev/null || true; rm -f -- "$port_file"\' EXIT',
+          'i=0; while test ! -s "$port_file"; do i=$((i + 1)); test "$i" -lt 30; sleep 0.1; done',
+          'health_url="http://127.0.0.1:$(cat "$port_file")/health"',
+          'sh "$root/promote.sh" "$project" "$id" "$sha" "$root" 5 "$attempt" "$health_url" 2 100 200',
+        ].join('\n'),
+        [root, metadata.projectId, idB, shaB, attempt],
+      );
+    const realUnhealthy = await promoteReal('dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+    assert.match(realUnhealthy.stdout, /PROMOTION_ROLLED_BACK .*healthStatus=200/);
+    await runLinuxShell('printf 0.5 > "$1/$2/releases/$3/.delay"\n', [
+      root,
+      metadata.projectId,
+      idB,
+    ]);
+    const realTimeout = await promoteReal('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+    assert.match(realTimeout.stdout, /PROMOTION_ROLLED_BACK .*healthStatus=200/);
+    await runLinuxShell(
+      'rm "$1/$2/releases/$3/.delay"; printf 200 > "$1/$2/releases/$3/.health"\n',
+      [root, metadata.projectId, idB],
+    );
+    const realHealthy = await promoteReal('ffffffff-ffff-4fff-8fff-ffffffffffff');
+    assert.match(realHealthy.stdout, /PROMOTION_PROMOTED .*healthStatus=200/);
   } finally {
     await runLinuxShell('rm -rf -- "$1"\n', [root]).catch(() => undefined);
   }

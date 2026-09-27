@@ -24,6 +24,7 @@ const validWorkerEnvironment = {
   REDIS_URL: 'redis://default:secret@127.0.0.1:6379',
   RELEASE_SSH_HOST: 'target.example.com',
   RELEASE_SSH_USER: 'deployer',
+  RELEASE_HEALTH_URL: 'http://127.0.0.1:3000/health',
   RELEASE_SSH_PRIVATE_KEY_PATH: resolve('keys', 'release-ed25519'),
   RELEASE_SSH_KNOWN_HOSTS_PATH: resolve('keys', 'known_hosts'),
 };
@@ -54,6 +55,8 @@ test('parses worker defaults with an absolute OS-temp workspace root', () => {
   assert.equal(environment.RELEASE_MAX_OUTPUT_BYTES, 65_536);
   assert.equal(environment.RELEASE_LEASE_MS, 60_000);
   assert.equal(environment.RELEASE_RETENTION, 5);
+  assert.equal(environment.RELEASE_HEALTH_URL, 'http://127.0.0.1:3000/health');
+  assert.equal(environment.RELEASE_HEALTH_ATTEMPTS, 5);
   assert.ok(environment.CI_TOTAL_TIMEOUT_MS >= environment.CI_STEP_TIMEOUT_MS);
 });
 
@@ -71,6 +74,8 @@ test('accepts bounded worker settings and an absolute workspace root', () => {
     RELEASE_SSH_USER: 'release_bot',
     RELEASE_REMOTE_ROOT: '/opt/releasedeck',
     RELEASE_TIMEOUT_MS: '1000',
+    RELEASE_HEALTH_ATTEMPTS: '1',
+    RELEASE_HEALTH_REQUEST_TIMEOUT_MS: '100',
     RELEASE_MAX_OUTPUT_BYTES: '1024',
     RELEASE_LEASE_MS: '10000',
     RELEASE_RETENTION: '20',
@@ -116,6 +121,14 @@ for (const [field, value] of [
   ['RELEASE_ARTIFACT_ROOT', 'relative/artifacts'],
   ['RELEASE_RETENTION', '1'],
   ['RELEASE_RETENTION', '21'],
+  ['RELEASE_HEALTH_URL', 'http://example.com:3000/health'],
+  ['RELEASE_HEALTH_URL', 'http://127.0.0.1:3000/health?token=abc'],
+  ['RELEASE_HEALTH_URL', 'http://127.0.0.1:3000/../admin'],
+  ['RELEASE_HEALTH_URL', 'https://127.0.0.1:3000/health'],
+  ['RELEASE_HEALTH_ATTEMPTS', '0'],
+  ['RELEASE_HEALTH_ATTEMPTS', '21'],
+  ['RELEASE_HEALTH_INTERVAL_MS', '99'],
+  ['RELEASE_HEALTH_REQUEST_TIMEOUT_MS', '10001'],
   ['RELEASE_TIMEOUT_MS', '999'],
   ['RELEASE_TIMEOUT_MS', '86400001'],
   ['RELEASE_MAX_OUTPUT_BYTES', '1023'],

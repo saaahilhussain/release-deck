@@ -10,7 +10,7 @@ import {
   type Project,
   type ReleaseExecutionClaim,
   type ReleaseFailureInput,
-  type ReleaseSuccessInput,
+  type ReleasePromotionInput,
 } from '@releasedeck/db';
 import {
   CiCleanupError,
@@ -42,6 +42,10 @@ const target = {
   remoteRoot: '/srv/apps',
   timeoutMs: 60_000,
   outputLimitBytes: 65_536,
+  healthUrl: 'http://127.0.0.1:3000/health',
+  healthAttempts: 5,
+  healthIntervalMs: 1000,
+  healthRequestTimeoutMs: 2000,
 };
 const processorOptions = {
   leaseMs: 60_000,
@@ -225,19 +229,28 @@ function harness(overrides: {
     async stageRelease() {
       releaseCalls.push('stage');
     },
-    async activateRelease(input) {
+    async promoteRelease(input) {
       releaseCalls.push('activate');
       const releasePath = `/srv/apps/${input.projectId}/releases/${input.deploymentId}`;
       return {
-        projectId: input.projectId,
-        deploymentId: input.deploymentId,
-        commitSha: input.commitSha,
-        remoteReleasePath: releasePath,
-        activeTarget: releasePath,
-        pm2ProcessName: `releasedeck-${input.projectId}`,
-        pm2Pid: 123,
-        nginx: { validated: true, reloaded: true },
-        completedAt: new Date(),
+        status: 'PROMOTED',
+        proof: {
+          projectId: input.projectId,
+          deploymentId: input.deploymentId,
+          commitSha: input.commitSha,
+          remoteReleasePath: releasePath,
+          activeTarget: releasePath,
+          pm2ProcessName: `releasedeck-${input.projectId}`,
+          pm2Pid: 123,
+          nginx: { validated: true, reloaded: true },
+          completedAt: new Date(),
+        },
+        healthProof: {
+          url: input.target.healthUrl,
+          statusCode: 200,
+          attempts: 1,
+          completedAt: new Date(),
+        },
       };
     },
     async cleanupPreparedRelease() {
@@ -288,7 +301,11 @@ function harness(overrides: {
       },
       reclaimExpiredReleaseExecution: async () => null,
       renewReleaseExecution: async () => current,
-      recordReleaseSuccess: async (_id, input: ReleaseSuccessInput) => {
+      advanceReleaseStage: async (_id, input) => {
+        current = { ...current, stage: input.stage, version: current.version + 1 };
+        return current;
+      },
+      recordReleasePromotion: async (_id, input: ReleasePromotionInput) => {
         const { leaseExpiresAt, heartbeatAt, ...release } = current.release!;
         void leaseExpiresAt;
         void heartbeatAt;
@@ -301,11 +318,14 @@ function harness(overrides: {
             ...release,
             status: 'DEPLOYED',
             success: input.proof,
+            health: input.health,
             finishedAt: new Date(),
           },
         };
         return current;
       },
+      recordReleaseRollback: async () => current,
+      recordReleaseRollbackFailure: async () => current,
       recordReleaseFailure: async (_id, input: ReleaseFailureInput) => {
         current = {
           ...current,
@@ -559,7 +579,10 @@ test('an active duplicate waits for authoritative completion and runs nothing', 
       claimReleaseExecution: async () => null,
       reclaimExpiredReleaseExecution: async () => null,
       renewReleaseExecution: async () => passed,
-      recordReleaseSuccess: async () => passed,
+      advanceReleaseStage: async () => passed,
+      recordReleasePromotion: async () => passed,
+      recordReleaseRollback: async () => passed,
+      recordReleaseRollbackFailure: async () => passed,
       recordReleaseFailure: async () => passed,
     },
     projects: { findById: async () => project() },
@@ -589,7 +612,7 @@ test('an active duplicate waits for authoritative completion and runs nothing', 
       stageRelease: async () => {
         throw new Error('release staging must not run');
       },
-      activateRelease: async () => {
+      promoteRelease: async () => {
         throw new Error('release activation must not run');
       },
       cleanupPreparedRelease: async () => undefined,

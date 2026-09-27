@@ -42,6 +42,8 @@ export const RELEASE_EXECUTION_STATUSES = [
   'RETRY_PENDING',
   'DEPLOYED',
   'FAILED',
+  'ROLLED_BACK',
+  'ROLLBACK_FAILED',
 ] as const;
 export type ReleaseExecutionStatus = (typeof RELEASE_EXECUTION_STATUSES)[number];
 export const RELEASE_FAILURE_KINDS = [
@@ -50,6 +52,8 @@ export const RELEASE_FAILURE_KINDS = [
   'PACKAGE_FAILED',
   'LEASE_LOST',
   'CANCELLED',
+  'ROLLBACK_FAILED',
+  'NO_KNOWN_GOOD',
 ] as const;
 export type ReleaseFailureKind = (typeof RELEASE_FAILURE_KINDS)[number];
 export const DEFAULT_RELEASE_LEASE_MS = 60_000;
@@ -57,6 +61,7 @@ export const MIN_RELEASE_LEASE_MS = 10_000;
 export const MAX_RELEASE_LEASE_MS = 300_000;
 export const MAX_RELEASE_PATH_BYTES = 1_024;
 export const MAX_RELEASE_PROCESS_NAME_BYTES = 128;
+export const MAX_RELEASE_HEALTH_URL_BYTES = 2_048;
 export interface ReleaseFailure {
   readonly kind: ReleaseFailureKind;
   readonly message: string;
@@ -78,6 +83,80 @@ export interface ReleaseSuccessProof {
   readonly nginx: ReleaseNginxEvidence;
   readonly completedAt: Date;
 }
+/** Bounded positive HTTP proof; response bodies are deliberately excluded. */
+export interface ReleaseHealthProof {
+  readonly url: string;
+  readonly statusCode: number;
+  readonly attempts: number;
+  readonly completedAt: Date;
+}
+export interface ReleaseRollbackTarget {
+  readonly deploymentId: string;
+  readonly releaseId: string;
+  readonly commitSha: string;
+  readonly remoteReleasePath: string;
+  readonly activeTarget: string;
+}
+export interface ReleaseRollbackEvidence {
+  readonly mode: 'AUTOMATIC' | 'MANUAL';
+  readonly outcome: 'RESTORED' | 'FAILED';
+  readonly requestId?: string;
+  readonly target: ReleaseRollbackTarget;
+  readonly health?: ReleaseHealthProof;
+  /** Health of the still-active candidate when a manual rollback failed. */
+  readonly activeHealth?: ReleaseHealthProof;
+  readonly failure?: ReleaseFailure;
+  readonly completedAt: Date;
+}
+export interface ReleasePromotionInput extends ReleaseSuccessInput {
+  readonly health: ReleaseHealthProof;
+}
+export interface ReleaseRollbackInput extends ReleaseExecutionLeaseInput {
+  readonly target: ReleaseRollbackTarget;
+  readonly health: ReleaseHealthProof;
+}
+export interface ReleaseRollbackFailureInput extends ReleaseExecutionLeaseInput {
+  readonly attemptedTarget: ReleaseRollbackTarget;
+  readonly failure: ReleaseFailure;
+}
+export interface ManualRollbackClaimOptions {
+  readonly now?: Date;
+  readonly leaseMs?: number;
+}
+export interface ManualRollbackClaim {
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly fence: number;
+  readonly attemptNumber: number;
+  readonly leaseExpiresAt: Date;
+  readonly deployment: Deployment;
+  readonly targetDeployment: Deployment;
+}
+export interface ManualRollbackOutcomeInput {
+  readonly expectedVersion: number;
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly fence: number;
+  readonly target: ReleaseRollbackTarget;
+  readonly health: ReleaseHealthProof;
+}
+export interface ManualRollbackFailureInput extends Omit<
+  ManualRollbackOutcomeInput,
+  'health'
+> {
+  readonly failure: ReleaseFailure;
+  readonly activeHealth?: ReleaseHealthProof;
+}
+export interface ManualRollbackOutcomeLeaseInput {
+  readonly expectedVersion: number;
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly fence: number;
+  readonly leaseMs?: number;
+}
+export interface ReleaseStageInput extends ReleaseExecutionLeaseInput {
+  readonly stage: 'HEALTH_CHECK' | 'PROMOTE' | 'ROLLBACK';
+}
 export interface DeploymentReleaseExecution {
   readonly status: ReleaseExecutionStatus;
   readonly releaseId: string;
@@ -90,6 +169,21 @@ export interface DeploymentReleaseExecution {
   readonly finishedAt?: Date;
   readonly failure?: ReleaseFailure;
   readonly success?: ReleaseSuccessProof;
+  readonly health?: ReleaseHealthProof;
+  readonly rollback?: ReleaseRollbackEvidence;
+  readonly manualRollback?: {
+    readonly requestId: string;
+    readonly targetDeploymentId: string;
+    readonly status: 'RUNNING' | 'FAILED' | 'RESTORED' | 'REJECTED';
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly fence: number;
+    readonly leaseExpiresAt?: Date;
+    readonly heartbeatAt?: Date;
+    readonly startedAt: Date;
+    readonly finishedAt?: Date;
+    readonly failure?: ReleaseFailure;
+  };
 }
 export interface ReleaseExecutionClaim {
   readonly attemptId: string;
@@ -110,6 +204,7 @@ export interface ReleaseExecutionLeaseInput {
 }
 export interface ReleaseSuccessInput extends ReleaseExecutionLeaseInput {
   readonly proof: ReleaseSuccessProof;
+  readonly health: ReleaseHealthProof;
 }
 export interface ReleaseFailureInput extends ReleaseExecutionLeaseInput {
   readonly failure: ReleaseFailure;
@@ -694,6 +789,7 @@ const runningStages = new Set<DeploymentStage>([
   'DEPLOY',
   'HEALTH_CHECK',
   'PROMOTE',
+  'ROLLBACK',
 ]);
 
 export function assertDeploymentState(
@@ -738,6 +834,10 @@ export function transitionDeployment(
   }
   assertDeploymentState(status, stage);
   if (stage !== current.stage) {
+    if (stage === 'ROLLBACK')
+      throw new InvalidTransitionError(
+        'rollback stages require a fenced release operation',
+      );
     const previousOrder = stageOrder.get(current.stage);
     const nextOrder = stageOrder.get(stage);
     if (nextOrder === undefined) {
@@ -860,6 +960,139 @@ function assertReleaseProof(proof: ReleaseSuccessProof | undefined): void {
     throw new ValidationError('release success proof is invalid');
 }
 
+function assertHealthProof(proof: ReleaseHealthProof | undefined): void {
+  if (proof === undefined) return;
+  let healthUrl: URL | undefined;
+  try {
+    healthUrl = new URL(proof.url);
+  } catch {
+    /* validated below */
+  }
+  if (
+    typeof proof.url !== 'string' ||
+    Buffer.byteLength(proof.url, 'utf8') > MAX_RELEASE_HEALTH_URL_BYTES ||
+    !healthUrl ||
+    healthUrl.protocol !== 'http:' ||
+    healthUrl.hostname !== '127.0.0.1' ||
+    healthUrl.username ||
+    healthUrl.password ||
+    healthUrl.search ||
+    healthUrl.hash ||
+    !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$/.test(healthUrl.pathname) ||
+    !Number.isSafeInteger(proof.statusCode) ||
+    proof.statusCode < 200 ||
+    proof.statusCode >= 300 ||
+    !Number.isSafeInteger(proof.attempts) ||
+    proof.attempts < 1 ||
+    proof.attempts > 20 ||
+    !isDate(proof.completedAt)
+  )
+    throw new ValidationError('release health proof is invalid');
+}
+
+function assertRollbackTarget(target: ReleaseRollbackTarget | undefined): void {
+  if (
+    !target ||
+    !UUID_PATTERN.test(target.deploymentId) ||
+    target.releaseId !== target.deploymentId ||
+    !/^[0-9a-f]{40}$/.test(target.commitSha) ||
+    !isSafeReleasePath(target.remoteReleasePath) ||
+    byteLength(target.remoteReleasePath) > MAX_RELEASE_PATH_BYTES ||
+    target.activeTarget !== target.remoteReleasePath
+  )
+    throw new ValidationError('release rollback target is invalid');
+}
+
+function assertRollbackEvidence(evidence: ReleaseRollbackEvidence | undefined): void {
+  if (evidence === undefined) return;
+  if (
+    !['AUTOMATIC', 'MANUAL'].includes(evidence.mode) ||
+    !['RESTORED', 'FAILED'].includes(evidence.outcome) ||
+    !isDate(evidence.completedAt)
+  )
+    throw new ValidationError('release rollback evidence is invalid');
+  assertRollbackTarget(evidence.target);
+  assertHealthProof(evidence.health);
+  assertReleaseFailure(evidence.failure);
+  if (
+    (evidence.outcome === 'RESTORED' &&
+      (!evidence.health || evidence.failure || evidence.activeHealth)) ||
+    (evidence.outcome === 'FAILED' &&
+      (!evidence.failure || evidence.failure.retryable || evidence.health))
+  )
+    throw new ValidationError('release rollback outcome evidence is incomplete');
+  assertHealthProof(evidence.activeHealth);
+  if (evidence.requestId !== undefined && !UUID_PATTERN.test(evidence.requestId))
+    throw new ValidationError('release rollback request ID is invalid');
+}
+
+function assertManualRollbackState(
+  deploymentId: string,
+  deploymentStatus: DeploymentStatus,
+  deploymentStage: DeploymentStage,
+  release: DeploymentReleaseExecution,
+): void {
+  const manual = release.manualRollback;
+  if (manual === undefined) return;
+  if (
+    !manual ||
+    !UUID_PATTERN.test(manual.requestId) ||
+    !UUID_PATTERN.test(manual.targetDeploymentId) ||
+    manual.targetDeploymentId === deploymentId ||
+    !['RUNNING', 'FAILED', 'RESTORED', 'REJECTED'].includes(manual.status) ||
+    !UUID_PATTERN.test(manual.attemptId) ||
+    !Number.isSafeInteger(manual.attemptNumber) ||
+    manual.attemptNumber < 1 ||
+    !Number.isSafeInteger(manual.fence) ||
+    manual.fence < 1 ||
+    !isDate(manual.startedAt)
+  )
+    throw new ValidationError('manual rollback state is invalid');
+  if (manual.status === 'RUNNING') {
+    if (
+      deploymentStatus !== 'SUCCESS' ||
+      deploymentStage !== 'COMPLETE' ||
+      release.status !== 'DEPLOYED' ||
+      !isDate(manual.leaseExpiresAt) ||
+      !isDate(manual.heartbeatAt) ||
+      manual.heartbeatAt.valueOf() < manual.startedAt.valueOf() ||
+      manual.leaseExpiresAt.valueOf() <= manual.heartbeatAt.valueOf() ||
+      manual.finishedAt !== undefined ||
+      manual.failure !== undefined
+    )
+      throw new ValidationError('running manual rollback is invalid');
+    return;
+  }
+  if (
+    !isDate(manual.finishedAt) ||
+    manual.finishedAt.valueOf() < manual.startedAt.valueOf() ||
+    manual.leaseExpiresAt !== undefined ||
+    manual.heartbeatAt !== undefined ||
+    !release.rollback ||
+    release.rollback.mode !== 'MANUAL' ||
+    release.rollback.requestId !== manual.requestId ||
+    release.rollback.target.deploymentId !== manual.targetDeploymentId ||
+    release.rollback.outcome !==
+      (manual.status === 'RESTORED' ? 'RESTORED' : 'FAILED') ||
+    (manual.status !== 'RESTORED') !== (manual.failure !== undefined)
+  )
+    throw new ValidationError('terminal manual rollback is invalid');
+  if (
+    manual.status === 'RESTORED'
+      ? release.status !== 'ROLLED_BACK' || deploymentStatus !== 'ROLLED_BACK'
+      : manual.status === 'REJECTED'
+        ? release.status !== 'DEPLOYED' ||
+          deploymentStatus !== 'SUCCESS' ||
+          deploymentStage !== 'COMPLETE' ||
+          release.rollback.activeHealth !== undefined
+        : release.rollback.activeHealth
+          ? release.status !== 'DEPLOYED' || deploymentStatus !== 'SUCCESS'
+          : release.status !== 'ROLLBACK_FAILED' || deploymentStatus !== 'FAILED'
+  )
+    throw new ValidationError('manual rollback outcome is inconsistent');
+  assertReleaseFailure(manual.failure);
+}
+
 export function assertReleaseExecutionState(
   deploymentId: string,
   deploymentCommitSha: string,
@@ -882,7 +1115,9 @@ export function assertReleaseExecutionState(
   if (release.status === 'RUNNING') {
     if (
       deploymentStatus !== 'RUNNING' ||
-      deploymentStage !== 'DEPLOY' ||
+      !(['DEPLOY', 'HEALTH_CHECK', 'PROMOTE', 'ROLLBACK'] as const).includes(
+        deploymentStage as 'DEPLOY' | 'HEALTH_CHECK' | 'PROMOTE' | 'ROLLBACK',
+      ) ||
       !release.attemptId ||
       !isDate(release.leaseExpiresAt) ||
       !isDate(release.heartbeatAt) ||
@@ -929,9 +1164,33 @@ export function assertReleaseExecutionState(
       release.success!.completedAt.valueOf() > release.finishedAt.valueOf()
     )
       throw new ValidationError('release proof identity is invalid');
+  } else if (release.status === 'ROLLED_BACK' || release.status === 'ROLLBACK_FAILED') {
+    const restored = release.status === 'ROLLED_BACK';
+    if (
+      deploymentStatus !== (restored ? 'ROLLED_BACK' : 'FAILED') ||
+      deploymentStage !== 'ROLLBACK' ||
+      !isDate(release.startedAt) ||
+      !isDate(release.finishedAt) ||
+      release.leaseExpiresAt !== undefined ||
+      release.heartbeatAt !== undefined ||
+      !release.rollback ||
+      release.rollback.outcome !== (restored ? 'RESTORED' : 'FAILED')
+    )
+      throw new ValidationError('release rollback terminal state is invalid');
+    if (release.success) assertReleaseProof(release.success);
+    if (
+      release.success &&
+      (release.success.releaseId !== deploymentId ||
+        release.success.commitSha !== deploymentCommitSha)
+    )
+      throw new ValidationError('release rollback candidate proof identity is invalid');
+    assertRollbackEvidence(release.rollback);
   } else if (
     deploymentStatus !== 'FAILED' ||
-    deploymentStage !== 'DEPLOY' ||
+    !(['DEPLOY', 'HEALTH_CHECK'] as readonly DeploymentStage[]).includes(
+      deploymentStage,
+    ) ||
+    (release.failure?.kind === 'NO_KNOWN_GOOD' && deploymentStage !== 'HEALTH_CHECK') ||
     !isDate(release.startedAt) ||
     !isDate(release.finishedAt) ||
     release.finishedAt.valueOf() < release.startedAt.valueOf() ||
@@ -945,6 +1204,9 @@ export function assertReleaseExecutionState(
   }
   assertReleaseFailure(release.failure);
   assertReleaseProof(release.success);
+  assertHealthProof(release.health);
+  assertRollbackEvidence(release.rollback);
+  assertManualRollbackState(deploymentId, deploymentStatus, deploymentStage, release);
 }
 
 function failureMatchesStage(
@@ -1236,13 +1498,15 @@ export function assertCiExecutionState(
   } else if (ci.status === 'PASSED') {
     const buildIndex = CI_STAGES.indexOf('BUILD');
     if (
-      !(['RUNNING', 'SUCCESS', 'FAILED'] as readonly DeploymentStatus[]).includes(
-        deploymentStatus,
-      ) ||
+      !(
+        ['RUNNING', 'SUCCESS', 'FAILED', 'ROLLED_BACK'] as readonly DeploymentStatus[]
+      ).includes(deploymentStatus) ||
       stageOrder.get(deploymentStage) === undefined ||
       (stageOrder.get(deploymentStage) ?? -1) < stageOrder.get('BUILD')! ||
       (deploymentStatus === 'SUCCESS' && deploymentStage !== 'COMPLETE') ||
-      (deploymentStatus === 'FAILED' && deploymentStage !== 'DEPLOY') ||
+      (deploymentStatus === 'FAILED' &&
+        !['DEPLOY', 'HEALTH_CHECK', 'ROLLBACK'].includes(deploymentStage)) ||
+      (deploymentStatus === 'ROLLED_BACK' && deploymentStage !== 'ROLLBACK') ||
       ci.leaseExpiresAt !== undefined ||
       ci.heartbeatAt !== undefined ||
       !isDate(ci.startedAt) ||

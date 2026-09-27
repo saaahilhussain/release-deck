@@ -21,7 +21,7 @@ import {
   type WorkerEnvironment,
 } from '@releasedeck/runtime';
 import {
-  activateRelease,
+  promoteRelease,
   cleanupPreparedRelease,
   openPreparedRelease,
   prepareRelease,
@@ -109,7 +109,7 @@ export async function startWorker(
         prepareRelease,
         openPreparedRelease,
         stageRelease,
-        activateRelease,
+        promoteRelease,
         cleanupPreparedRelease,
       };
     const processJob: DeploymentJobProcessor = (job, context) =>
@@ -138,6 +138,10 @@ export async function startWorker(
               remoteRoot: environment.RELEASE_REMOTE_ROOT,
               timeoutMs: environment.RELEASE_TIMEOUT_MS,
               outputLimitBytes: environment.RELEASE_MAX_OUTPUT_BYTES,
+              healthUrl: environment.RELEASE_HEALTH_URL,
+              healthAttempts: environment.RELEASE_HEALTH_ATTEMPTS,
+              healthIntervalMs: environment.RELEASE_HEALTH_INTERVAL_MS,
+              healthRequestTimeoutMs: environment.RELEASE_HEALTH_REQUEST_TIMEOUT_MS,
             },
           },
         },

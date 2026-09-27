@@ -1,5 +1,6 @@
 import type { Collection, Db, Document, Filter, UpdateFilter } from 'mongodb';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import {
   createProject,
@@ -23,6 +24,7 @@ import {
   DEFAULT_RELEASE_LEASE_MS,
   MIN_RELEASE_LEASE_MS,
   MAX_RELEASE_LEASE_MS,
+  MAX_RELEASE_HEALTH_URL_BYTES,
   CI_STAGES,
   type CiExecutionClaim,
   type CiExecutionLeaseInput,
@@ -34,6 +36,18 @@ import {
   type ReleaseExecutionLeaseInput,
   type ReleaseSuccessInput,
   type ReleaseFailureInput,
+  type ReleaseHealthProof,
+  type ReleaseSuccessProof,
+  type ReleasePromotionInput,
+  type ReleaseRollbackInput,
+  type ReleaseRollbackFailureInput,
+  type ReleaseRollbackEvidence,
+  type ManualRollbackClaim,
+  type ManualRollbackClaimOptions,
+  type ManualRollbackOutcomeInput,
+  type ManualRollbackFailureInput,
+  type ManualRollbackOutcomeLeaseInput,
+  type ReleaseStageInput,
   type DeploymentStage,
   type DeploymentStatus,
   type Deployment,
@@ -204,6 +218,56 @@ export interface ReleaseDeploymentRepository {
     outcome: ReleaseFailureInput,
     now?: Date,
   ): Promise<Deployment>;
+  recordReleasePromotion(
+    id: string,
+    outcome: ReleasePromotionInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseRollback(
+    id: string,
+    outcome: ReleaseRollbackInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordReleaseRollbackFailure(
+    id: string,
+    outcome: ReleaseRollbackFailureInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  claimManualRollback(
+    activeDeploymentId: string,
+    targetDeploymentId: string,
+    options?: ManualRollbackClaimOptions,
+  ): Promise<ManualRollbackClaim | null>;
+  reclaimExpiredManualRollback(
+    activeDeploymentId: string,
+    targetDeploymentId: string,
+    options?: ManualRollbackClaimOptions,
+  ): Promise<ManualRollbackClaim | null>;
+  recordManualRollbackOutcome(
+    activeDeploymentId: string,
+    outcome: ManualRollbackOutcomeInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordManualRollbackFailure(
+    activeDeploymentId: string,
+    outcome: ManualRollbackFailureInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  recordManualRollbackRejected(
+    activeDeploymentId: string,
+    outcome: ManualRollbackFailureInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  renewManualRollback(
+    activeDeploymentId: string,
+    lease: ManualRollbackOutcomeLeaseInput,
+    now?: Date,
+  ): Promise<Deployment>;
+  advanceReleaseStage(
+    id: string,
+    outcome: ReleaseStageInput,
+    now?: Date,
+  ): Promise<Deployment>;
 }
 
 export type DeploymentRepositoryWithRelease = DeploymentRepository &
@@ -273,6 +337,59 @@ function releaseNow(value: Date | undefined): Date {
   if (!(now instanceof Date) || Number.isNaN(now.valueOf()))
     throw new ValidationError('release timestamp is invalid');
   return now;
+}
+
+function assertHealthInput(
+  value: ReleaseHealthProof | undefined,
+): asserts value is ReleaseHealthProof {
+  let url: URL | undefined;
+  try {
+    if (value) url = new URL(value.url);
+  } catch {
+    /* validated below */
+  }
+  if (
+    !value ||
+    typeof value.url !== 'string' ||
+    Buffer.byteLength(value.url, 'utf8') > MAX_RELEASE_HEALTH_URL_BYTES ||
+    !url ||
+    url.protocol !== 'http:' ||
+    url.hostname !== '127.0.0.1' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$/.test(url.pathname) ||
+    !Number.isSafeInteger(value.statusCode) ||
+    value.statusCode < 200 ||
+    value.statusCode >= 300 ||
+    !Number.isSafeInteger(value.attempts) ||
+    value.attempts < 1 ||
+    value.attempts > 20 ||
+    !(value.completedAt instanceof Date) ||
+    !Number.isFinite(value.completedAt.valueOf())
+  )
+    throw new ValidationError('release health proof is invalid');
+}
+
+function isHistoricallyPromoted(deployment: Deployment): deployment is Deployment & {
+  release: DeploymentReleaseExecution & {
+    success: ReleaseSuccessProof;
+    health: ReleaseHealthProof;
+  };
+} {
+  const release = deployment.release;
+  return (
+    !!release?.success &&
+    !!release.health &&
+    ((deployment.status === 'SUCCESS' &&
+      deployment.stage === 'COMPLETE' &&
+      release.status === 'DEPLOYED') ||
+      (deployment.status === 'ROLLED_BACK' &&
+        deployment.stage === 'ROLLBACK' &&
+        release.status === 'ROLLED_BACK' &&
+        release.rollback?.mode === 'MANUAL'))
+  );
 }
 function releaseLeaseMs(value: number | undefined): number {
   const ms = value ?? DEFAULT_RELEASE_LEASE_MS;
@@ -578,7 +695,7 @@ function createProjectsRepository(
 
 function createDeploymentsRepository(
   collection: Collection<StoredDeployment>,
-): DeploymentRepository {
+): DeploymentRepositoryWithCiAndRelease {
   const createQueued = async (input: DeploymentCreateInput): Promise<Deployment> => {
     const record = createQueuedDeployment(input);
     try {
@@ -952,7 +1069,7 @@ function createDeploymentsRepository(
       const reclaiming =
         reclaimOnly &&
         existing?.status === 'RUNNING' &&
-        current.stage === 'DEPLOY' &&
+        ['DEPLOY', 'HEALTH_CHECK', 'PROMOTE', 'ROLLBACK'].includes(current.stage) &&
         current.status === 'RUNNING';
       const retrying =
         existing?.status === 'RETRY_PENDING' &&
@@ -1081,6 +1198,11 @@ function createDeploymentsRepository(
   ): Promise<Deployment> => {
     try {
       const now = releaseNow(nowInput);
+      if (!outcome.health)
+        throw new ValidationError(
+          'release promotion requires positive application health proof',
+        );
+      assertHealthInput(outcome.health);
       if (
         !UUID_PATTERN.test(id) ||
         !Number.isSafeInteger(outcome.expectedVersion) ||
@@ -1122,6 +1244,7 @@ function createDeploymentsRepository(
         status: 'DEPLOYED' as const,
         finishedAt: now,
         success: proof,
+        ...(outcome.health === undefined ? {} : { health: outcome.health }),
       } as DeploymentReleaseExecution;
       const next = {
         ...current,
@@ -1181,6 +1304,12 @@ function createDeploymentsRepository(
       )
         throw new ConcurrencyError();
       const failure = outcome.failure;
+      if (failure.kind === 'NO_KNOWN_GOOD' && current.stage !== 'HEALTH_CHECK')
+        throw new ValidationError(
+          'no-known-good failure must occur during health check',
+        );
+      if (failure.kind === 'NO_KNOWN_GOOD' && failure.retryable)
+        throw new ValidationError('no-known-good failure is terminal');
       const releaseBase = { ...existing } as {
         -readonly [
           K in keyof DeploymentReleaseExecution
@@ -1200,11 +1329,17 @@ function createDeploymentsRepository(
         failure,
       } as DeploymentReleaseExecution;
       const next = failure.retryable
-        ? { ...current, release, version: current.version + 1, updatedAt: now }
+        ? {
+            ...current,
+            stage: 'DEPLOY' as const,
+            release,
+            version: current.version + 1,
+            updatedAt: now,
+          }
         : {
             ...current,
             status: 'FAILED' as const,
-            stage: 'DEPLOY' as const,
+            stage: current.stage,
             release,
             version: current.version + 1,
             updatedAt: now,
@@ -1230,6 +1365,558 @@ function createDeploymentsRepository(
     } catch (error) {
       mapMongoError(error);
     }
+  };
+
+  const recordReleasePromotion = async (
+    id: string,
+    outcome: ReleasePromotionInput,
+    now?: Date,
+  ) => {
+    assertHealthInput(outcome.health);
+    const saved = await collection.findOne({ _id: id });
+    if (saved) {
+      const prior = deploymentFromDocument(saved);
+      if (
+        prior.status === 'SUCCESS' &&
+        prior.release?.status === 'DEPLOYED' &&
+        prior.release.health &&
+        isDeepStrictEqual(prior.release.success, outcome.proof) &&
+        isDeepStrictEqual(prior.release.health, outcome.health)
+      )
+        return prior;
+    }
+    return recordReleaseSuccess(
+      id,
+      { ...outcome, proof: outcome.proof, health: outcome.health },
+      now,
+    );
+  };
+  const recordReleaseRollback = async (
+    id: string,
+    outcome: ReleaseRollbackInput,
+    nowInput?: Date,
+  ) => finishAutomaticRollback(id, outcome, 'RESTORED', nowInput);
+  const recordReleaseRollbackFailure = async (
+    id: string,
+    outcome: ReleaseRollbackFailureInput,
+    nowInput?: Date,
+  ) => finishAutomaticRollback(id, outcome, 'FAILED', nowInput);
+
+  const finishAutomaticRollback = async (
+    id: string,
+    outcome: ReleaseRollbackInput | ReleaseRollbackFailureInput,
+    result: 'RESTORED' | 'FAILED',
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    const now = releaseNow(nowInput);
+    if (
+      !UUID_PATTERN.test(id) ||
+      !Number.isSafeInteger(outcome.expectedVersion) ||
+      outcome.expectedVersion < 1 ||
+      !ciTokenValid(outcome.attemptId, outcome.fence)
+    )
+      throw new ValidationError('rollback lease token is invalid');
+    const document = await collection.findOne({ _id: id });
+    if (!document) throw new NotFoundError();
+    const current = deploymentFromDocument(document);
+    const existing = current.release;
+    const target =
+      result === 'RESTORED'
+        ? (outcome as ReleaseRollbackInput).target
+        : (outcome as ReleaseRollbackFailureInput).attemptedTarget;
+    if (
+      existing?.rollback?.mode === 'AUTOMATIC' &&
+      existing.rollback.outcome === result &&
+      isDeepStrictEqual(existing.rollback.target, target) &&
+      (result === 'FAILED'
+        ? isDeepStrictEqual(
+            existing.rollback.failure,
+            (outcome as ReleaseRollbackFailureInput).failure,
+          )
+        : isDeepStrictEqual(
+            existing.rollback.health,
+            (outcome as ReleaseRollbackInput).health,
+          ))
+    )
+      return current;
+    if (
+      current.version !== outcome.expectedVersion ||
+      current.stage !== 'ROLLBACK' ||
+      existing?.status !== 'RUNNING' ||
+      existing.attemptId !== outcome.attemptId.toLowerCase() ||
+      existing.fence !== outcome.fence ||
+      !existing.leaseExpiresAt ||
+      existing.leaseExpiresAt.valueOf() <= now.valueOf()
+    )
+      throw new ConcurrencyError();
+    if (result === 'RESTORED')
+      assertHealthInput((outcome as ReleaseRollbackInput).health);
+    const targetDoc = await collection.findOne({ _id: target.deploymentId });
+    if (!targetDoc) throw new NotFoundError();
+    const knownGood = deploymentFromDocument(targetDoc);
+    if (
+      knownGood.projectId !== current.projectId ||
+      !isHistoricallyPromoted(knownGood) ||
+      target.releaseId !== knownGood.id ||
+      target.commitSha !== knownGood.commitSha ||
+      target.remoteReleasePath !== knownGood.release.success.remoteReleasePath
+    )
+      throw new ValidationError(
+        'rollback target is not a known-good release for this project',
+      );
+    const evidence: ReleaseRollbackEvidence = {
+      mode: 'AUTOMATIC',
+      outcome: result,
+      target,
+      ...(result === 'RESTORED'
+        ? { health: (outcome as ReleaseRollbackInput).health }
+        : { failure: (outcome as ReleaseRollbackFailureInput).failure }),
+      completedAt: now,
+    };
+    const release = {
+      ...existing,
+      status: (result === 'RESTORED' ? 'ROLLED_BACK' : 'ROLLBACK_FAILED') as
+        'ROLLED_BACK' | 'ROLLBACK_FAILED',
+      leaseExpiresAt: undefined,
+      heartbeatAt: undefined,
+      finishedAt: now,
+      rollback: evidence,
+    } as unknown as DeploymentReleaseExecution;
+    delete (release as { leaseExpiresAt?: Date }).leaseExpiresAt;
+    delete (release as { heartbeatAt?: Date }).heartbeatAt;
+    const next: Deployment = {
+      ...current,
+      status: result === 'RESTORED' ? 'ROLLED_BACK' : 'FAILED',
+      stage: 'ROLLBACK',
+      release,
+      version: current.version + 1,
+      updatedAt: now,
+    };
+    assertReleaseExecutionState(
+      next.id,
+      next.commitSha,
+      next.status,
+      next.stage,
+      release,
+    );
+    if (
+      !(await updateRelease(current, next, {
+        'release.status': 'RUNNING',
+        'release.attemptId': outcome.attemptId.toLowerCase(),
+        'release.fence': outcome.fence,
+        'release.leaseExpiresAt': { $gt: now },
+      }))
+    )
+      throw new ConcurrencyError();
+    return next;
+  };
+
+  const claimManualRollback = async (
+    activeId: string,
+    targetId: string,
+    options?: ManualRollbackClaimOptions,
+    reclaimOnly = false,
+  ): Promise<ManualRollbackClaim | null> => {
+    const now = releaseNow(options?.now);
+    const leaseMs = releaseLeaseMs(options?.leaseMs);
+    if (
+      !UUID_PATTERN.test(activeId) ||
+      !UUID_PATTERN.test(targetId) ||
+      activeId === targetId
+    )
+      throw new ValidationError('manual rollback deployment IDs are invalid');
+    const activeDoc = await collection.findOne({ _id: activeId });
+    const targetDoc = await collection.findOne({ _id: targetId });
+    if (!activeDoc || !targetDoc) throw new NotFoundError();
+    const active = deploymentFromDocument(activeDoc);
+    const target = deploymentFromDocument(targetDoc);
+    const old = active.release?.manualRollback;
+    if (reclaimOnly && old?.targetDeploymentId !== targetId) return null;
+    if (active.projectId !== target.projectId || !isHistoricallyPromoted(target))
+      throw new ValidationError(
+        'manual rollback target is not a healthy release for this project',
+      );
+    if (
+      active.status !== 'SUCCESS' ||
+      active.stage !== 'COMPLETE' ||
+      active.release?.status !== 'DEPLOYED' ||
+      !active.release.success
+    )
+      throw new InvalidTransitionError();
+    if (
+      old?.status === 'RUNNING' &&
+      (!reclaimOnly ||
+        !old.leaseExpiresAt ||
+        old.leaseExpiresAt.valueOf() > now.valueOf())
+    )
+      return null;
+    if (reclaimOnly && (!old || old.status !== 'RUNNING')) return null;
+    if (!reclaimOnly && old?.status === 'RUNNING') return null;
+    const requestId = old?.status === 'RUNNING' ? old.requestId : randomUUID();
+    const attemptId = randomUUID();
+    const fence = (old?.fence ?? 0) + 1;
+    const attemptNumber = (old?.attemptNumber ?? 0) + 1;
+    const operation = {
+      requestId,
+      targetDeploymentId: target.id,
+      status: 'RUNNING' as const,
+      attemptId,
+      attemptNumber,
+      fence,
+      leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+      heartbeatAt: now,
+      startedAt: old?.startedAt ?? now,
+    };
+    const release = {
+      ...active.release,
+      manualRollback: operation,
+    } as DeploymentReleaseExecution;
+    const next = { ...active, release, version: active.version + 1, updatedAt: now };
+    if (
+      !(await updateRelease(active, next, {
+        'release.status': 'DEPLOYED',
+        ...(old ? { 'release.manualRollback.fence': old.fence } : {}),
+      }))
+    )
+      return null;
+    return {
+      requestId,
+      attemptId,
+      fence,
+      attemptNumber,
+      leaseExpiresAt: operation.leaseExpiresAt,
+      deployment: next,
+      targetDeployment: target,
+    };
+  };
+  const recordManualRollbackOutcome = async (
+    activeId: string,
+    outcome: ManualRollbackOutcomeInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    const now = releaseNow(nowInput);
+    assertHealthInput(outcome.health);
+    if (
+      !UUID_PATTERN.test(activeId) ||
+      !UUID_PATTERN.test(outcome.requestId) ||
+      !ciTokenValid(outcome.attemptId, outcome.fence) ||
+      !Number.isSafeInteger(outcome.expectedVersion) ||
+      outcome.expectedVersion < 1
+    )
+      throw new ValidationError('manual rollback outcome token is invalid');
+    const activeDoc = await collection.findOne({ _id: activeId });
+    if (!activeDoc) throw new NotFoundError();
+    const active = deploymentFromDocument(activeDoc);
+    const op = active.release?.manualRollback;
+    if (
+      active.status === 'ROLLED_BACK' &&
+      op?.requestId === outcome.requestId &&
+      active.release?.rollback?.mode === 'MANUAL' &&
+      isDeepStrictEqual(active.release.rollback.target, outcome.target) &&
+      isDeepStrictEqual(active.release.rollback.health, outcome.health)
+    )
+      return active;
+    if (
+      active.version !== outcome.expectedVersion ||
+      active.release?.status !== 'DEPLOYED' ||
+      op?.status !== 'RUNNING' ||
+      op.requestId !== outcome.requestId ||
+      op.attemptId !== outcome.attemptId.toLowerCase() ||
+      op.fence !== outcome.fence ||
+      !op.leaseExpiresAt ||
+      op.leaseExpiresAt.valueOf() <= now.valueOf()
+    )
+      throw new ConcurrencyError();
+    const targetDoc = await collection.findOne({ _id: op.targetDeploymentId });
+    if (!targetDoc) throw new NotFoundError();
+    const target = deploymentFromDocument(targetDoc);
+    if (target.projectId !== active.projectId || !isHistoricallyPromoted(target))
+      throw new ValidationError('manual rollback target is no longer healthy');
+    const evidence: ReleaseRollbackEvidence = {
+      mode: 'MANUAL',
+      outcome: 'RESTORED',
+      requestId: op.requestId,
+      target: outcome.target,
+      health: outcome.health,
+      completedAt: now,
+    };
+    if (
+      outcome.target.deploymentId !== target.id ||
+      outcome.target.commitSha !== target.commitSha ||
+      outcome.target.remoteReleasePath !== target.release.success.remoteReleasePath
+    )
+      throw new ValidationError('manual rollback target proof does not match request');
+    const release = {
+      ...active.release,
+      status: 'ROLLED_BACK' as const,
+      manualRollback: { ...op, status: 'RESTORED' as const, finishedAt: now },
+      rollback: evidence,
+    } as DeploymentReleaseExecution;
+    delete (release.manualRollback as { leaseExpiresAt?: Date }).leaseExpiresAt;
+    delete (release.manualRollback as { heartbeatAt?: Date }).heartbeatAt;
+    const next: Deployment = {
+      ...active,
+      status: 'ROLLED_BACK',
+      stage: 'ROLLBACK',
+      release,
+      version: active.version + 1,
+      updatedAt: now,
+    };
+    assertReleaseExecutionState(
+      next.id,
+      next.commitSha,
+      next.status,
+      next.stage,
+      release,
+    );
+    if (
+      !(await updateRelease(active, next, {
+        'release.status': 'DEPLOYED',
+        'release.manualRollback.requestId': op.requestId,
+        'release.manualRollback.fence': outcome.fence,
+        'release.manualRollback.leaseExpiresAt': { $gt: now },
+      }))
+    )
+      throw new ConcurrencyError();
+    return next;
+  };
+  const recordManualRollbackFailure = async (
+    activeId: string,
+    outcome: ManualRollbackFailureInput,
+    nowInput?: Date,
+    rejected = false,
+  ): Promise<Deployment> => {
+    const now = releaseNow(nowInput);
+    if (
+      !UUID_PATTERN.test(activeId) ||
+      !UUID_PATTERN.test(outcome.requestId) ||
+      !ciTokenValid(outcome.attemptId, outcome.fence) ||
+      !Number.isSafeInteger(outcome.expectedVersion) ||
+      outcome.expectedVersion < 1
+    )
+      throw new ValidationError('manual rollback failure token is invalid');
+    const doc = await collection.findOne({ _id: activeId });
+    if (!doc) throw new NotFoundError();
+    const active = deploymentFromDocument(doc);
+    const op = active.release?.manualRollback;
+    if (
+      op?.status === (rejected ? 'REJECTED' : 'FAILED') &&
+      op.requestId === outcome.requestId &&
+      active.release?.rollback?.mode === 'MANUAL' &&
+      active.release.rollback.outcome === 'FAILED' &&
+      isDeepStrictEqual(active.release.rollback.failure, outcome.failure) &&
+      isDeepStrictEqual(active.release.rollback.activeHealth, outcome.activeHealth)
+    )
+      return active;
+    if (
+      active.version !== outcome.expectedVersion ||
+      active.release?.status !== 'DEPLOYED' ||
+      op?.status !== 'RUNNING' ||
+      op.requestId !== outcome.requestId ||
+      op.attemptId !== outcome.attemptId.toLowerCase() ||
+      op.fence !== outcome.fence ||
+      !op.leaseExpiresAt ||
+      op.leaseExpiresAt.valueOf() <= now.valueOf()
+    )
+      throw new ConcurrencyError();
+    const targetDoc = await collection.findOne({ _id: op.targetDeploymentId });
+    if (!targetDoc) throw new NotFoundError();
+    const target = deploymentFromDocument(targetDoc);
+    if (target.projectId !== active.projectId || !isHistoricallyPromoted(target))
+      throw new ValidationError('manual rollback target is no longer healthy');
+    if (outcome.activeHealth) assertHealthInput(outcome.activeHealth);
+    if (
+      outcome.target.deploymentId !== target.id ||
+      outcome.target.commitSha !== target.commitSha ||
+      outcome.target.remoteReleasePath !== target.release.success.remoteReleasePath
+    )
+      throw new ValidationError(
+        'manual rollback failure target does not match request',
+      );
+    const evidence: ReleaseRollbackEvidence = {
+      mode: 'MANUAL',
+      outcome: 'FAILED',
+      requestId: op.requestId,
+      target: outcome.target,
+      failure: outcome.failure,
+      ...(outcome.activeHealth ? { activeHealth: outcome.activeHealth } : {}),
+      completedAt: now,
+    };
+    const release = {
+      ...active.release,
+      ...(outcome.activeHealth || rejected
+        ? {}
+        : { status: 'ROLLBACK_FAILED' as const }),
+      manualRollback: {
+        ...op,
+        status: rejected ? ('REJECTED' as const) : ('FAILED' as const),
+        finishedAt: now,
+        failure: outcome.failure,
+      },
+      rollback: evidence,
+    } as DeploymentReleaseExecution;
+    delete (release.manualRollback as { leaseExpiresAt?: Date }).leaseExpiresAt;
+    delete (release.manualRollback as { heartbeatAt?: Date }).heartbeatAt;
+    const next: Deployment =
+      outcome.activeHealth || rejected
+        ? {
+            ...active,
+            status: 'SUCCESS',
+            stage: 'COMPLETE',
+            release,
+            version: active.version + 1,
+            updatedAt: now,
+          }
+        : {
+            ...active,
+            status: 'FAILED',
+            stage: 'ROLLBACK',
+            release,
+            version: active.version + 1,
+            updatedAt: now,
+          };
+    assertReleaseExecutionState(
+      next.id,
+      next.commitSha,
+      next.status,
+      next.stage,
+      release,
+    );
+    if (
+      !(await updateRelease(active, next, {
+        'release.status': 'DEPLOYED',
+        'release.manualRollback.requestId': op.requestId,
+        'release.manualRollback.fence': outcome.fence,
+        'release.manualRollback.leaseExpiresAt': { $gt: now },
+      }))
+    )
+      throw new ConcurrencyError();
+    return next;
+  };
+  const renewManualRollback = async (
+    activeId: string,
+    lease: ManualRollbackOutcomeLeaseInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    const now = releaseNow(nowInput);
+    const leaseMs = releaseLeaseMs(lease.leaseMs);
+    if (
+      !UUID_PATTERN.test(activeId) ||
+      !UUID_PATTERN.test(lease.requestId) ||
+      !ciTokenValid(lease.attemptId, lease.fence) ||
+      !Number.isSafeInteger(lease.expectedVersion) ||
+      lease.expectedVersion < 1
+    )
+      throw new ValidationError('manual rollback lease token is invalid');
+    const doc = await collection.findOne({ _id: activeId });
+    if (!doc) throw new NotFoundError();
+    const active = deploymentFromDocument(doc);
+    const op = active.release?.manualRollback;
+    if (
+      active.version !== lease.expectedVersion ||
+      active.release?.status !== 'DEPLOYED' ||
+      op?.status !== 'RUNNING' ||
+      op.requestId !== lease.requestId ||
+      op.attemptId !== lease.attemptId.toLowerCase() ||
+      op.fence !== lease.fence ||
+      !op.leaseExpiresAt ||
+      op.leaseExpiresAt.valueOf() <= now.valueOf()
+    )
+      throw new ConcurrencyError();
+    const release = {
+      ...active.release,
+      manualRollback: {
+        ...op,
+        leaseExpiresAt: new Date(now.valueOf() + leaseMs),
+        heartbeatAt: now,
+      },
+    } as DeploymentReleaseExecution;
+    const next = { ...active, release, version: active.version + 1, updatedAt: now };
+    if (
+      !(await updateRelease(active, next, {
+        'release.status': 'DEPLOYED',
+        'release.manualRollback.requestId': lease.requestId,
+        'release.manualRollback.attemptId': lease.attemptId.toLowerCase(),
+        'release.manualRollback.fence': lease.fence,
+        'release.manualRollback.leaseExpiresAt': { $gt: now },
+      }))
+    )
+      throw new ConcurrencyError();
+    return next;
+  };
+  const advanceReleaseStage = async (
+    id: string,
+    outcome: ReleaseStageInput,
+    nowInput?: Date,
+  ): Promise<Deployment> => {
+    const now = releaseNow(nowInput);
+    if (
+      !UUID_PATTERN.test(id) ||
+      !Number.isSafeInteger(outcome.expectedVersion) ||
+      outcome.expectedVersion < 1 ||
+      !ciTokenValid(outcome.attemptId, outcome.fence)
+    )
+      throw new ValidationError('release stage token is invalid');
+    const doc = await collection.findOne({ _id: id });
+    if (!doc) throw new NotFoundError();
+    const current = deploymentFromDocument(doc);
+    const release = current.release;
+    if (
+      current.stage === outcome.stage &&
+      release?.status === 'RUNNING' &&
+      release.attemptId === outcome.attemptId.toLowerCase() &&
+      release.fence === outcome.fence
+    )
+      return current;
+    if (
+      current.version !== outcome.expectedVersion ||
+      current.status !== 'RUNNING' ||
+      release?.status !== 'RUNNING' ||
+      release.attemptId !== outcome.attemptId.toLowerCase() ||
+      release.fence !== outcome.fence ||
+      !release.leaseExpiresAt ||
+      release.leaseExpiresAt.valueOf() <= now.valueOf()
+    )
+      throw new ConcurrencyError();
+    const allowed: Record<DeploymentStage, DeploymentStage[]> = {
+      DEPLOY: ['HEALTH_CHECK'],
+      HEALTH_CHECK: ['PROMOTE', 'ROLLBACK'],
+      PROMOTE: ['ROLLBACK'],
+      ROLLBACK: [],
+      QUEUED: [],
+      CHECKOUT: [],
+      INSTALL: [],
+      TEST: [],
+      BUILD: [],
+      COMPLETE: [],
+    };
+    if (!allowed[current.stage].includes(outcome.stage))
+      throw new InvalidTransitionError();
+    const next = {
+      ...current,
+      stage: outcome.stage,
+      version: current.version + 1,
+      updatedAt: now,
+    };
+    assertDeploymentState(next.status, next.stage);
+    assertCiExecutionState(next.status, next.stage, next.ci);
+    assertReleaseExecutionState(
+      next.id,
+      next.commitSha,
+      next.status,
+      next.stage,
+      next.release,
+    );
+    if (
+      !(await updateRelease(current, next, {
+        'release.status': 'RUNNING',
+        'release.attemptId': outcome.attemptId.toLowerCase(),
+        'release.fence': outcome.fence,
+        'release.leaseExpiresAt': { $gt: now },
+      }))
+    )
+      throw new ConcurrencyError();
+    return next;
   };
 
   return {
@@ -1301,6 +1988,27 @@ function createDeploymentsRepository(
     renewReleaseExecution: renewRelease,
     recordReleaseSuccess,
     recordReleaseFailure,
+    recordReleasePromotion,
+    recordReleaseRollback,
+    recordReleaseRollbackFailure,
+    claimManualRollback: (activeId, targetId, options) =>
+      claimManualRollback(activeId, targetId, options, false),
+    reclaimExpiredManualRollback: (activeId, targetId, options) => {
+      return (async () => {
+        const doc = await collection.findOne({ _id: activeId });
+        if (!doc) throw new NotFoundError();
+        const active = deploymentFromDocument(doc);
+        if (active.release?.manualRollback?.targetDeploymentId !== targetId)
+          return null;
+        return claimManualRollback(activeId, targetId, options, true);
+      })();
+    },
+    recordManualRollbackOutcome,
+    recordManualRollbackFailure,
+    recordManualRollbackRejected: (activeId, outcome, now) =>
+      recordManualRollbackFailure(activeId, outcome, now, true),
+    renewManualRollback,
+    advanceReleaseStage,
   };
 }
 

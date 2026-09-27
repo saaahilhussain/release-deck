@@ -305,7 +305,7 @@ test('release retry and success preserve CI evidence and persist bounded proof',
   assert.ok(retry);
   const completedAt = new Date(now.valueOf() + 3);
   const remoteReleasePath = `/srv/apps/${projectId}/releases/${deployment.id}`;
-  const complete = await deployments.recordReleaseSuccess(
+  const complete = await deployments.recordReleasePromotion(
     deployment.id,
     {
       expectedVersion: retry.deployment.version,
@@ -319,6 +319,12 @@ test('release retry and success preserve CI evidence and persist bounded proof',
         pm2ProcessName: `releasedeck-${projectId}`,
         pm2Pid: 42,
         nginx: { validated: true, reloaded: true },
+        completedAt,
+      },
+      health: {
+        url: 'http://127.0.0.1:3000/healthz',
+        statusCode: 200,
+        attempts: 1,
         completedAt,
       },
     },
@@ -357,4 +363,548 @@ test('release renewal rechecks expiry in the atomic update filter', async () => 
     ),
     ConcurrencyError,
   );
+});
+
+const health = {
+  url: 'http://127.0.0.1:3000/healthz',
+  statusCode: 200,
+  attempts: 1,
+  completedAt: now,
+};
+function releaseProof(id: string, commitSha: string, project: string) {
+  const remoteReleasePath = `/srv/apps/${project}/releases/${id}`;
+  return {
+    releaseId: id,
+    commitSha,
+    remoteReleasePath,
+    activeTarget: remoteReleasePath,
+    pm2ProcessName: `releasedeck-${project}`,
+    pm2Pid: 42,
+    nginx: { validated: true, reloaded: true },
+    completedAt: now,
+  };
+}
+
+test('Phase 6 promotes only with health proof and durably records A restored after B fails health', async () => {
+  const { deployments } = repositories();
+  const prior = await passedCi(deployments);
+  const priorClaim = await deployments.claimReleaseExecution(prior.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(priorClaim);
+  const healthyA = await deployments.recordReleasePromotion(
+    prior.id,
+    {
+      expectedVersion: priorClaim.deployment.version,
+      attemptId: priorClaim.attemptId,
+      fence: priorClaim.fence,
+      proof: releaseProof(prior.id, sha, projectId),
+      health,
+    },
+    now,
+  );
+  assert.equal(healthyA.release?.health?.statusCode, 200);
+
+  const candidate = await passedCi(deployments);
+  const claim = await deployments.claimReleaseExecution(candidate.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(claim);
+  const checking = await deployments.advanceReleaseStage(
+    candidate.id,
+    {
+      expectedVersion: claim.deployment.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    now,
+  );
+  const rollingBack = await deployments.advanceReleaseStage(
+    candidate.id,
+    {
+      expectedVersion: checking.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      stage: 'ROLLBACK',
+    },
+    now,
+  );
+  const restored = await deployments.recordReleaseRollback(
+    candidate.id,
+    {
+      expectedVersion: rollingBack.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      target: {
+        deploymentId: prior.id,
+        releaseId: prior.id,
+        commitSha: sha,
+        remoteReleasePath: healthyA.release!.success!.remoteReleasePath,
+        activeTarget: healthyA.release!.success!.activeTarget,
+      },
+      health,
+    },
+    now,
+  );
+  assert.equal(restored.status, 'ROLLED_BACK');
+  assert.equal(restored.stage, 'ROLLBACK');
+  assert.equal(
+    restored.release?.success,
+    undefined,
+    'candidate B must not receive fabricated success evidence',
+  );
+  assert.equal(restored.release?.rollback?.target.deploymentId, prior.id);
+  assert.equal(
+    (await deployments.findById(candidate.id))?.release?.rollback?.outcome,
+    'RESTORED',
+  );
+
+  const failedCandidate = await passedCi(deployments);
+  const failedClaim = await deployments.claimReleaseExecution(failedCandidate.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(failedClaim);
+  const failedChecking = await deployments.advanceReleaseStage(
+    failedCandidate.id,
+    {
+      expectedVersion: failedClaim.deployment.version,
+      attemptId: failedClaim.attemptId,
+      fence: failedClaim.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    now,
+  );
+  const failedRollbackStage = await deployments.advanceReleaseStage(
+    failedCandidate.id,
+    {
+      expectedVersion: failedChecking.version,
+      attemptId: failedClaim.attemptId,
+      fence: failedClaim.fence,
+      stage: 'ROLLBACK',
+    },
+    now,
+  );
+  const rollbackFailed = await deployments.recordReleaseRollbackFailure(
+    failedCandidate.id,
+    {
+      expectedVersion: failedRollbackStage.version,
+      attemptId: failedClaim.attemptId,
+      fence: failedClaim.fence,
+      attemptedTarget: {
+        deploymentId: prior.id,
+        releaseId: prior.id,
+        commitSha: sha,
+        remoteReleasePath: healthyA.release!.success!.remoteReleasePath,
+        activeTarget: healthyA.release!.success!.activeTarget,
+      },
+      failure: {
+        kind: 'ROLLBACK_FAILED',
+        message: 'restored release did not become healthy',
+        retryable: false,
+      },
+    },
+    now,
+  );
+  assert.equal(rollbackFailed.status, 'FAILED');
+  assert.equal(rollbackFailed.stage, 'ROLLBACK');
+  assert.equal(rollbackFailed.release?.rollback?.outcome, 'FAILED');
+  assert.equal(rollbackFailed.release?.success, undefined);
+});
+
+test('manual rollback claims only a healthy same-project predecessor and fences completion', async () => {
+  const { deployments } = repositories();
+  const prior = await passedCi(deployments);
+  const priorClaim = await deployments.claimReleaseExecution(prior.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(priorClaim);
+  const healthyA = await deployments.recordReleasePromotion(
+    prior.id,
+    {
+      expectedVersion: priorClaim.deployment.version,
+      attemptId: priorClaim.attemptId,
+      fence: priorClaim.fence,
+      proof: releaseProof(prior.id, sha, projectId),
+      health,
+    },
+    now,
+  );
+  const active = await passedCi(deployments);
+  const activeClaim = await deployments.claimReleaseExecution(active.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(activeClaim);
+  const laterHealth = { ...health, completedAt: new Date(now.valueOf() + 5) };
+  const healthyB = await deployments.recordReleasePromotion(
+    active.id,
+    {
+      expectedVersion: activeClaim.deployment.version,
+      attemptId: activeClaim.attemptId,
+      fence: activeClaim.fence,
+      proof: {
+        ...releaseProof(active.id, sha, projectId),
+        completedAt: laterHealth.completedAt,
+      },
+      health: laterHealth,
+    },
+    laterHealth.completedAt,
+  );
+  const rejectedClaim = await deployments.claimManualRollback(active.id, prior.id, {
+    now: laterHealth.completedAt,
+    leaseMs: 10_000,
+  });
+  assert.ok(rejectedClaim);
+  const rejected = await deployments.recordManualRollbackRejected(
+    active.id,
+    {
+      expectedVersion: rejectedClaim.deployment.version,
+      requestId: rejectedClaim.requestId,
+      attemptId: rejectedClaim.attemptId,
+      fence: rejectedClaim.fence,
+      target: {
+        deploymentId: prior.id,
+        releaseId: prior.id,
+        commitSha: sha,
+        remoteReleasePath: healthyA.release!.success!.remoteReleasePath,
+        activeTarget: healthyA.release!.success!.activeTarget,
+      },
+      failure: {
+        kind: 'ROLLBACK_FAILED',
+        message: 'manual rollback precondition was rejected by the target',
+        retryable: false,
+      },
+    },
+    new Date(now.valueOf() + 6),
+  );
+  assert.equal(rejected.status, 'SUCCESS');
+  assert.equal(rejected.stage, 'COMPLETE');
+  assert.equal(rejected.release?.status, 'DEPLOYED');
+  assert.equal(rejected.release?.manualRollback?.status, 'REJECTED');
+  assertReleaseExecutionState(
+    rejected.id,
+    rejected.commitSha,
+    rejected.status,
+    rejected.stage,
+    rejected.release,
+  );
+  const manual = await deployments.claimManualRollback(active.id, prior.id, {
+    now: new Date(now.valueOf() + 7),
+    leaseMs: 10_000,
+  });
+  assert.ok(manual);
+  assert.equal(
+    await deployments.reclaimExpiredManualRollback(
+      active.id,
+      'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      { now: new Date(laterHealth.completedAt.valueOf() + 10_001) },
+    ),
+    null,
+    'an expired request cannot be reclaimed for a different target',
+  );
+  const renewed = await deployments.renewManualRollback(
+    active.id,
+    {
+      expectedVersion: manual.deployment.version,
+      requestId: manual.requestId,
+      attemptId: manual.attemptId,
+      fence: manual.fence,
+      leaseMs: 10_000,
+    },
+    new Date(now.valueOf() + 8),
+  );
+  const rolled = await deployments.recordManualRollbackOutcome(
+    active.id,
+    {
+      expectedVersion: renewed.version,
+      requestId: manual.requestId,
+      attemptId: manual.attemptId,
+      fence: manual.fence,
+      target: {
+        deploymentId: prior.id,
+        releaseId: prior.id,
+        commitSha: sha,
+        remoteReleasePath: healthyA.release!.success!.remoteReleasePath,
+        activeTarget: healthyA.release!.success!.activeTarget,
+      },
+      health,
+    },
+    new Date(now.valueOf() + 9),
+  );
+  assert.equal(rolled.status, 'ROLLED_BACK');
+  assert.equal(rolled.release?.rollback?.mode, 'MANUAL');
+  assert.equal(rolled.release?.success?.releaseId, active.id);
+  assert.throws(
+    () =>
+      assertReleaseExecutionState(active.id, sha, rolled.status, rolled.stage, {
+        ...rolled.release!,
+        manualRollback: {
+          ...rolled.release!.manualRollback!,
+          targetDeploymentId: active.id,
+        },
+      }),
+    ValidationError,
+    'a persisted manual request cannot point back to its own deployment',
+  );
+  const reverse = await deployments.claimManualRollback(prior.id, active.id, {
+    now: new Date(now.valueOf() + 10),
+    leaseMs: 10_000,
+  });
+  assert.ok(reverse, 'a previously promoted release remains restorable');
+  assert.equal(reverse.targetDeployment.status, 'ROLLED_BACK');
+  const restoredB = await deployments.recordManualRollbackOutcome(
+    prior.id,
+    {
+      expectedVersion: reverse.deployment.version,
+      requestId: reverse.requestId,
+      attemptId: reverse.attemptId,
+      fence: reverse.fence,
+      target: {
+        deploymentId: active.id,
+        releaseId: active.id,
+        commitSha: sha,
+        remoteReleasePath: healthyB.release!.success!.remoteReleasePath,
+        activeTarget: healthyB.release!.success!.activeTarget,
+      },
+      health,
+    },
+    new Date(now.valueOf() + 11),
+  );
+  assert.equal(restoredB.release?.rollback?.target.deploymentId, active.id);
+
+  const candidateC = await passedCi(deployments);
+  const claimC = await deployments.claimReleaseExecution(candidateC.id, {
+    now: new Date(now.valueOf() + 12),
+    leaseMs: 10_000,
+  });
+  assert.ok(claimC);
+  const checkingC = await deployments.advanceReleaseStage(
+    candidateC.id,
+    {
+      expectedVersion: claimC.deployment.version,
+      attemptId: claimC.attemptId,
+      fence: claimC.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    new Date(now.valueOf() + 10),
+  );
+  const rollbackC = await deployments.advanceReleaseStage(
+    candidateC.id,
+    {
+      expectedVersion: checkingC.version,
+      attemptId: claimC.attemptId,
+      fence: claimC.fence,
+      stage: 'ROLLBACK',
+    },
+    new Date(now.valueOf() + 10),
+  );
+  const restoredFromC = await deployments.recordReleaseRollback(
+    candidateC.id,
+    {
+      expectedVersion: rollbackC.version,
+      attemptId: claimC.attemptId,
+      fence: claimC.fence,
+      target: {
+        deploymentId: active.id,
+        releaseId: active.id,
+        commitSha: sha,
+        remoteReleasePath: healthyB.release!.success!.remoteReleasePath,
+        activeTarget: healthyB.release!.success!.activeTarget,
+      },
+      health,
+    },
+    new Date(now.valueOf() + 10),
+  );
+  assert.equal(restoredFromC.release?.rollback?.target.deploymentId, active.id);
+  assert.equal(restoredFromC.status, 'ROLLED_BACK');
+  await assert.rejects(
+    deployments.claimManualRollback(healthyB.id, active.id, { now }),
+    ValidationError,
+  );
+});
+
+test('unhealthy candidate without a predecessor records NO_KNOWN_GOOD at HEALTH_CHECK', async () => {
+  const { deployments } = repositories();
+  const candidate = await passedCi(deployments);
+  const claim = await deployments.claimReleaseExecution(candidate.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(claim);
+  const checking = await deployments.advanceReleaseStage(
+    candidate.id,
+    {
+      expectedVersion: claim.deployment.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    now,
+  );
+  const failed = await deployments.recordReleaseFailure(
+    candidate.id,
+    {
+      expectedVersion: checking.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      failure: {
+        kind: 'NO_KNOWN_GOOD',
+        message: 'candidate unhealthy and no previous healthy release exists',
+        retryable: false,
+      },
+    },
+    now,
+  );
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.stage, 'HEALTH_CHECK');
+  assert.equal(failed.release?.failure?.kind, 'NO_KNOWN_GOOD');
+});
+
+test('release failure after health-check entry preserves the terminal stage and resets retry stage', async () => {
+  const { deployments } = repositories();
+  const candidate = await passedCi(deployments);
+  const claim = await deployments.claimReleaseExecution(candidate.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(claim);
+  const checking = await deployments.advanceReleaseStage(
+    candidate.id,
+    {
+      expectedVersion: claim.deployment.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    now,
+  );
+  const retry = await deployments.recordReleaseFailure(
+    candidate.id,
+    {
+      expectedVersion: checking.version,
+      attemptId: claim.attemptId,
+      fence: claim.fence,
+      failure: {
+        kind: 'TRANSPORT_FAILED',
+        message: 'remote result was not received',
+        retryable: true,
+      },
+    },
+    now,
+  );
+  assert.equal(retry.stage, 'DEPLOY');
+  assert.equal(retry.release?.status, 'RETRY_PENDING');
+  const second = await deployments.claimReleaseExecution(candidate.id, {
+    now: new Date(now.valueOf() + 1),
+    leaseMs: 10_000,
+  });
+  assert.ok(second);
+  const secondChecking = await deployments.advanceReleaseStage(
+    candidate.id,
+    {
+      expectedVersion: second.deployment.version,
+      attemptId: second.attemptId,
+      fence: second.fence,
+      stage: 'HEALTH_CHECK',
+    },
+    new Date(now.valueOf() + 1),
+  );
+  const failed = await deployments.recordReleaseFailure(
+    candidate.id,
+    {
+      expectedVersion: secondChecking.version,
+      attemptId: second.attemptId,
+      fence: second.fence,
+      failure: {
+        kind: 'TRANSPORT_FAILED',
+        message: 'remote result was not received',
+        retryable: false,
+      },
+    },
+    new Date(now.valueOf() + 1),
+  );
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.stage, 'HEALTH_CHECK');
+  assert.equal(failed.release?.failure?.kind, 'TRANSPORT_FAILED');
+});
+
+test('manual rollback failure preserves B as successful when B is re-proven healthy', async () => {
+  const { deployments } = repositories();
+  const prior = await passedCi(deployments);
+  const priorClaim = await deployments.claimReleaseExecution(prior.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(priorClaim);
+  const healthyA = await deployments.recordReleasePromotion(
+    prior.id,
+    {
+      expectedVersion: priorClaim.deployment.version,
+      attemptId: priorClaim.attemptId,
+      fence: priorClaim.fence,
+      proof: releaseProof(prior.id, sha, projectId),
+      health,
+    },
+    now,
+  );
+  const active = await passedCi(deployments);
+  const releaseClaim = await deployments.claimReleaseExecution(active.id, {
+    now,
+    leaseMs: 10_000,
+  });
+  assert.ok(releaseClaim);
+  const laterHealth = { ...health, completedAt: new Date(now.valueOf() + 5) };
+  const healthyB = await deployments.recordReleasePromotion(
+    active.id,
+    {
+      expectedVersion: releaseClaim.deployment.version,
+      attemptId: releaseClaim.attemptId,
+      fence: releaseClaim.fence,
+      proof: {
+        ...releaseProof(active.id, sha, projectId),
+        completedAt: laterHealth.completedAt,
+      },
+      health: laterHealth,
+    },
+    laterHealth.completedAt,
+  );
+  const request = await deployments.claimManualRollback(active.id, prior.id, {
+    now: laterHealth.completedAt,
+    leaseMs: 10_000,
+  });
+  assert.ok(request);
+  const outcome = await deployments.recordManualRollbackFailure(
+    active.id,
+    {
+      expectedVersion: request.deployment.version,
+      requestId: request.requestId,
+      attemptId: request.attemptId,
+      fence: request.fence,
+      target: {
+        deploymentId: prior.id,
+        releaseId: prior.id,
+        commitSha: sha,
+        remoteReleasePath: healthyA.release!.success!.remoteReleasePath,
+        activeTarget: healthyA.release!.success!.activeTarget,
+      },
+      failure: {
+        kind: 'ROLLBACK_FAILED',
+        message: 'previous release could not be activated',
+        retryable: false,
+      },
+      activeHealth: laterHealth,
+    },
+    laterHealth.completedAt,
+  );
+  assert.equal(outcome.status, 'SUCCESS');
+  assert.equal(outcome.stage, 'COMPLETE');
+  assert.equal(outcome.release?.status, 'DEPLOYED');
+  assert.equal(outcome.release?.manualRollback?.status, 'FAILED');
+  assert.equal(outcome.release?.rollback?.activeHealth?.statusCode, 200);
+  assert.equal(outcome.release?.success?.releaseId, healthyB.id);
 });

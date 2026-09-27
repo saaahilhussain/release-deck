@@ -21,7 +21,12 @@ import {
   type CommandExecutor,
   type CommandResult,
 } from './process.js';
-import { ACTIVATE_REMOTE_SCRIPT, STAGE_REMOTE_SCRIPT } from './scripts.js';
+import {
+  ACTIVATE_REMOTE_SCRIPT,
+  MANUAL_ROLLBACK_REMOTE_SCRIPT,
+  PROMOTE_REMOTE_SCRIPT,
+  STAGE_REMOTE_SCRIPT,
+} from './scripts.js';
 
 export interface ReleaseMetadata {
   readonly projectId: string;
@@ -50,6 +55,10 @@ export interface SshTarget {
   readonly privateKeyPath: string;
   readonly knownHostsPath: string;
   readonly remoteRoot: string;
+  readonly healthUrl: string;
+  readonly healthAttempts: number;
+  readonly healthIntervalMs: number;
+  readonly healthRequestTimeoutMs: number;
   readonly timeoutMs: number;
   readonly outputLimitBytes: number;
 }
@@ -80,6 +89,81 @@ export interface ReleaseProof extends ReleaseMetadata {
   };
   readonly completedAt: Date;
 }
+
+export interface PromoteReleaseInput extends ReleaseMetadata {
+  readonly attemptId: string;
+  readonly retention: number;
+  readonly target: SshTarget;
+  readonly signal?: AbortSignal;
+  readonly now?: () => Date;
+}
+
+export type PromotionOutcome =
+  | {
+      readonly status: 'PROMOTED';
+      readonly proof: ReleaseProof;
+      readonly healthProof: ReleaseHealthProof;
+    }
+  | {
+      readonly status: 'ROLLED_BACK';
+      readonly candidate: ReleaseMetadata;
+      readonly restored: ReleaseMetadata & {
+        readonly releaseId: string;
+        readonly remoteReleasePath: string;
+        readonly activeTarget: string;
+      };
+      readonly healthProof: ReleaseHealthProof;
+    }
+  | {
+      readonly status: 'ROLLBACK_FAILED';
+      readonly candidate: ReleaseMetadata;
+      readonly attemptedRestore: ReleaseMetadata;
+      readonly failureCode:
+        'candidate_unhealthy' | 'restore_unhealthy' | 'activation_failed';
+    }
+  | {
+      readonly status: 'NO_KNOWN_GOOD';
+      readonly candidate: ReleaseMetadata;
+      readonly failureCode: 'no_known_good';
+    };
+
+export interface ReleaseHealthProof {
+  readonly url: string;
+  readonly statusCode: number;
+  readonly attempts: number;
+  readonly completedAt: Date;
+}
+
+export interface ManualRollbackInput extends ReleaseMetadata {
+  readonly targetDeploymentId: string;
+  readonly targetCommitSha: string;
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly retention: number;
+  readonly target: SshTarget;
+  readonly signal?: AbortSignal;
+  readonly now?: () => Date;
+}
+
+export type RollbackOutcome =
+  | {
+      readonly status: 'RESTORED';
+      readonly proof: ReleaseProof;
+      readonly healthProof: ReleaseHealthProof;
+    }
+  | {
+      readonly status: 'FAILED_ACTIVE_RESTORED';
+      readonly active: ReleaseMetadata;
+      readonly attemptedRestore: ReleaseMetadata;
+      readonly proof: ReleaseProof;
+      readonly healthProof: ReleaseHealthProof;
+    }
+  | {
+      readonly status: 'ROLLBACK_FAILED';
+      readonly active: ReleaseMetadata;
+      readonly attemptedRestore: ReleaseMetadata;
+      readonly failureCode: 'restore_unhealthy' | 'active_restore_failed';
+    };
 
 interface StoredArtifactMetadata extends ReleaseMetadata {
   readonly schemaVersion: 1;
@@ -392,6 +476,51 @@ function validateSshTarget(target: SshTarget): SshTarget {
   ) {
     throw new ReleaseDeployerError('transport', 'SSH configuration is invalid');
   }
+  let health: URL;
+  try {
+    health = new URL(target.healthUrl);
+  } catch {
+    throw new ReleaseDeployerError(
+      'transport',
+      'health check configuration is invalid',
+    );
+  }
+  const healthBudgetMs =
+    target.healthAttempts * target.healthRequestTimeoutMs +
+    (target.healthAttempts - 1) * target.healthIntervalMs;
+  if (healthBudgetMs * 2 >= target.timeoutMs) {
+    throw new ReleaseDeployerError(
+      'transport',
+      'health checks exceed the remote deadline',
+    );
+  }
+  if (
+    health.protocol !== 'http:' ||
+    health.hostname !== '127.0.0.1' ||
+    !/^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}(?:\/[A-Za-z0-9._~/-]*)?$/.test(
+      target.healthUrl,
+    ) ||
+    Number(health.port) < 1 ||
+    Number(health.port) > 65_535 ||
+    health.username !== '' ||
+    health.password !== '' ||
+    health.search !== '' ||
+    health.hash !== '' ||
+    !Number.isSafeInteger(target.healthAttempts) ||
+    target.healthAttempts < 1 ||
+    target.healthAttempts > 20 ||
+    !Number.isSafeInteger(target.healthIntervalMs) ||
+    target.healthIntervalMs < 100 ||
+    target.healthIntervalMs > 10_000 ||
+    !Number.isSafeInteger(target.healthRequestTimeoutMs) ||
+    target.healthRequestTimeoutMs < 100 ||
+    target.healthRequestTimeoutMs > 10_000
+  ) {
+    throw new ReleaseDeployerError(
+      'transport',
+      'health check configuration is invalid',
+    );
+  }
   return { ...target, host, remoteRoot: validateRemoteRoot(target.remoteRoot) };
 }
 
@@ -507,7 +636,7 @@ function assertArtifactMatches(
 }
 
 function remoteCommand(args: readonly string[]): string {
-  if (args.some((value) => !/^[A-Za-z0-9._/-]+$/.test(value))) {
+  if (args.some((value) => !/^[A-Za-z0-9._/:+-]+$/.test(value))) {
     throw new ReleaseDeployerError('remote', 'remote command argument is invalid');
   }
   return `sh -s -- ${args.join(' ')}`;
@@ -650,6 +779,388 @@ export async function activateRelease(
   });
   requireSuccess('remote', 'remote release activation failed', activated);
   return parseReleaseProof(activated.stdout, metadata, target.remoteRoot, input.now);
+}
+
+function parseOutcomeFields(output: string, prefix: string): Map<string, string> {
+  const lines = output.split(/\r?\n/).filter((line) => line.startsWith(`${prefix} `));
+  if (lines.length !== 1) {
+    throw new ReleaseDeployerError(
+      'remote',
+      'remote outcome proof is missing or ambiguous',
+    );
+  }
+  const entries = lines[0]!
+    .slice(prefix.length + 1)
+    .split(' ')
+    .map((item) => {
+      const splitAt = item.indexOf('=');
+      return (
+        splitAt < 1 ? ['', ''] : [item.slice(0, splitAt), item.slice(splitAt + 1)]
+      ) as [string, string];
+    });
+  const fields = new Map(entries);
+  if (
+    fields.size !== entries.length ||
+    [...fields.values()].some((value) => value === '')
+  ) {
+    throw new ReleaseDeployerError('remote', 'remote outcome proof fields are invalid');
+  }
+  const expectedKeys: Record<string, readonly string[]> = {
+    PROMOTION_PROMOTED: [
+      'active',
+      'deployment',
+      'healthAttempts',
+      'healthStatus',
+      'nginxReloaded',
+      'nginxValidated',
+      'path',
+      'pid',
+      'pm2',
+      'project',
+      'sha',
+    ],
+    PROMOTION_ROLLED_BACK: [
+      'active',
+      'candidate',
+      'candidateSha',
+      'deployment',
+      'healthAttempts',
+      'healthStatus',
+      'nginxReloaded',
+      'nginxValidated',
+      'path',
+      'pid',
+      'pm2',
+      'project',
+      'sha',
+    ],
+    PROMOTION_ROLLBACK_FAILED: [
+      'candidate',
+      'candidateSha',
+      'deployment',
+      'failureCode',
+      'project',
+      'sha',
+    ],
+    PROMOTION_NO_KNOWN_GOOD: [
+      'candidate',
+      'candidateSha',
+      'deployment',
+      'failureCode',
+      'project',
+      'sha',
+    ],
+    MANUAL_ROLLBACK_RESTORED: [
+      'active',
+      'deployment',
+      'healthAttempts',
+      'healthStatus',
+      'nginxReloaded',
+      'nginxValidated',
+      'path',
+      'pid',
+      'pm2',
+      'project',
+      'sha',
+    ],
+    MANUAL_ROLLBACK_ACTIVE_RESTORED: [
+      'active',
+      'attempted',
+      'attemptedSha',
+      'deployment',
+      'healthAttempts',
+      'healthStatus',
+      'nginxReloaded',
+      'nginxValidated',
+      'path',
+      'pid',
+      'pm2',
+      'project',
+      'sha',
+    ],
+    MANUAL_ROLLBACK_FAILED: [
+      'attempted',
+      'attemptedSha',
+      'deployment',
+      'failureCode',
+      'project',
+      'sha',
+    ],
+  };
+  const keys = expectedKeys[prefix];
+  if (
+    !keys ||
+    JSON.stringify([...fields.keys()].sort()) !== JSON.stringify([...keys].sort())
+  ) {
+    throw new ReleaseDeployerError('remote', 'remote outcome proof fields are invalid');
+  }
+  return fields;
+}
+
+function requireOneOutcome(output: string, prefixes: readonly string[]): string {
+  const lines = output.split(/\r?\n/);
+  const matches = prefixes.filter((prefix) =>
+    lines.some((line) => line.startsWith(`${prefix} `)),
+  );
+  if (matches.length !== 1) {
+    throw new ReleaseDeployerError('remote', 'remote outcome is ambiguous or missing');
+  }
+  return matches[0]!;
+}
+
+function healthProof(
+  fields: Map<string, string>,
+  target: SshTarget,
+  now?: () => Date,
+): ReleaseHealthProof {
+  const statusCode = Number(fields.get('healthStatus'));
+  const attempts = Number(fields.get('healthAttempts'));
+  if (
+    !Number.isSafeInteger(statusCode) ||
+    statusCode < 200 ||
+    statusCode >= 300 ||
+    !Number.isSafeInteger(attempts) ||
+    attempts < 1 ||
+    attempts > target.healthAttempts
+  )
+    throw new ReleaseDeployerError('remote', 'health proof is invalid');
+  const completedAt = (now ?? (() => new Date()))();
+  if (!(completedAt instanceof Date) || Number.isNaN(completedAt.valueOf())) {
+    throw new ReleaseDeployerError('remote', 'health proof timestamp is invalid');
+  }
+  return { url: target.healthUrl, statusCode, attempts, completedAt };
+}
+
+function proofFromFields(
+  fields: Map<string, string>,
+  expected: ReleaseMetadata,
+  target: SshTarget,
+  now?: () => Date,
+): ReleaseProof {
+  return parseReleaseProof(
+    `RELEASE_PROOF project=${fields.get('project')} deployment=${fields.get('deployment')} sha=${fields.get('sha')} path=${fields.get('path')} active=${fields.get('active')} pm2=${fields.get('pm2')} pid=${fields.get('pid')} nginxValidated=${fields.get('nginxValidated')} nginxReloaded=${fields.get('nginxReloaded')}`,
+    expected,
+    target.remoteRoot,
+    now,
+  );
+}
+
+export async function promoteRelease(
+  input: PromoteReleaseInput,
+  executor: CommandExecutor = defaultCommandExecutor,
+): Promise<PromotionOutcome> {
+  const metadata = validateReleaseMetadata(input);
+  const attemptId = validateAttemptId(input.attemptId);
+  const target = validateSshTarget(input.target);
+  if (
+    !Number.isSafeInteger(input.retention) ||
+    input.retention < 2 ||
+    input.retention > 20
+  ) {
+    throw new ReleaseDeployerError('remote', 'release retention is invalid');
+  }
+  const command = remoteCommand([
+    metadata.projectId,
+    metadata.deploymentId,
+    metadata.commitSha,
+    target.remoteRoot,
+    String(input.retention),
+    attemptId,
+    target.healthUrl,
+    String(target.healthAttempts),
+    String(target.healthIntervalMs),
+    String(target.healthRequestTimeoutMs),
+  ]);
+  const result = await executor.run('ssh', buildSshArgs(target, command), {
+    ...commandOptions(target, input.signal),
+    input: PROMOTE_REMOTE_SCRIPT,
+  });
+  requireSuccess('remote', 'remote health-gated promotion failed', result);
+  if (result.stdoutTruncated) {
+    throw new ReleaseDeployerError('remote', 'remote promotion proof was truncated');
+  }
+  const prefix = requireOneOutcome(result.stdout, [
+    'PROMOTION_PROMOTED',
+    'PROMOTION_ROLLED_BACK',
+    'PROMOTION_ROLLBACK_FAILED',
+    'PROMOTION_NO_KNOWN_GOOD',
+  ]);
+  const fields = parseOutcomeFields(result.stdout, prefix);
+  const releaseIdentity = (idKey: string, shaKey: string): ReleaseMetadata => ({
+    projectId: fields.get('project') ?? '',
+    deploymentId: fields.get(idKey) ?? '',
+    commitSha: fields.get(shaKey) ?? '',
+  });
+  if (fields.get('project') !== metadata.projectId)
+    throw new ReleaseDeployerError('remote', 'promotion project proof mismatch');
+  const candidate = releaseIdentity('candidate', 'candidateSha');
+  if (prefix === 'PROMOTION_NO_KNOWN_GOOD') {
+    if (
+      fields.get('deployment') !== metadata.deploymentId ||
+      fields.get('sha') !== metadata.commitSha ||
+      fields.get('candidate') !== metadata.deploymentId ||
+      fields.get('candidateSha') !== metadata.commitSha ||
+      fields.get('failureCode') !== 'no_known_good'
+    ) {
+      throw new ReleaseDeployerError('remote', 'missing known-good proof is invalid');
+    }
+    return {
+      status: 'NO_KNOWN_GOOD',
+      candidate: metadata,
+      failureCode: 'no_known_good',
+    };
+  }
+  if (prefix === 'PROMOTION_ROLLBACK_FAILED') {
+    const failureCode = fields.get('failureCode');
+    if (
+      fields.get('candidate') !== metadata.deploymentId ||
+      fields.get('candidateSha') !== metadata.commitSha ||
+      (failureCode !== 'restore_unhealthy' &&
+        failureCode !== 'candidate_unhealthy' &&
+        failureCode !== 'activation_failed')
+    ) {
+      throw new ReleaseDeployerError('remote', 'rollback failure proof is invalid');
+    }
+    const attemptedRestore = validateReleaseMetadata(
+      releaseIdentity('deployment', 'sha'),
+    );
+    if (attemptedRestore.deploymentId === metadata.deploymentId) {
+      throw new ReleaseDeployerError('remote', 'rollback target proof is invalid');
+    }
+    return {
+      status: 'ROLLBACK_FAILED',
+      candidate: metadata,
+      attemptedRestore,
+      failureCode,
+    };
+  }
+  const health = healthProof(fields, target, input.now);
+  if (prefix === 'PROMOTION_PROMOTED') {
+    return {
+      status: 'PROMOTED',
+      proof: proofFromFields(fields, metadata, target, input.now),
+      healthProof: health,
+    };
+  }
+  if (
+    candidate.deploymentId !== metadata.deploymentId ||
+    candidate.commitSha !== metadata.commitSha
+  ) {
+    throw new ReleaseDeployerError('remote', 'candidate rollback proof mismatch');
+  }
+  const restoredProof = proofFromFields(
+    fields,
+    releaseIdentity('deployment', 'sha'),
+    target,
+    input.now,
+  );
+  return {
+    status: 'ROLLED_BACK',
+    candidate: metadata,
+    restored: {
+      ...releaseIdentity('deployment', 'sha'),
+      releaseId: fields.get('deployment')!,
+      remoteReleasePath: restoredProof.remoteReleasePath,
+      activeTarget: restoredProof.activeTarget,
+    },
+    healthProof: health,
+  };
+}
+
+export async function rollbackRelease(
+  input: ManualRollbackInput,
+  executor: CommandExecutor = defaultCommandExecutor,
+): Promise<RollbackOutcome> {
+  const active = validateReleaseMetadata(input);
+  const restore = validateReleaseMetadata({
+    projectId: input.projectId,
+    deploymentId: input.targetDeploymentId,
+    commitSha: input.targetCommitSha,
+  });
+  if (restore.deploymentId === active.deploymentId)
+    throw new ReleaseDeployerError(
+      'remote',
+      'rollback target must differ from active release',
+    );
+  const attemptId = validateAttemptId(input.attemptId);
+  const requestId = validateAttemptId(input.requestId);
+  const target = validateSshTarget(input.target);
+  if (
+    !Number.isSafeInteger(input.retention) ||
+    input.retention < 2 ||
+    input.retention > 20
+  ) {
+    throw new ReleaseDeployerError('remote', 'release retention is invalid');
+  }
+  const command = remoteCommand([
+    active.projectId,
+    active.deploymentId,
+    active.commitSha,
+    restore.deploymentId,
+    restore.commitSha,
+    target.remoteRoot,
+    String(input.retention),
+    attemptId,
+    target.healthUrl,
+    String(target.healthAttempts),
+    String(target.healthIntervalMs),
+    String(target.healthRequestTimeoutMs),
+    requestId,
+  ]);
+  const result = await executor.run('ssh', buildSshArgs(target, command), {
+    ...commandOptions(target, input.signal),
+    input: MANUAL_ROLLBACK_REMOTE_SCRIPT,
+  });
+  requireSuccess('remote', 'remote manual rollback failed', result);
+  if (result.stdoutTruncated) {
+    throw new ReleaseDeployerError('remote', 'remote rollback proof was truncated');
+  }
+  const prefix = requireOneOutcome(result.stdout, [
+    'MANUAL_ROLLBACK_RESTORED',
+    'MANUAL_ROLLBACK_ACTIVE_RESTORED',
+    'MANUAL_ROLLBACK_FAILED',
+  ]);
+  const fields = parseOutcomeFields(result.stdout, prefix);
+  if (prefix === 'MANUAL_ROLLBACK_FAILED') {
+    if (
+      fields.get('project') !== active.projectId ||
+      fields.get('deployment') !== active.deploymentId ||
+      fields.get('sha') !== active.commitSha ||
+      fields.get('attempted') !== restore.deploymentId ||
+      fields.get('attemptedSha') !== restore.commitSha ||
+      fields.get('failureCode') !== 'active_restore_failed'
+    ) {
+      throw new ReleaseDeployerError(
+        'remote',
+        'manual rollback failure proof is invalid',
+      );
+    }
+    return {
+      status: 'ROLLBACK_FAILED',
+      active,
+      attemptedRestore: restore,
+      failureCode: 'active_restore_failed',
+    };
+  }
+  const expected = prefix === 'MANUAL_ROLLBACK_RESTORED' ? restore : active;
+  if (
+    fields.get('project') !== active.projectId ||
+    (prefix === 'MANUAL_ROLLBACK_ACTIVE_RESTORED' &&
+      (fields.get('attempted') !== restore.deploymentId ||
+        fields.get('attemptedSha') !== restore.commitSha))
+  )
+    throw new ReleaseDeployerError('remote', 'manual rollback identity proof mismatch');
+  const proof = proofFromFields(fields, expected, target, input.now);
+  const health = healthProof(fields, target, input.now);
+  return prefix === 'MANUAL_ROLLBACK_RESTORED'
+    ? { status: 'RESTORED', proof, healthProof: health }
+    : {
+        status: 'FAILED_ACTIVE_RESTORED',
+        active,
+        attemptedRestore: restore,
+        proof,
+        healthProof: health,
+      };
 }
 
 export async function cleanupPreparedRelease(
