@@ -9,9 +9,6 @@ coverage/
 .env.*
 !.env.example
 
-# Local planning and agent session memory
+# Local agent memory and documentation
 /AGENTS.md
-/docs/ROADMAP.md
-/docs/STATUS.md
-/docs/decisions/
-/docs/phases/
+/docs/
