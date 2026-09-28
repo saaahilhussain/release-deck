@@ -13,10 +13,11 @@ pnpm/Turborepo monorepo with three
 applications and six useful shared packages. Build, typecheck, test, lint,
 formatting, runtime verification, isolated persistence verification, and
 real-service Phase 3, Phase 4, and Phase 5 flows are supported by root commands.
-Phase 6 health-gated promotion and rollback is implemented and verified in the
-current uncommitted worktree; its commit/push awaits explicit approval. The
-Phase 6 verifier uses real MongoDB/Redis/worker/CI with a simulated remote
-operation, while Linux fixture tests exercise the fixed remote scripts.
+Phase 6 health-gated promotion and rollback is implemented and verified at
+commit `993b86a`. The Phase 6 verifier uses real MongoDB/Redis/worker/CI with a
+simulated remote operation, while Linux fixture tests exercise the fixed remote
+scripts. Phase 7 dashboard and browser-safe API reads are implemented and
+verified in this repository.
 
 ## Implemented Phase 1 foundation
 
@@ -38,8 +39,8 @@ The Phase 1 API requested work and exposed `/health`; it did not execute
 deployment pipelines. Startup connected to MongoDB and Redis before listening
 on loopback `127.0.0.1:3000`. The health handler still pings both dependencies
 concurrently with a bounded three-second request timeout and returns `200` only
-when both are reachable, otherwise `503`. The dashboard remains a minimal
-branded shell at Vite's default `127.0.0.1:5173` and does not call the API.
+when both are reachable, otherwise `503`. The Phase 1 dashboard was a minimal
+branded shell. Phase 7 replaces it with the read-only interface described below.
 
 The `/health` contract should report dependency reachability with bounded checks.
 A MongoDB `ping` is a connectivity no-op: it does not establish write
@@ -209,7 +210,7 @@ for only the required Nginx validation/reload operations. Phase 5 activates
 directly after infrastructure proof. The Phase 6 extension below adds
 application health checks and rollback.
 
-## Implemented Phase 6 health promotion and rollback (uncommitted)
+## Implemented Phase 6 health promotion and rollback
 
 The worker configures a loopback-only HTTP health URL, bounded attempts,
 request timeout, interval, and remote deadline. The release-deployer activates a
@@ -236,7 +237,26 @@ switching `current`, allowing a reclaimed attempt to re-prove a completed switch
 after a persistence interruption. Stale pre-mutation requests become a durable
 `REJECTED` manual operation while preserving historical deployment success.
 An uncertain post-mutation failure does not claim success. There is no public
-rollback HTTP route or dashboard control yet.
+rollback HTTP route or browser execution control.
+
+## Implemented Phase 7 dashboard
+
+The React/Vite dashboard reads projects and deployments through same-origin API
+routes. Vite proxies `/api` and `/health` to the loopback API during development;
+a deployed dashboard needs equivalent same-origin routing. Project and
+deployment lists are paginated, and the interface labels counts and search as
+limited to the loaded page. The selected deployment receives authoritative
+version changes over SSE, with periodic read fallback and list refresh.
+
+The deployment detail API projects only browser-safe persisted evidence: CI
+step status/timing, release and health proof, rollback outcome, and bounded
+activity milestones. It excludes CI stdout/stderr, unfiltered failure messages,
+target paths, health URLs, process names, attempt IDs, fences, and leases.
+The SSE route sends an initial snapshot, newer versions from bounded MongoDB
+polling, heartbeats, and a five-minute connection limit. A per-router cap limits
+active streams to 32. Browser rollback execution and raw command logs remain
+deferred until an operator authorization boundary exists. The dashboard is
+read-only and does not claim whole-system health from the API dependency check.
 
 ## Target control and execution planes
 
@@ -292,10 +312,10 @@ is intentionally deferred until that phase.
 The implemented system uses Node.js, Express, React, Vite, TypeScript, native
 MongoDB, Redis, Zod, Pino, ioredis, BullMQ, Git, and fixed npm/pnpm CI commands.
 Remote release deployment uses system OpenSSH, POSIX shell tools, PM2, and
-Nginx. Server-Sent Events are preferred later for server-to-browser
-status and log streams. Phosphor icons and the shadcn-inspired visual system
-belong to the later dashboard phase. No technology is added solely for résumé
-value.
+Nginx. Phase 7 uses Server-Sent Events for deployment status; a protected raw
+log stream remains future work. The dashboard uses a custom inline SVG icon
+set and styling based on the preserved visual references. No technology is
+added solely for résumé value.
 
 ## Architectural guardrails
 

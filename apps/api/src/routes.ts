@@ -1,6 +1,10 @@
 import type { Router } from 'express';
 import express from 'express';
-import { BadRequestError } from './errors.js';
+import {
+  deploymentDetailResponse,
+  deploymentListResponse,
+} from './deployment-read-model.js';
+import { BadRequestError, ServiceUnavailableError } from './errors.js';
 import {
   createProjectSchema,
   deploymentPathSchema,
@@ -46,27 +50,24 @@ function projectResponse(project: Awaited<ReturnType<ProjectService['get']>>) {
   };
 }
 
-function deploymentResponse(deployment: Awaited<ReturnType<DeploymentService['get']>>) {
-  return {
-    id: deployment.id,
-    projectId: deployment.projectId,
-    provider: deployment.provider,
-    commitSha: deployment.commitSha,
-    status: deployment.status,
-    stage: deployment.stage,
-    version: deployment.version,
-    createdAt: new Date(deployment.createdAt).toISOString(),
-    updatedAt: new Date(deployment.updatedAt).toISOString(),
-  };
+export interface DeploymentEventOptions {
+  pollIntervalMs?: number;
+  heartbeatIntervalMs?: number;
+  maxConnectionMs?: number;
+  maxActiveStreams?: number;
 }
 
-export function createApiRouter(repositories: ApiRepositories): Router {
+export function createApiRouter(
+  repositories: ApiRepositories,
+  eventOptions: DeploymentEventOptions = {},
+): Router {
   const router = express.Router();
   const projects = new ProjectService(repositories.projects);
   const deployments = new DeploymentService(
     repositories.deployments,
     repositories.projects,
   );
+  let activeDeploymentStreams = 0;
 
   router.post('/projects', async (request, response) => {
     const input = parsed(request.body, createProjectSchema);
@@ -94,7 +95,7 @@ export function createApiRouter(repositories: ApiRepositories): Router {
     const query = parsed(request.query, listQuerySchema);
     const page = await deployments.listByProject(projectId, query);
     response.json({
-      deployments: page.items.map(deploymentResponse),
+      deployments: page.items.map(deploymentListResponse),
       nextCursor: page.nextCursor,
     });
   });
@@ -102,7 +103,127 @@ export function createApiRouter(repositories: ApiRepositories): Router {
   router.get('/deployments/:deploymentId', async (request, response) => {
     const { deploymentId } = parsed(request.params, deploymentPathSchema);
     const deployment = await deployments.get(deploymentId);
-    response.json({ deployment: deploymentResponse(deployment) });
+    response.json({ deployment: deploymentDetailResponse(deployment) });
+  });
+
+  router.get('/deployments/:deploymentId/events', async (request, response) => {
+    const { deploymentId } = parsed(request.params, deploymentPathSchema);
+    if (activeDeploymentStreams >= (eventOptions.maxActiveStreams ?? 32)) {
+      throw new ServiceUnavailableError('deployment streams are at capacity');
+    }
+    activeDeploymentStreams += 1;
+    let released = false;
+    const releaseSlot = () => {
+      if (released) return;
+      released = true;
+      activeDeploymentStreams -= 1;
+    };
+    response.on('close', releaseSlot);
+
+    // Resolve before sending headers so invalid or missing IDs retain JSON errors.
+    let initial: Awaited<ReturnType<DeploymentService['get']>>;
+    try {
+      initial = await deployments.get(deploymentId);
+    } catch (error) {
+      releaseSlot();
+      throw error;
+    }
+    if (response.destroyed) {
+      releaseSlot();
+      return;
+    }
+
+    try {
+      response.status(200);
+      response.set({
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      response.flushHeaders();
+    } catch (error) {
+      releaseSlot();
+      throw error;
+    }
+
+    let closed = false;
+    let reading = false;
+    let lastVersion = initial.version;
+    const timers: {
+      poll?: NodeJS.Timeout;
+      heartbeat?: NodeJS.Timeout;
+      lifetime?: NodeJS.Timeout;
+    } = {};
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      if (timers.poll) clearInterval(timers.poll);
+      if (timers.heartbeat) clearInterval(timers.heartbeat);
+      if (timers.lifetime) clearTimeout(timers.lifetime);
+      releaseSlot();
+      response.end();
+    };
+    response.on('close', close);
+    if (response.destroyed) {
+      close();
+      return;
+    }
+
+    const sendDeployment = (deployment: typeof initial) => {
+      if (closed || response.destroyed) return;
+      const data = JSON.stringify({ deployment: deploymentDetailResponse(deployment) });
+      if (
+        !response.write(
+          `id: ${deployment.version}\nevent: deployment\ndata: ${data}\n\n`,
+        )
+      ) {
+        // A slow reader must not accumulate an unbounded response buffer.
+        close();
+      }
+    };
+
+    sendDeployment(initial);
+    if (closed) return;
+
+    timers.poll = setInterval(() => {
+      if (reading || closed) return;
+      reading = true;
+      void deployments
+        .get(deploymentId)
+        .then((current) => {
+          if (closed || current.version <= lastVersion) return;
+          lastVersion = current.version;
+          sendDeployment(current);
+        })
+        .catch(() => {
+          if (!closed && !response.destroyed) {
+            const writable = response.write(
+              'event: stream-error\ndata: {"message":"deployment stream unavailable"}\n\n',
+            );
+            if (!writable) {
+              close();
+              return;
+            }
+          }
+          close();
+        })
+        .finally(() => {
+          reading = false;
+        });
+    }, eventOptions.pollIntervalMs ?? 2_000);
+    timers.poll.unref();
+
+    timers.heartbeat = setInterval(() => {
+      if (closed || response.destroyed) return;
+      if (!response.write(': heartbeat\n\n')) close();
+    }, eventOptions.heartbeatIntervalMs ?? 15_000);
+    timers.heartbeat.unref();
+
+    // EventSource reconnects with a fresh authoritative snapshot. This bounds
+    // the lifetime of every individual polling connection.
+    timers.lifetime = setTimeout(close, eventOptions.maxConnectionMs ?? 300_000);
+    timers.lifetime.unref();
   });
 
   return router;

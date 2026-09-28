@@ -49,6 +49,12 @@ Once running:
 - Dashboard: <http://127.0.0.1:5173>
 - API health check: <http://127.0.0.1:3000/health>
 
+The dashboard reads real projects, deployment evidence, release health, and
+rollback outcomes through the API. It shows bounded persisted activity rather
+than raw CI output. Rollback execution remains an operator action outside the
+browser. In development, Vite proxies API requests to `127.0.0.1:3000`; a
+separately hosted dashboard needs equivalent same-origin `/api` routing.
+
 ## Development commands
 
 ```bash

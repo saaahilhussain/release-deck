@@ -11,7 +11,7 @@ import {
   PayloadTooLargeError,
   UnsupportedMediaTypeError,
 } from './errors.js';
-import { createApiRouter } from './routes.js';
+import { createApiRouter, type DeploymentEventOptions } from './routes.js';
 import type { ApiRepositories } from './services.js';
 import {
   createGithubWebhookRouter,
@@ -33,6 +33,7 @@ export interface AppDependencies {
   githubWebhookSecret?: string;
   deploymentQueue?: DeploymentQueueProducer;
   githubWebhookProcessor?: GithubWebhookProcessor;
+  deploymentEventOptions?: DeploymentEventOptions;
 }
 
 export function createApp(dependencies: AppDependencies): Express {
@@ -90,7 +91,10 @@ export function createApp(dependencies: AppDependencies): Express {
   });
 
   if (dependencies.repositories) {
-    app.use('/api', createApiRouter(dependencies.repositories));
+    app.use(
+      '/api',
+      createApiRouter(dependencies.repositories, dependencies.deploymentEventOptions),
+    );
   }
 
   app.use((_request, _response, next) => {
