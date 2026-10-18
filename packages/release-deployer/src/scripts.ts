@@ -1,3 +1,5 @@
+import { PM2_ACTIVATION_FUNCTION } from './pm2.js';
+
 export const STAGE_REMOTE_SCRIPT = String.raw`set -eu
 project_id=$1
 deployment_id=$2
@@ -78,6 +80,7 @@ printf 'RELEASE_STAGED project=%s deployment=%s sha=%s path=%s\n' \
 `;
 
 export const ACTIVATE_REMOTE_SCRIPT = String.raw`set -eu
+${PM2_ACTIVATION_FUNCTION}
 project_id=$1
 deployment_id=$2
 commit_sha=$3
@@ -129,10 +132,7 @@ active=$(readlink -f "$base/current")
 test "$active" = "$target"
 
 name="releasedeck-$project_id"
-pm2 startOrReload "$target/ecosystem.config.cjs" --only "$name" --update-env
-pid=$(pm2 pid "$name")
-case "$pid" in ''|*[!0-9]*) exit 68 ;; esac
-test "$pid" -gt 0
+pid=$(activate_pm2 "$target" "$name") || exit 68
 sudo -n nginx -t
 sudo -n nginx -s reload
 
@@ -155,6 +155,7 @@ printf 'RELEASE_PROOF project=%s deployment=%s sha=%s path=%s active=%s pm2=%s p
 `;
 
 export const PROMOTE_REMOTE_SCRIPT = String.raw`set -u
+${PM2_ACTIVATION_FUNCTION}
 project_id=$1 deployment_id=$2 commit_sha=$3 root=$4 keep=$5 attempt_id=$6
 health_url=$7 attempts=$8 interval_ms=$9 request_timeout_ms=${'$'}{10}
 valid_uuid() { case "$1" in ????????-????-????-????-????????????) ;; *) return 1 ;; esac; case "$1" in *[!0-9a-fA-F-]*) return 1 ;; esac; }
@@ -212,10 +213,7 @@ next="$base/.current-$attempt_id"; rm -f -- "$next"; ln -s "releases/$deployment
 activate() {
   id=$1 dir="$releases/$1" name="releasedeck-$project_id"
   ln -sfn "$base/shared/.env" "$dir/.env"
-  pm2 startOrReload "$dir/ecosystem.config.cjs" --only "$name" --update-env || return 1
-  pid=$(pm2 pid "$name") || return 1
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  test "$pid" -gt 0 || return 1
+  pid=$(activate_pm2 "$dir" "$name") || return 1
   sudo -n nginx -t && sudo -n nginx -s reload || return 1
   return 0
 }
@@ -278,6 +276,7 @@ exit 0
 `;
 
 export const MANUAL_ROLLBACK_REMOTE_SCRIPT = String.raw`set -u
+${PM2_ACTIVATION_FUNCTION}
 project_id=$1 active_id=$2 active_sha=$3 restore_id=$4 restore_sha=$5 root=$6 keep=$7 attempt_id=$8 health_url=$9 attempts=${'$'}{10} interval_ms=${'$'}{11} request_timeout_ms=${'$'}{12} request_id=${'$'}{13}
 valid_uuid() { case "$1" in ????????-????-????-????-????????????) ;; *) return 1 ;; esac; case "$1" in *[!0-9a-fA-F-]*) return 1 ;; esac; }
 valid_uuid "$project_id" && valid_uuid "$active_id" && valid_uuid "$restore_id" && valid_uuid "$attempt_id" && valid_uuid "$request_id" || exit 64
@@ -330,8 +329,7 @@ if test "$current" != "releases/$restore_id"; then
   next="$base/.rollback-$attempt_id"; rm -f -- "$next" && ln -s "releases/$restore_id" "$next" && mv -Tf -- "$next" "$base/current" || exit 74
 fi
 name="releasedeck-$project_id"
-if pm2 startOrReload "$restore/ecosystem.config.cjs" --only "$name" --update-env && sudo -n nginx -t && sudo -n nginx -s reload; then
-  pid=$(pm2 pid "$name") || pid=
+if pid=$(activate_pm2 "$restore" "$name") && sudo -n nginx -t && sudo -n nginx -s reload; then
   i=1; ok=0; status=0
   while test "$i" -le "$attempts"; do status=$(curl --noproxy '*' --silent --show-error --max-time "$(awk -v ms="$request_timeout_ms" 'BEGIN { printf "%.3f", ms / 1000 }')" --output /dev/null --write-out '%{http_code}' "$health_url" 2>/dev/null) || status=0; case "$status" in ??????*) status=0 ;; *[!0-9]*) status=0 ;; esac; if test "$status" -ge 200 && test "$status" -lt 300; then ok=1; break; fi; test "$i" -lt "$attempts" && sleep "$(awk -v ms="$interval_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"; i=$((i + 1)); done
   if test "$ok" = 1 && test "$(readlink "$base/current")" = "releases/$restore_id" && test "$pid" -gt 0; then
@@ -356,8 +354,7 @@ if pm2 startOrReload "$restore/ecosystem.config.cjs" --only "$name" --update-env
 fi
 restore_next="$base/.restore-active-$attempt_id"; rm -f -- "$restore_next" && ln -s "releases/$active_id" "$restore_next" && mv -Tf -- "$restore_next" "$base/current" || exit 74
 active_dir="$releases/$active_id"
-if pm2 startOrReload "$active_dir/ecosystem.config.cjs" --only "$name" --update-env && sudo -n nginx -t && sudo -n nginx -s reload; then
-  active_pid=$(pm2 pid "$name") || active_pid=
+if active_pid=$(activate_pm2 "$active_dir" "$name") && sudo -n nginx -t && sudo -n nginx -s reload; then
   i=1; active_status=0; active_attempts=0; active_ok=0
   while test "$i" -le "$attempts"; do active_attempts=$i; active_status=$(curl --noproxy '*' --silent --show-error --max-time "$(awk -v ms="$request_timeout_ms" 'BEGIN { printf "%.3f", ms / 1000 }')" --output /dev/null --write-out '%{http_code}' "$health_url" 2>/dev/null) || active_status=0; case "$active_status" in ??????*) active_status=0 ;; *[!0-9]*) active_status=0 ;; esac; if test "$active_status" -ge 200 && test "$active_status" -lt 300; then active_ok=1; break; fi; test "$i" -lt "$attempts" && sleep "$(awk -v ms="$interval_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"; i=$((i + 1)); done
   if test "$active_ok" = 1 && test "$active_pid" -gt 0 && test "$(readlink "$base/current")" = "releases/$active_id"; then

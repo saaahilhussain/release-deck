@@ -310,6 +310,19 @@ test('proof parsing rejects missing, duplicate, or mismatched evidence', () => {
   }
 });
 
+const fakePm2 = String.raw`#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path');
+const state = process.argv[1] + '.state';
+const [command, config] = process.argv.slice(2);
+if (command === 'jlist') console.log(fs.existsSync(state) ? fs.readFileSync(state, 'utf8') : '[]');
+else if (command === 'delete') fs.rmSync(state, {force:true});
+else if (command === 'start') {
+  if (fs.existsSync(path.join(path.dirname(config), '.fail-start'))) process.exit(1);
+  const app = require(config).apps[0];
+  fs.writeFileSync(state, JSON.stringify([{name:app.name,pid:4321,pm2_env:{status:'online',pm_exec_path:path.resolve(path.dirname(config),app.script),pm_cwd:path.dirname(config)}}]));
+} else process.exit(1);
+`;
+
 test('remote scripts stage immutable content and atomically activate with guarded retention', () => {
   assert.match(STAGE_REMOTE_SCRIPT, /sha256sum/);
   assert.match(STAGE_REMOTE_SCRIPT, /\.staging-/);
@@ -319,7 +332,9 @@ test('remote scripts stage immutable content and atomically activate with guarde
   assert.match(ACTIVATE_REMOTE_SCRIPT, /mv -Tf --/);
   assert.match(ACTIVATE_REMOTE_SCRIPT, /flock -w 300/);
   assert.ok((ACTIVATE_REMOTE_SCRIPT.match(/readlink -f/g) ?? []).length >= 2);
-  assert.match(ACTIVATE_REMOTE_SCRIPT, /pm2 startOrReload/);
+  assert.match(ACTIVATE_REMOTE_SCRIPT, /pm2 delete/);
+  assert.match(ACTIVATE_REMOTE_SCRIPT, /activate_pm2/);
+  assert.doesNotMatch(ACTIVATE_REMOTE_SCRIPT, /startOrReload/);
   assert.match(ACTIVATE_REMOTE_SCRIPT, /sudo -n nginx -t/);
   assert.match(ACTIVATE_REMOTE_SCRIPT, /! -name "\$deployment_id"/);
   assert.doesNotMatch(ACTIVATE_REMOTE_SCRIPT, /rm -rf -- "\$root"/);
@@ -386,14 +401,14 @@ commit_sha=$4
 archive=$5
 mkdir -p "$root/$project_id/shared" "$root/source/.releasedeck-release" "$root/bin"
 printf 'PORT=3000\n' > "$root/$project_id/shared/.env"
-printf 'module.exports = { apps: [] };\n' > "$root/source/ecosystem.config.cjs"
+printf 'module.exports={apps:[{name:"releasedeck-%s",cwd:__dirname,script:"./server.cjs"}]};\n' "$project_id" > "$root/source/ecosystem.config.cjs"
+printf '' > "$root/source/server.cjs"
 printf '%s' "$project_id" > "$root/source/.releasedeck-release/project-id"
 printf '%s' "$deployment_id" > "$root/source/.releasedeck-release/deployment-id"
 printf '%s' "$commit_sha" > "$root/source/.releasedeck-release/commit-sha"
 tar -czf "$archive" -C "$root/source" .
 cat > "$root/bin/pm2" <<'EOF'
-#!/bin/sh
-if test "$1" = pid; then printf '4321\n'; else sleep 0.2; fi
+${fakePm2}
 EOF
 cat > "$root/bin/sudo" <<'EOF'
 #!/bin/sh
@@ -529,11 +544,11 @@ test('promotion restores and rechecks healthy A after candidate B fails', async 
         'root=$1 project=$2 a=$3 b=$4 sha_a=$5 sha_b=$6',
         'base="$root/$project"; mkdir -p "$base/shared" "$base/releases/$a/.releasedeck-release" "$base/releases/$b/.releasedeck-release" "$root/bin"',
         'printf x > "$base/shared/.env"',
-        'for id in "$a" "$b"; do d="$base/releases/$id"; printf %s "$project" > "$d/.releasedeck-release/project-id"; printf %s "$id" > "$d/.releasedeck-release/deployment-id"; printf x > "$d/.releasedeck-release/archive-sha256"; ln -s "$base/shared/.env" "$d/.env"; printf x > "$d/ecosystem.config.cjs"; done',
+        'for id in "$a" "$b"; do d="$base/releases/$id"; printf %s "$project" > "$d/.releasedeck-release/project-id"; printf %s "$id" > "$d/.releasedeck-release/deployment-id"; printf x > "$d/.releasedeck-release/archive-sha256"; ln -s "$base/shared/.env" "$d/.env"; printf \'module.exports={apps:[{name:"releasedeck-%s",cwd:__dirname,script:"./server.cjs"}]};\\n\' "$project" > "$d/ecosystem.config.cjs"; printf x > "$d/server.cjs"; done',
         'printf %s "$sha_a" > "$base/releases/$a/.releasedeck-release/commit-sha"; printf %s "$sha_b" > "$base/releases/$b/.releasedeck-release/commit-sha"',
         'printf 200 > "$base/releases/$a/.health"; printf 503 > "$base/releases/$b/.health"',
         'ln -s "releases/$a" "$base/current"',
-        "printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = pid ]; then echo 4321; fi' > \"$root/bin/pm2\"",
+        `cat > "$root/bin/pm2" <<'FAKE'\n${fakePm2}FAKE`,
         "printf '%s\\n' '#!/bin/sh' 'test \"$1\" = -n && shift' 'exec \"$@\"' > \"$root/bin/sudo\"",
         "printf '%s\\n' '#!/bin/sh' 'exit 0' > \"$root/bin/nginx\"",
         'printf \'%s\\n\' \'#!/bin/sh\' \'test "$1" = --noproxy && test "$2" = "*" || exit 7\' \'id=$(basename "$(readlink "$FIXTURE_BASE/current")")\' \'code=$(cat "$FIXTURE_BASE/releases/$id/.health")\' \'printf %s "$code"\' \'test "$code" -lt 400\' > "$root/bin/curl"',
@@ -574,6 +589,18 @@ test('promotion restores and rechecks healthy A after candidate B fails', async 
     assert.equal(legacyCheck.stdout, '');
     const first = await promote(idA, metadata.commitSha, attemptId);
     assert.match(first.stdout, /PROMOTION_PROMOTED .*healthStatus=200/);
+    await runLinuxShell('touch "$1/$2/releases/$3/.fail-start"\n', [
+      root,
+      metadata.projectId,
+      idB,
+    ]);
+    const failedStart = await promote(idB, shaB, randomUUID());
+    assert.match(failedStart.stdout, /PROMOTION_ROLLED_BACK .*healthStatus=200/);
+    await runLinuxShell('rm "$1/$2/releases/$3/.fail-start"\n', [
+      root,
+      metadata.projectId,
+      idB,
+    ]);
     const candidate = await promote(idB, shaB, '77777777-7777-4777-8777-777777777777');
     assert.match(
       candidate.stdout,
