@@ -1,6 +1,49 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
+import { windowsTerminationCommand } from './windows-process-tree.js';
+
+export interface GitHubCheckoutCredential {
+  token: string;
+  readonly helperPath: string;
+  readonly repositoryPath: string;
+}
+
+function shellQuote(value: string): string {
+  return "'" + value.replaceAll('\\', '/').replaceAll("'", "'\\''") + "'";
+}
+
+/** Only exact-SHA fetch may extend createCiEnvironment with this fixed contract. */
+export function githubCredentialEnvironment(
+  credential: GitHubCheckoutCredential,
+): NodeJS.ProcessEnv {
+  const entries = [
+    ['credential.helper', ''],
+    ['credential.useHttpPath', 'true'],
+    [
+      'credential.helper',
+      `!${shellQuote(process.execPath)} ${shellQuote(credential.helperPath)}`,
+    ],
+    ['http.followRedirects', 'false'],
+    ['credential.interactive', 'false'],
+    // Authenticated fetch must not launch hooks or background maintenance with its token.
+    ['core.hooksPath', process.platform === 'win32' ? 'NUL' : '/dev/null'],
+    ['gc.auto', '0'],
+    ['maintenance.auto', 'false'],
+    ['fetch.recurseSubmodules', 'false'],
+  ];
+  return {
+    RELEASEDECK_CHECKOUT_TOKEN: credential.token,
+    RELEASEDECK_CHECKOUT_PATH: credential.repositoryPath,
+    GIT_CONFIG_COUNT: String(entries.length),
+    ...Object.fromEntries(
+      entries.flatMap(([key, value], i) => [
+        [`GIT_CONFIG_KEY_${i}`, key],
+        [`GIT_CONFIG_VALUE_${i}`, value],
+      ]),
+    ),
+  };
+}
 
 export const DEFAULT_OUTPUT_LIMIT_BYTES = 256 * 1024;
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -24,6 +67,8 @@ export interface ProcessOptions {
   readonly killGraceMs?: number;
   readonly outputLimitBytes?: number;
   readonly signal?: AbortSignal;
+  /** Trusted fetch only; never copied into repository command environments. */
+  readonly githubCredential?: GitHubCheckoutCredential;
 }
 
 export interface ProcessRunner {
@@ -49,6 +94,13 @@ export class ProcessCancelledError extends Error {
     super('child process was cancelled');
     this.name = 'ProcessCancelledError';
     this.result = result;
+  }
+}
+
+export class ProcessTerminationError extends Error {
+  constructor() {
+    super('child process termination could not be confirmed');
+    this.name = 'ProcessTerminationError';
   }
 }
 
@@ -145,45 +197,66 @@ async function waitForProcessTreeExit(
   return true;
 }
 
-function sendSignal(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
+function sendSignal(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  earliestStart: number,
+  latestStart: number,
+): Promise<void> {
   if (!child.pid) return Promise.resolve();
+  const processId = child.pid;
   const fallback = () => {
     try {
       child.kill(signal);
     } catch {
-      // The child may have exited between taskkill and the fallback.
+      // The child may have exited after signalling its process group.
     }
   };
   if (process.platform === 'win32') {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let complete = false;
-      let taskkill: ChildProcess | undefined;
-      const finish = (useFallback: boolean) => {
+      let helper: ChildProcess | undefined;
+      const finish = (confirmed: boolean) => {
         if (complete) return;
         complete = true;
         clearTimeout(commandTimer);
-        if (useFallback) fallback();
-        resolve();
+        if (confirmed) resolve();
+        else reject(new ProcessTerminationError());
       };
       const commandTimer = setTimeout(() => {
         try {
-          taskkill?.kill('SIGKILL');
+          helper?.kill('SIGKILL');
         } catch {
-          // The taskkill helper may have exited as its timeout fired.
+          // The helper may have exited as its timeout fired.
         }
-        finish(true);
+        finish(false);
       }, TREE_KILL_COMMAND_TIMEOUT_MS);
       commandTimer.unref();
       try {
-        taskkill = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-          shell: false,
-          windowsHide: true,
-          stdio: 'ignore',
-        });
-        taskkill.once('error', () => finish(true));
-        taskkill.once('close', (exitCode) => finish(exitCode !== 0));
+        helper = spawn(
+          join(
+            process.env.SystemRoot ?? 'C:\\Windows',
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe',
+          ),
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            windowsTerminationCommand(processId, earliestStart, latestStart),
+          ],
+          {
+            shell: false,
+            windowsHide: true,
+            stdio: 'ignore',
+          },
+        );
+        helper.once('error', () => finish(false));
+        helper.once('close', (exitCode) => finish(exitCode === 0));
       } catch {
-        finish(true);
+        finish(false);
       }
     });
   }
@@ -242,6 +315,18 @@ function baseResult(
 
 export const defaultProcessRunner: ProcessRunner = {
   run(command, args, options) {
+    if (
+      options.githubCredential &&
+      (command !== 'git' ||
+        args.length !== 5 ||
+        args[0] !== 'fetch' ||
+        args[1] !== '--no-tags' ||
+        args[2] !== '--depth=1' ||
+        args[3] !== 'origin' ||
+        !/^[0-9a-f]{40}$/.test(args[4] ?? ''))
+    ) {
+      throw new Error('GitHub credentials are restricted to exact-SHA fetch');
+    }
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const graceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     const limit = options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES;
@@ -275,12 +360,25 @@ export const defaultProcessRunner: ProcessRunner = {
       const launched = launch(command, args);
       const child = spawn(launched.command, [...launched.args], {
         cwd: options.cwd,
-        env: createCiEnvironment(options.cwd),
+        env: {
+          ...createCiEnvironment(options.cwd),
+          ...(options.githubCredential
+            ? githubCredentialEnvironment(options.githubCredential)
+            : {}),
+        },
         shell: false,
         detached: process.platform !== 'win32',
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      const spawnedAt = Date.now();
+      let closed = false;
+      const childClosed = new Promise<void>((resolve) =>
+        child.once('close', () => {
+          closed = true;
+          resolve();
+        }),
+      );
       let settled = false;
       let reason: 'timeout' | 'cancelled' | undefined;
       const timer = setTimeout(() => terminate('timeout'), timeoutMs);
@@ -308,15 +406,34 @@ export const defaultProcessRunner: ProcessRunner = {
         if (settled || reason) return;
         reason = why;
         void (async () => {
-          await sendSignal(child, 'SIGTERM');
-          if (process.platform !== 'win32') {
-            const terminated = await waitForProcessTreeExit(child, graceMs);
-            if (!terminated) {
-              await sendSignal(child, 'SIGKILL');
-              await waitForProcessTreeExit(child, FORCE_SETTLE_GRACE_MS);
+          try {
+            await sendSignal(child, 'SIGTERM', startedAt, spawnedAt);
+            if (process.platform !== 'win32') {
+              const terminated = await waitForProcessTreeExit(child, graceMs);
+              if (!terminated) {
+                await sendSignal(child, 'SIGKILL', startedAt, spawnedAt);
+                await waitForProcessTreeExit(child, FORCE_SETTLE_GRACE_MS);
+              }
+            } else if (!closed) {
+              let closeTimer: NodeJS.Timeout | undefined;
+              try {
+                await Promise.race([
+                  childClosed,
+                  new Promise<never>((_resolve, reject) => {
+                    closeTimer = setTimeout(
+                      () => reject(new ProcessTerminationError()),
+                      FORCE_SETTLE_GRACE_MS,
+                    );
+                  }),
+                ]);
+              } finally {
+                if (closeTimer) clearTimeout(closeTimer);
+              }
             }
+            finish();
+          } catch {
+            finish(new ProcessTerminationError());
           }
-          finish();
         })();
       };
       function cancel() {

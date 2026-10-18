@@ -1,4 +1,10 @@
 export {
+  createGitHubAppAuth,
+  createGitHubAppJwt,
+  type GitHubAppAuth,
+  type GitHubAppConfiguration,
+} from './github-app-auth.js';
+export {
   createSystemdBuildExecutor,
   type BuildExecutor,
   type BuildSession,
@@ -25,6 +31,7 @@ export {
   DEFAULT_TIMEOUT_MS,
   ProcessCancelledError,
   ProcessTimeoutError,
+  ProcessTerminationError,
   defaultProcessRunner,
   type ProcessOptions,
   type ProcessResult,

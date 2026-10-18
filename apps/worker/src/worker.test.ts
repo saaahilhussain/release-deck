@@ -88,7 +88,7 @@ test('isolated worker probes before connections and fails closed on missing laun
   assert.equal(connections, 0);
 });
 
-test('systemd worker probes and wires the restricted executor before starting a consumer', async () => {
+test('systemd worker probes and loads App auth before connecting and wires both boundaries into the runner', async () => {
   const events: string[] = [];
   const executor = {
     probe: async () => {
@@ -96,6 +96,11 @@ test('systemd worker probes and wires the restricted executor before starting a 
     },
     open: async () => {
       throw new Error('not executed by startup');
+    },
+  };
+  const githubAppAuth = {
+    installationToken: async () => {
+      throw new Error('startup must not mint a token');
     },
   };
   const mongo = { db: {}, close: async () => undefined } as unknown as MongoConnection;
@@ -109,9 +114,18 @@ test('systemd worker probes and wires the restricted executor before starting a 
       NODE_ENV: 'production',
       CI_EXECUTION_MODE: 'systemd',
       CI_CONCURRENCY: 1,
+      GITHUB_APP_ID: '123',
+      GITHUB_APP_INSTALLATION_ID: '456',
+      GITHUB_APP_PRIVATE_KEY_PATH: environment.RELEASE_SSH_PRIVATE_KEY_PATH,
     },
     {
       createBuildExecutor: () => executor,
+      createGitHubAppAuth: async (config) => {
+        events.push('auth');
+        assert.equal(config.appId, '123');
+        assert.equal(config.installationId, '456');
+        return githubAppAuth;
+      },
       connectMongo: async () => {
         events.push('mongo');
         return mongo;
@@ -121,6 +135,7 @@ test('systemd worker probes and wires the restricted executor before starting a 
       createCiRunner: (options) => {
         events.push('runner');
         assert.equal(options.buildExecutor, executor);
+        assert.equal(options.githubAppAuth, githubAppAuth);
         return {
           run: async () => {
             throw new Error('not executed');
@@ -135,8 +150,62 @@ test('systemd worker probes and wires the restricted executor before starting a 
       logger: createLogger('silent'),
     },
   );
-  assert.deepEqual(events, ['probe', 'mongo', 'runner', 'consumer']);
+  assert.deepEqual(events, ['probe', 'auth', 'mongo', 'runner', 'consumer']);
   await worker.close();
+});
+
+test('App auth fails closed before connections for same-user mode, partial configuration and invalid keys', async () => {
+  let connections = 0;
+  const dependencies = {
+    connectMongo: async () => {
+      connections++;
+      throw new Error('must not connect');
+    },
+    connectRedis: async () => {
+      throw new Error('must not connect');
+    },
+    createBuildExecutor: () => ({
+      probe: async () => undefined,
+      open: async () => {
+        throw new Error('must not open');
+      },
+    }),
+    createGitHubAppAuth: async () => {
+      throw new Error('signing key configuration is invalid');
+    },
+    logger: createLogger('silent'),
+  };
+  await assert.rejects(
+    startWorker({ ...environment, GITHUB_APP_ID: '123' }, dependencies),
+    /requires isolated/,
+  );
+  await assert.rejects(
+    startWorker(
+      {
+        ...environment,
+        CI_EXECUTION_MODE: 'systemd',
+        CI_CONCURRENCY: 1,
+        GITHUB_APP_ID: '123',
+      },
+      dependencies,
+    ),
+    /incomplete/,
+  );
+  await assert.rejects(
+    startWorker(
+      {
+        ...environment,
+        CI_EXECUTION_MODE: 'systemd',
+        CI_CONCURRENCY: 1,
+        GITHUB_APP_ID: '123',
+        GITHUB_APP_INSTALLATION_ID: '456',
+        GITHUB_APP_PRIVATE_KEY_PATH: environment.RELEASE_SSH_PRIVATE_KEY_PATH,
+      },
+      dependencies,
+    ),
+    /signing key configuration is invalid/,
+  );
+  assert.equal(connections, 0);
 });
 
 function workerStub(close: () => Promise<void>) {

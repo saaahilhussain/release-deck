@@ -40,7 +40,11 @@ def main():
                   commands=dict(npm='/usr/bin/python3', pnpm='/usr/bin/python3'))
     launcher = module.Launcher(config)
     os.environ.update(MONGODB_URI='worker-mongo-canary', REDIS_URL='worker-redis-canary',
-                      GITHUB_APP_PRIVATE_KEY='worker-signing-key-canary', GITHUB_TOKEN='checkout-token-canary')
+                      GITHUB_APP_PRIVATE_KEY='worker-signing-key-canary', GITHUB_TOKEN='checkout-token-canary',
+                      GITHUB_APP_ID='123', GITHUB_APP_INSTALLATION_ID='456',
+                      GITHUB_APP_PRIVATE_KEY_PATH=str(base/'worker-private'/'signing-key'),
+                      GITHUB_APP_JWT='app-jwt-canary', RELEASEDECK_CHECKOUT_TOKEN='installation-token-canary',
+                      RELEASEDECK_CHECKOUT_PATH='owner/repository.git', GIT_ASKPASS='helper-path-canary')
     execute = launcher.execute
     def fixture_execute(*args):
         result, timed_out = execute(*args)
@@ -102,20 +106,23 @@ def main():
             private = base/'worker-private'
             private.mkdir(mode=0o700,exist_ok=True)
             (private/'signing-key').write_text('nonsecret filesystem canary')
+            os.chown(private,worker.pw_uid,worker.pw_gid)
+            os.chown(private/'signing-key',worker.pw_uid,worker.pw_gid)
+            (private/'signing-key').chmod(0o600)
             (source/'credential-link').symlink_to(private/'signing-key')
             program = """import os,pathlib,subprocess,sys,time
 assert not pathlib.Path('/workspace/.git').exists()
 assert not pathlib.Path('/workspace/credential-link').exists()
 assert not pathlib.Path('/etc/releasedeck').exists()
-assert not pathlib.Path(CHECKOUT).exists()
+assert not pathlib.Path(FIXTURE_CHECKOUT_ROOT).exists()
 assert not pathlib.Path('/proc/'+WORKER_PID+'/environ').exists()
-assert not any(k in os.environ for k in ['MONGODB_URI','REDIS_URL','GITHUB_APP_PRIVATE_KEY','GITHUB_TOKEN','SSH_AUTH_SOCK'])
+assert not any(k in os.environ for k in ['MONGODB_URI','REDIS_URL','GITHUB_APP_PRIVATE_KEY','GITHUB_TOKEN','SSH_AUTH_SOCK','GITHUB_APP_ID','GITHUB_APP_INSTALLATION_ID','GITHUB_APP_PRIVATE_KEY_PATH','GITHUB_APP_JWT','RELEASEDECK_CHECKOUT_TOKEN','RELEASEDECK_CHECKOUT_PATH','GIT_ASKPASS'])
 p=subprocess.Popen(['/bin/sleep','9999'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
 pathlib.Path('/workspace/background-pid').write_text(str(p.pid))
 if MODE in ['timeout','cancel']:time.sleep(300)
 if pathlib.Path(sys.argv[0]).name==FAIL_FILE:sys.exit(7)
 print('repository command completed')
-""".replace('CHECKOUT', repr(str(base/'checkout'))).replace('WORKER_PID', repr(str(os.getpid()))).replace('MODE', repr(mode)).replace('FAIL_FILE', repr({'INSTALL':'ci','TEST':'test','BUILD':'run'}.get(mode,'')))
+""".replace('FIXTURE_CHECKOUT_ROOT', repr(str(base/'checkout'))).replace('WORKER_PID', repr(str(os.getpid()))).replace('MODE', repr(mode)).replace('FAIL_FILE', repr({'INSTALL':'ci','TEST':'test','BUILD':'run'}.get(mode,'')))
             for name in ['ci','test','run']:
                 (source/name).write_text(program)
             launcher.own_tree(source, worker.pw_uid, worker.pw_gid)

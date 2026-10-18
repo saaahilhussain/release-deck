@@ -7,9 +7,12 @@ import {
 } from '@releasedeck/db';
 import {
   createCiRunner,
+  createGitHubAppAuth,
   createSystemdBuildExecutor,
   type BuildExecutor,
   type CiRunner,
+  type GitHubAppAuth,
+  type GitHubAppConfiguration,
 } from '@releasedeck/ci-runner';
 import {
   createDeploymentWorker as createQueueWorker,
@@ -54,6 +57,7 @@ export interface WorkerStartupDependencies {
   ): DeploymentWorker;
   createCiRunner?: typeof createCiRunner;
   createBuildExecutor?: (launcherPath: string) => BuildExecutor;
+  createGitHubAppAuth?: (config: GitHubAppConfiguration) => Promise<GitHubAppAuth>;
   releaseOperations?: DeploymentReleaseOperations;
   logger: Logger;
 }
@@ -92,6 +96,28 @@ export async function startWorker(
       );
       await buildExecutor.probe();
     }
+    let githubAppAuth: GitHubAppAuth | undefined;
+    const appFields = [
+      environment.GITHUB_APP_ID,
+      environment.GITHUB_APP_INSTALLATION_ID,
+      environment.GITHUB_APP_PRIVATE_KEY_PATH,
+    ];
+    if (appFields.some((value) => value !== undefined)) {
+      if (!buildExecutor)
+        throw new Error('GitHub App checkout requires isolated build execution');
+      if (
+        !environment.GITHUB_APP_ID ||
+        !environment.GITHUB_APP_INSTALLATION_ID ||
+        !environment.GITHUB_APP_PRIVATE_KEY_PATH
+      ) {
+        throw new Error('GitHub App configuration is incomplete');
+      }
+      githubAppAuth = await (dependencies.createGitHubAppAuth ?? createGitHubAppAuth)({
+        appId: environment.GITHUB_APP_ID,
+        installationId: environment.GITHUB_APP_INSTALLATION_ID,
+        privateKeyPath: environment.GITHUB_APP_PRIVATE_KEY_PATH,
+      });
+    }
     mongo = await dependencies
       .connectMongo(environment.MONGODB_URI)
       .catch((error: unknown) => {
@@ -119,6 +145,7 @@ export async function startWorker(
     const runner: CiRunner = (dependencies.createCiRunner ?? createCiRunner)({
       workspaceRoot: environment.CI_WORKSPACE_ROOT,
       ...(buildExecutor ? { buildExecutor } : {}),
+      ...(githubAppAuth ? { githubAppAuth } : {}),
       limits: {
         checkoutTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
         installTimeoutMs: environment.CI_STEP_TIMEOUT_MS,

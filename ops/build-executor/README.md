@@ -101,5 +101,7 @@ before those checks; ordinary runner errors execute this cleanup automatically.
 Disk/memory/CPU quotas, external package availability, general network policy,
 parallel identities, and full malicious-artifact validation remain separate work.
 
-GitHub App authentication is intentionally the following milestone. This change
-adds no GitHub App settings, token requests, signing keys, PATs, or live GitHub calls.
+GitHub App checkout uses this boundary. Its signing PEM must be worker/root-owned,
+mode 600, outside checkout/source and runtime mounts. Only the trusted worker loads
+it. Checkout-only helpers are siblings of allocated checkouts, removed before source
+handoff. See the CI runner's GitHub App configuration contract for future provisioning.

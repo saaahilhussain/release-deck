@@ -35,6 +35,38 @@ test('parses API defaults', () => {
   assert.equal(environment.PORT, 3_000);
 });
 
+test('GitHub App configuration is optional, complete-only, safely validated and requires isolated execution', () => {
+  assert.equal(parseWorkerEnvironment(validWorkerEnvironment).GITHUB_APP_ID, undefined);
+  const complete = {
+    ...validWorkerEnvironment,
+    CI_EXECUTION_MODE: 'systemd',
+    CI_CONCURRENCY: '1',
+    GITHUB_APP_ID: '123',
+    GITHUB_APP_INSTALLATION_ID: '456',
+    GITHUB_APP_PRIVATE_KEY_PATH: resolve('keys', 'github-app.pem'),
+  };
+  assert.equal(parseWorkerEnvironment(complete).GITHUB_APP_ID, '123');
+  for (const config of [
+    { ...validWorkerEnvironment, GITHUB_APP_ID: '123' },
+    { ...complete, GITHUB_APP_INSTALLATION_ID: undefined },
+    { ...complete, GITHUB_APP_PRIVATE_KEY_PATH: undefined },
+    { ...complete, GITHUB_APP_ID: 'secret-id-canary' },
+    { ...complete, GITHUB_APP_INSTALLATION_ID: '../secret-canary' },
+    { ...complete, GITHUB_APP_PRIVATE_KEY_PATH: 'secret-path-canary' },
+    { ...complete, CI_EXECUTION_MODE: 'local' },
+  ]) {
+    assert.throws(
+      () => parseWorkerEnvironment(config),
+      (error: Error) => {
+        assert.ok(error instanceof ConfigurationError);
+        assert.equal(error.message.includes('canary'), false);
+        assert.equal(JSON.stringify(error).includes('canary'), false);
+        return true;
+      },
+    );
+  }
+});
+
 test('production worker requires systemd and reusable build identity requires concurrency one', () => {
   assert.throws(
     () => parseWorkerEnvironment({ ...validWorkerEnvironment, NODE_ENV: 'production' }),

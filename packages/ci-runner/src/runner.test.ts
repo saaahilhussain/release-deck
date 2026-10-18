@@ -20,6 +20,7 @@ import {
   CiCleanupError,
   CiStepError,
   ProcessCancelledError,
+  ProcessTerminationError,
   ProcessTimeoutError,
   createCiRunner,
   createWorkspaceManager,
@@ -356,6 +357,90 @@ test('cleanup failure preserves the prior CI error through an explicit contract'
         error.executionError.message === 'stage unavailable',
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('unconfirmed process termination retains the workspace instead of racing filesystem cleanup', async () => {
+  const root = await temporaryDirectory('termination-failure');
+  let cleaned = false;
+  const failure = new ProcessTerminationError();
+  try {
+    await assert.rejects(
+      createCiRunner({
+        workspaceRoot: root,
+        workspaceManager: {
+          async create() {
+            return {
+              path: root,
+              async cleanup() {
+                cleaned = true;
+              },
+            };
+          },
+        },
+        processRunner: {
+          async run() {
+            throw failure;
+          },
+        },
+      }).run({
+        deploymentId,
+        repositoryUrl: 'file:///fixture.git',
+        commitSha: 'a'.repeat(40),
+      }),
+      (error: unknown) =>
+        error instanceof CiCleanupError &&
+        error.cleanupError === failure &&
+        error.executionError === failure,
+    );
+    assert.equal(cleaned, false);
+    await fileAccess(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('npm cancellation during startup stops late shell descendants before workspace removal', async () => {
+  const root = await temporaryDirectory('npm-cancel');
+  const marker = join(root, 'fixture.pid');
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  let fixturePid: number | undefined;
+  try {
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'cancellation-fixture',
+        version: '1.0.0',
+        scripts: { test: 'node test.cjs' },
+      }),
+    );
+    await writeFile(
+      join(root, 'test.cjs'),
+      'require("node:fs").writeFileSync("fixture.pid", String(process.pid)); setInterval(() => {}, 60000);',
+    );
+    timer = setTimeout(() => controller.abort(), 100);
+    await assert.rejects(
+      defaultProcessRunner.run('npm', ['test'], {
+        cwd: root,
+        signal: controller.signal,
+        timeoutMs: 10_000,
+      }),
+      ProcessCancelledError,
+    );
+    try {
+      fixturePid = Number(await readFile(marker, 'utf8'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (fixturePid !== undefined) assert.equal(processIsRunning(fixturePid), false);
+    // Windows refuses this removal when npm's orphan still holds the cwd.
+    await rm(root, { recursive: true, force: true });
+    await assert.rejects(fileAccess(root));
+  } finally {
+    clearTimeout(timer);
+    if (fixturePid !== undefined) await stopProcess(fixturePid);
     await rm(root, { recursive: true, force: true });
   }
 });

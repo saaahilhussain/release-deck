@@ -211,8 +211,39 @@ const workerEnvironmentSchema = commonEnvironmentSchema
     CI_BUILD_LAUNCHER_PATH: localAbsolutePath.default(
       '/usr/local/libexec/releasedeck-build-launcher',
     ),
+    GITHUB_APP_ID: z
+      .string()
+      .regex(/^[1-9][0-9]{0,19}$/)
+      .optional(),
+    GITHUB_APP_INSTALLATION_ID: z
+      .string()
+      .regex(/^[1-9][0-9]{0,19}$/)
+      .optional(),
+    GITHUB_APP_PRIVATE_KEY_PATH: localAbsolutePath.optional(),
   })
   .superRefine((value, context) => {
+    const appFields = [
+      'GITHUB_APP_ID',
+      'GITHUB_APP_INSTALLATION_ID',
+      'GITHUB_APP_PRIVATE_KEY_PATH',
+    ] as const;
+    if (appFields.some((field) => value[field] !== undefined)) {
+      for (const field of appFields) {
+        if (!value[field])
+          context.addIssue({
+            code: 'custom',
+            path: [field],
+            message: 'required for GitHub App checkout',
+          });
+      }
+      if (value.CI_EXECUTION_MODE !== 'systemd') {
+        context.addIssue({
+          code: 'custom',
+          path: ['CI_EXECUTION_MODE'],
+          message: 'GitHub App checkout requires systemd execution',
+        });
+      }
+    }
     if (value.NODE_ENV === 'production' && value.CI_EXECUTION_MODE !== 'systemd') {
       context.addIssue({
         code: 'custom',

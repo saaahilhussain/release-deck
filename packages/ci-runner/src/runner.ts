@@ -1,11 +1,17 @@
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { BuildExecutor, BuildSession } from './build-executor.js';
+import type { GitHubAppAuth } from './github-app-auth.js';
+import {
+  authenticatedGitHubFetch,
+  requiresGitHubAuthentication,
+} from './github-checkout.js';
 
 import {
   DEFAULT_OUTPUT_LIMIT_BYTES,
   ProcessCancelledError,
   ProcessTimeoutError,
+  ProcessTerminationError,
   boundedUtf8,
   defaultProcessRunner,
   type ProcessResult,
@@ -73,6 +79,7 @@ export interface CiRunnerOptions {
   readonly processRunner?: ProcessRunner;
   readonly workspaceManager?: WorkspaceManager;
   readonly buildExecutor?: BuildExecutor;
+  readonly githubAppAuth?: GitHubAppAuth;
 }
 
 export class CiStepError extends Error {
@@ -215,6 +222,9 @@ function combineStageResults(
 }
 
 export function createCiRunner(options: CiRunnerOptions): CiRunner {
+  if (options.githubAppAuth && !options.buildExecutor) {
+    throw new Error('GitHub App checkout requires isolated build execution');
+  }
   const processRunner = options.processRunner ?? defaultProcessRunner;
   const limits = options.limits ?? {};
   const workspaces =
@@ -256,6 +266,7 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
       let executionError: unknown;
       let executionFailed = false;
       let executionResult: CiRunResult | undefined;
+      let processTerminationFailed = false;
       let buildSession: BuildSession | undefined;
       let buildWorkspacePath = workspace.path;
 
@@ -279,10 +290,38 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
             : { outputLimitBytes: limits.outputLimitBytes }),
         } as ProcessOptions;
         try {
+          if (stage === 'CHECKOUT' && args[0] === 'fetch') {
+            const result = await processRunner.run(command, args, processOptions);
+            if (!requiresGitHubAuthentication(input.repositoryUrl, result))
+              return result;
+            if (!options.githubAppAuth) {
+              throw new CiStepError(
+                'CHECKOUT',
+                'GitHub App configuration is required for authenticated checkout',
+              );
+            }
+            const authenticated = await authenticatedGitHubFetch(
+              options.githubAppAuth,
+              input.repositoryUrl,
+              args,
+              processRunner,
+              {
+                ...processOptions,
+                ...(deadline === undefined
+                  ? {}
+                  : { timeoutMs: Math.max(1, deadline - Date.now()) }),
+              },
+            );
+            return {
+              ...authenticated,
+              durationMs: result.durationMs + authenticated.durationMs,
+            };
+          }
           return stage !== 'CHECKOUT' && buildSession
             ? await buildSession.run(stage, command as PackageManager, processOptions)
             : await processRunner.run(command, args, processOptions);
         } catch (error) {
+          if (error instanceof ProcessTerminationError) processTerminationFailed = true;
           const reported =
             totalTimedOut && error instanceof ProcessCancelledError
               ? new ProcessTimeoutError(error.result)
@@ -417,6 +456,10 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         await buildSession?.close();
       } catch (error) {
         boundaryCleanupError = error;
+      }
+      if (processTerminationFailed) {
+        // Preserve the workspace when process death cannot be proven.
+        throw new CiCleanupError(executionError, executionError);
       }
       try {
         await workspace.cleanup();
