@@ -44,6 +44,9 @@ function safeEnvironment(cwd: string | undefined): NodeJS.ProcessEnv {
   for (const key of ['SystemRoot', 'WINDIR', 'PATHEXT', 'ComSpec', 'SYSTEMDRIVE']) {
     if (process.env[key]) environment[key] = process.env[key];
   }
+  if (process.platform === 'win32' && process.env.ProgramData !== undefined) {
+    environment.ProgramData = process.env.ProgramData;
+  }
   if (cwd) {
     environment.HOME = cwd;
     environment.TEMP = cwd;
