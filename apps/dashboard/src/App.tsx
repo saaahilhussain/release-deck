@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
+import { createDetailReader } from './detail-requests';
+
 type View = 'overview' | 'projects' | 'deployments' | 'releases';
 type State = 'loading' | 'ready' | 'error';
 type Stream = 'connecting' | 'live' | 'reconnecting' | 'unavailable';
@@ -457,6 +459,9 @@ function DeploymentTable({
 }
 
 export default function App() {
+  const [readDetail] = useState(() =>
+    createDetailReader((path, signal) => get<{ deployment: Detail }>(path, signal)),
+  );
   const [view, setView] = useState<View>('overview');
   const [search, setSearch] = useState('');
   const [projectCursors, setProjectCursors] = useState<(string | null)[]>([null]);
@@ -537,6 +542,9 @@ export default function App() {
     if (projectState !== 'ready') return;
     if (!projects.items.some((item) => item.id === projectId)) {
       setProjectId(projects.items[0]?.id ?? null);
+      setDeploymentId(null);
+      setDeploymentCursors([null]);
+      setDeploymentPage(0);
     }
   }, [projectId, projectState, projects]);
   useEffect(() => {
@@ -618,10 +626,7 @@ export default function App() {
     const ids = deploymentIds.split(',');
     void Promise.allSettled(
       ids.map((id) =>
-        get<{ deployment: Detail }>(
-          '/api/deployments/' + encodeURIComponent(id),
-          controller.signal,
-        ),
+        readDetail('/api/deployments/' + encodeURIComponent(id), controller.signal),
       ),
     ).then((results) => {
       clearTimeout(timeout);
@@ -669,12 +674,15 @@ export default function App() {
       clearTimeout(timeout);
       controller.abort();
     };
-  }, [deploymentIds, deploymentState, deploymentRetry, detailRefresh]);
+  }, [deploymentIds, deploymentState, deploymentRetry, detailRefresh, readDetail]);
   useEffect(() => {
     if (!deploymentId) return;
     const id = deploymentId;
     let closed = false;
     let source: EventSource | undefined;
+    let active: AbortController | undefined;
+    let requestTimeout: ReturnType<typeof setTimeout> | undefined;
+    const requestTimeoutMs = 10000;
     setStream('connecting');
     const update = (deployment: Detail) => {
       setDetails((current) =>
@@ -706,12 +714,20 @@ export default function App() {
       });
     };
     const poll = () => {
-      void get<{ deployment: Detail }>('/api/deployments/' + encodeURIComponent(id))
+      if (closed || active) return;
+      const controller = new AbortController();
+      active = controller;
+      requestTimeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+      void readDetail('/api/deployments/' + encodeURIComponent(id), controller.signal)
         .then(({ deployment }) => {
-          if (!closed) update(deployment);
+          if (!closed && !controller.signal.aborted) update(deployment);
         })
         .catch(() => {
           if (!closed) setStream('unavailable');
+        })
+        .finally(() => {
+          clearTimeout(requestTimeout);
+          active = undefined;
         });
     };
     if (typeof EventSource !== 'undefined') {
@@ -743,8 +759,10 @@ export default function App() {
       closed = true;
       source?.close();
       clearInterval(timer);
+      clearTimeout(requestTimeout);
+      active?.abort();
     };
-  }, [deploymentId]);
+  }, [deploymentId, readDetail]);
 
   const project = projects.items.find((item) => item.id === projectId);
   const name = project
@@ -1434,11 +1452,19 @@ function DeploymentDetail({
                     }
                   />
                   <Field
-                    label="Restored release"
+                    label={
+                      detail.release.rollback.outcome === 'RESTORED'
+                        ? 'Restored release'
+                        : 'Attempted release (not restored)'
+                    }
                     value={detail.release.rollback.targetReleaseId}
                   />
                   <Field
-                    label="Restored commit"
+                    label={
+                      detail.release.rollback.outcome === 'RESTORED'
+                        ? 'Restored commit'
+                        : 'Attempted commit (not restored)'
+                    }
                     value={<code>{sha(detail.release.rollback.targetCommitSha)}</code>}
                   />
                   <Field
