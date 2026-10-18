@@ -372,6 +372,28 @@ export async function prepareRelease(
   const embeddedMetadata = join(temporaryDirectory, '.releasedeck-release');
   const archivePath = join(temporaryDirectory, 'release.tar.gz');
   const metadataPath = join(temporaryDirectory, 'metadata.json');
+  const deadline = Date.now() + (input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const archiveCommand = async (command: string, args: readonly string[]) => {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new ReleaseDeployerError(
+        'preparation',
+        'release archive creation timed out',
+      );
+    }
+    const result = await executor.run(command, args, {
+      cwd: temporaryDirectory,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      timeoutMs: remainingMs,
+      outputLimitBytes: input.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
+    });
+    if (result.exitCode !== 0) {
+      throw new ReleaseDeployerError('preparation', 'release archive creation failed', {
+        ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+        ...(result.signal === null ? {} : { signal: result.signal }),
+      });
+    }
+  };
   try {
     await mkdir(embeddedMetadata);
     await Promise.all([
@@ -379,39 +401,28 @@ export async function prepareRelease(
       writeFile(join(embeddedMetadata, 'deployment-id'), metadata.deploymentId, 'utf8'),
       writeFile(join(embeddedMetadata, 'commit-sha'), metadata.commitSha, 'utf8'),
     ]);
-    const result = await executor.run(
-      'tar',
-      [
-        '-czf',
-        archivePath,
-        '--exclude=.git',
-        '--exclude=.env',
-        '--exclude=.releasedeck-release',
-        '--exclude=.ci',
-        '--exclude=.cache',
-        '--exclude=.tmp',
-        '--exclude=.npm-cache',
-        '--exclude=.corepack-cache',
-        '--exclude=node_modules/.cache',
-        '-C',
-        workspacePath,
-        '.',
-        '-C',
-        temporaryDirectory,
-        '.releasedeck-release',
-      ],
-      {
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
-        timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        outputLimitBytes: input.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES,
-      },
-    );
-    if (result.exitCode !== 0) {
-      throw new ReleaseDeployerError('preparation', 'release archive creation failed', {
-        ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
-        ...(result.signal === null ? {} : { signal: result.signal }),
-      });
-    }
+    // Relative archive names avoid GNU tar interpreting a Windows drive as a host.
+    await archiveCommand('tar', [
+      '-cf',
+      'release.tar',
+      '--exclude=.git',
+      '--exclude=.env',
+      '--exclude=.releasedeck-release',
+      '--exclude=.ci',
+      '--exclude=.cache',
+      '--exclude=.tmp',
+      '--exclude=.npm-cache',
+      '--exclude=.corepack-cache',
+      '--exclude=node_modules/.cache',
+      '-C',
+      process.platform === 'win32'
+        ? workspacePath.replaceAll('\\', '/')
+        : workspacePath,
+      '.',
+    ]);
+    // Append only generated metadata, without the repository exclusion filters.
+    await archiveCommand('tar', ['-rf', 'release.tar', '.releasedeck-release']);
+    await archiveCommand('gzip', ['-n', 'release.tar']);
     const archiveSha256 = await hashFile(archivePath);
     await writeFile(
       metadataPath,

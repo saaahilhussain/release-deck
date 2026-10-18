@@ -266,6 +266,8 @@ try {
   assert.equal(completed.release?.status, 'DEPLOYED');
   assert.equal(completed.release?.success?.releaseId, deployment.id);
   assert.equal(completed.release?.success?.commitSha, commitSha);
+  // Success is persisted before artifact cleanup; wait for the isolated job to settle.
+  await worker.close();
   assert.deepEqual(calls, ['stage', 'activate', 'cleanup']);
   assert.deepEqual(await readdir(workspaceRoot), []);
   assert.deepEqual(await readdir(artifactRoot), []);

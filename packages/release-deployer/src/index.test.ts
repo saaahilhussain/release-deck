@@ -118,10 +118,11 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
   const artifactRoot = join(root, 'artifacts');
   const calls: { command: string; args: readonly string[] }[] = [];
   const executor: CommandExecutor = {
-    async run(command, args) {
+    async run(command, args, options) {
       calls.push({ command, args });
-      assert.equal(command, 'tar');
-      await writeFile(args[1]!, 'archive bytes');
+      if (command === 'gzip') {
+        await writeFile(join(options.cwd!, 'release.tar.gz'), 'archive bytes');
+      } else assert.equal(command, 'tar');
       return commandResult(command, args);
     },
   };
@@ -135,7 +136,7 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
       { ...metadata, workspacePath, artifactRoot },
       executor,
     );
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 3);
     assert.ok(calls[0]!.args.includes('--exclude=.git'));
     assert.ok(calls[0]!.args.includes('--exclude=.env'));
     assert.ok(calls[0]!.args.includes('--exclude=.npm-cache'));
@@ -144,7 +145,7 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
       await prepareRelease({ ...metadata, workspacePath, artifactRoot }, executor),
       prepared,
     );
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 3);
 
     await writeFile(prepared.archivePath, 'tampered');
     await assert.rejects(
