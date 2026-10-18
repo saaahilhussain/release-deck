@@ -1,4 +1,9 @@
 export {
+  createSystemdBuildExecutor,
+  type BuildExecutor,
+  type BuildSession,
+} from './build-executor.js';
+export {
   CI_STAGES,
   CiCleanupError,
   CiStepError,

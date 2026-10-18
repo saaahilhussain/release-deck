@@ -1,5 +1,6 @@
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { BuildExecutor, BuildSession } from './build-executor.js';
 
 import {
   DEFAULT_OUTPUT_LIMIT_BYTES,
@@ -71,6 +72,7 @@ export interface CiRunnerOptions {
   readonly limits?: CiLimits;
   readonly processRunner?: ProcessRunner;
   readonly workspaceManager?: WorkspaceManager;
+  readonly buildExecutor?: BuildExecutor;
 }
 
 export class CiStepError extends Error {
@@ -254,6 +256,8 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
       let executionError: unknown;
       let executionFailed = false;
       let executionResult: CiRunResult | undefined;
+      let buildSession: BuildSession | undefined;
+      let buildWorkspacePath = workspace.path;
 
       const runProcess = async (
         stage: CiStage,
@@ -264,7 +268,7 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         const remainingTimeout =
           deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
         const processOptions = {
-          cwd: workspace.path,
+          cwd: stage === 'CHECKOUT' ? workspace.path : buildWorkspacePath,
           signal: controller.signal,
           ...(remainingTimeout === undefined ? {} : { timeoutMs: remainingTimeout }),
           ...(limits.killGraceMs === undefined
@@ -275,7 +279,9 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
             : { outputLimitBytes: limits.outputLimitBytes }),
         } as ProcessOptions;
         try {
-          return await processRunner.run(command, args, processOptions);
+          return stage !== 'CHECKOUT' && buildSession
+            ? await buildSession.run(stage, command as PackageManager, processOptions)
+            : await processRunner.run(command, args, processOptions);
         } catch (error) {
           const reported =
             totalTimedOut && error instanceof ProcessCancelledError
@@ -352,6 +358,10 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
           throw stageError;
         }
         for (const stage of ['INSTALL', 'TEST', 'BUILD'] as const) {
+          if (stage === 'INSTALL' && options.buildExecutor) {
+            buildSession = await options.buildExecutor.open(workspace.path);
+            buildWorkspacePath = buildSession.workspacePath;
+          }
           const [command, args] = stepCommand(stage, packageManager);
           if (stage !== 'INSTALL') await startStage(stage);
           const result = await runProcess(stage, command, args);
@@ -368,10 +378,11 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
           }
           if (stage === 'BUILD' && hooks.onBuildReady) {
             try {
+              await buildSession?.collect();
               await hooks.onBuildReady({
                 deploymentId: input.deploymentId,
                 commitSha: input.commitSha,
-                workspacePath: workspace.path,
+                workspacePath: buildWorkspacePath,
                 packageManager,
                 buildResult: stageResult,
               });
@@ -391,7 +402,7 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         executionResult = {
           deploymentId: input.deploymentId,
           commitSha: input.commitSha,
-          workspacePath: workspace.path,
+          workspacePath: buildWorkspacePath,
           stages,
         };
       } catch (error) {
@@ -401,11 +412,19 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         if (totalTimer) clearTimeout(totalTimer);
         input.signal?.removeEventListener('abort', abort);
       }
+      let boundaryCleanupError: unknown;
+      try {
+        await buildSession?.close();
+      } catch (error) {
+        boundaryCleanupError = error;
+      }
       try {
         await workspace.cleanup();
       } catch (cleanupError) {
         throw new CiCleanupError(cleanupError, executionError);
       }
+      if (boundaryCleanupError)
+        throw new CiCleanupError(boundaryCleanupError, executionError);
       if (executionFailed) throw executionError;
       return executionResult as CiRunResult;
     },

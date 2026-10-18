@@ -5,7 +5,12 @@ import {
   type DomainRepositories,
   type MongoConnection,
 } from '@releasedeck/db';
-import { createCiRunner, type CiRunner } from '@releasedeck/ci-runner';
+import {
+  createCiRunner,
+  createSystemdBuildExecutor,
+  type BuildExecutor,
+  type CiRunner,
+} from '@releasedeck/ci-runner';
 import {
   createDeploymentWorker as createQueueWorker,
   type DeploymentJobProcessor,
@@ -48,6 +53,7 @@ export interface WorkerStartupDependencies {
     options: { readonly concurrency: number },
   ): DeploymentWorker;
   createCiRunner?: typeof createCiRunner;
+  createBuildExecutor?: (launcherPath: string) => BuildExecutor;
   releaseOperations?: DeploymentReleaseOperations;
   logger: Logger;
 }
@@ -69,6 +75,23 @@ export async function startWorker(
   let repositories: DomainRepositories | undefined;
   let deploymentWorker: DeploymentWorker | undefined;
   try {
+    // Probe before connecting/consuming. A missing or unsafe boundary never falls
+    // back to same-user execution, even when startWorker is called directly.
+    if (
+      environment.NODE_ENV === 'production' &&
+      environment.CI_EXECUTION_MODE !== 'systemd'
+    ) {
+      throw new Error('production worker requires isolated build execution');
+    }
+    let buildExecutor: BuildExecutor | undefined;
+    if (environment.CI_EXECUTION_MODE === 'systemd') {
+      if (environment.CI_CONCURRENCY !== 1)
+        throw new Error('isolated builds require concurrency one');
+      buildExecutor = (dependencies.createBuildExecutor ?? createSystemdBuildExecutor)(
+        environment.CI_BUILD_LAUNCHER_PATH,
+      );
+      await buildExecutor.probe();
+    }
     mongo = await dependencies
       .connectMongo(environment.MONGODB_URI)
       .catch((error: unknown) => {
@@ -95,6 +118,7 @@ export async function startWorker(
     const connectedRepositories = repositories;
     const runner: CiRunner = (dependencies.createCiRunner ?? createCiRunner)({
       workspaceRoot: environment.CI_WORKSPACE_ROOT,
+      ...(buildExecutor ? { buildExecutor } : {}),
       limits: {
         checkoutTimeoutMs: environment.CI_STEP_TIMEOUT_MS,
         installTimeoutMs: environment.CI_STEP_TIMEOUT_MS,

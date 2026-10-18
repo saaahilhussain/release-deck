@@ -35,6 +35,30 @@ test('parses API defaults', () => {
   assert.equal(environment.PORT, 3_000);
 });
 
+test('production worker requires systemd and reusable build identity requires concurrency one', () => {
+  assert.throws(
+    () => parseWorkerEnvironment({ ...validWorkerEnvironment, NODE_ENV: 'production' }),
+    /CI_EXECUTION_MODE/,
+  );
+  assert.throws(
+    () =>
+      parseWorkerEnvironment({
+        ...validWorkerEnvironment,
+        CI_EXECUTION_MODE: 'systemd',
+        CI_CONCURRENCY: '2',
+      }),
+    /CI_CONCURRENCY/,
+  );
+  const parsed = parseWorkerEnvironment({
+    ...validWorkerEnvironment,
+    NODE_ENV: 'production',
+    CI_EXECUTION_MODE: 'systemd',
+    CI_CONCURRENCY: '1',
+  });
+  assert.equal(parsed.CI_EXECUTION_MODE, 'systemd');
+  assert.equal(parsed.CI_CONCURRENCY, 1);
+});
+
 test('parses worker defaults with an absolute OS-temp workspace root', () => {
   const environment = parseWorkerEnvironment(validWorkerEnvironment);
   assert.ok(environment.CI_WORKSPACE_ROOT.length > 0);

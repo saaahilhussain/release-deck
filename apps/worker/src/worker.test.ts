@@ -38,6 +38,8 @@ const environment: WorkerEnvironment = {
   CI_MAX_OUTPUT_BYTES: 16_384,
   CI_LEASE_MS: 30_000,
   CI_CONCURRENCY: 2,
+  CI_EXECUTION_MODE: 'local',
+  CI_BUILD_LAUNCHER_PATH: '/usr/local/libexec/releasedeck-build-launcher',
 };
 
 function repositories(): DomainRepositories {
@@ -47,6 +49,95 @@ function repositories(): DomainRepositories {
     webhookEvents: {} as DomainRepositories['webhookEvents'],
   };
 }
+
+test('isolated worker probes before connections and fails closed on missing launcher or concurrency', async () => {
+  let connections = 0;
+  const dependencies = {
+    connectMongo: async () => {
+      connections += 1;
+      throw new Error('must not connect');
+    },
+    connectRedis: async () => {
+      throw new Error('must not connect');
+    },
+    createBuildExecutor: () => ({
+      probe: async () => {
+        throw new Error('boundary unavailable');
+      },
+      open: async () => {
+        throw new Error('must not open');
+      },
+    }),
+    logger: createLogger('silent'),
+  };
+  await assert.rejects(
+    startWorker(
+      { ...environment, CI_EXECUTION_MODE: 'systemd', CI_CONCURRENCY: 1 },
+      dependencies,
+    ),
+    /boundary unavailable/,
+  );
+  await assert.rejects(
+    startWorker({ ...environment, CI_EXECUTION_MODE: 'systemd' }, dependencies),
+    /concurrency one/,
+  );
+  await assert.rejects(
+    startWorker({ ...environment, NODE_ENV: 'production' }, dependencies),
+    /requires isolated/,
+  );
+  assert.equal(connections, 0);
+});
+
+test('systemd worker probes and wires the restricted executor before starting a consumer', async () => {
+  const events: string[] = [];
+  const executor = {
+    probe: async () => {
+      events.push('probe');
+    },
+    open: async () => {
+      throw new Error('not executed by startup');
+    },
+  };
+  const mongo = { db: {}, close: async () => undefined } as unknown as MongoConnection;
+  const redis = {
+    client: {},
+    close: async () => undefined,
+  } as unknown as RedisConnection;
+  const worker = await startWorker(
+    {
+      ...environment,
+      NODE_ENV: 'production',
+      CI_EXECUTION_MODE: 'systemd',
+      CI_CONCURRENCY: 1,
+    },
+    {
+      createBuildExecutor: () => executor,
+      connectMongo: async () => {
+        events.push('mongo');
+        return mongo;
+      },
+      initializeDomainRepositories: async () => repositories(),
+      connectRedis: async () => redis,
+      createCiRunner: (options) => {
+        events.push('runner');
+        assert.equal(options.buildExecutor, executor);
+        return {
+          run: async () => {
+            throw new Error('not executed');
+          },
+        };
+      },
+      createDeploymentWorker: (_connection, _processor, options) => {
+        events.push('consumer');
+        assert.equal(options.concurrency, 1);
+        return workerStub(async () => undefined);
+      },
+      logger: createLogger('silent'),
+    },
+  );
+  assert.deepEqual(events, ['probe', 'mongo', 'runner', 'consumer']);
+  await worker.close();
+});
 
 function workerStub(close: () => Promise<void>) {
   return {

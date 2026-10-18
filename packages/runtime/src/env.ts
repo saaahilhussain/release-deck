@@ -207,8 +207,26 @@ const workerEnvironmentSchema = commonEnvironmentSchema
       .default(1_048_576),
     CI_LEASE_MS: z.coerce.number().int().min(10_000).max(300_000).default(60_000),
     CI_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
+    CI_EXECUTION_MODE: z.enum(['local', 'systemd']).default('local'),
+    CI_BUILD_LAUNCHER_PATH: localAbsolutePath.default(
+      '/usr/local/libexec/releasedeck-build-launcher',
+    ),
   })
   .superRefine((value, context) => {
+    if (value.NODE_ENV === 'production' && value.CI_EXECUTION_MODE !== 'systemd') {
+      context.addIssue({
+        code: 'custom',
+        path: ['CI_EXECUTION_MODE'],
+        message: 'production requires systemd execution',
+      });
+    }
+    if (value.CI_EXECUTION_MODE === 'systemd' && value.CI_CONCURRENCY !== 1) {
+      context.addIssue({
+        code: 'custom',
+        path: ['CI_CONCURRENCY'],
+        message: 'systemd execution requires concurrency one',
+      });
+    }
     if (value.CI_TOTAL_TIMEOUT_MS < value.CI_STEP_TIMEOUT_MS) {
       context.addIssue({
         code: 'custom',

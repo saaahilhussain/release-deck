@@ -75,7 +75,7 @@ function launch(
   return { command: process.execPath, args: [script, ...args] };
 }
 
-function safeEnvironment(cwd: string): NodeJS.ProcessEnv {
+export function createCiEnvironment(cwd: string): NodeJS.ProcessEnv {
   const path = process.env.PATH;
   if (!path) throw new Error('PATH is not configured');
   const temp = join(cwd, '.tmp');
@@ -275,7 +275,7 @@ export const defaultProcessRunner: ProcessRunner = {
       const launched = launch(command, args);
       const child = spawn(launched.command, [...launched.args], {
         cwd: options.cwd,
-        env: safeEnvironment(options.cwd),
+        env: createCiEnvironment(options.cwd),
         shell: false,
         detached: process.platform !== 'win32',
         windowsHide: true,

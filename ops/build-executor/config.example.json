@@ -1,0 +1,13 @@
+{
+  "workerUser": "releasedeck-worker",
+  "buildUser": "releasedeck-build",
+  "checkoutRoot": "/var/lib/releasedeck/checkouts",
+  "buildRoot": "/var/lib/releasedeck-build/jobs",
+  "stateRoot": "/run/releasedeck-build",
+  "runtimePaths": ["/opt/node-v24.22.0-linux-x64"],
+  "toolPath": "/usr/local/bin:/usr/bin:/bin",
+  "commands": {
+    "npm": "/usr/local/bin/npm",
+    "pnpm": "/usr/local/bin/pnpm"
+  }
+}
