@@ -310,13 +310,23 @@ export async function processDeploymentJob(
   let runnerInvoked = false;
   const stageStarted = new Map<CiStage, Date>();
 
-  const serialize = async <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = mutation.then(operation);
-    mutation = result.then(
-      () => undefined,
-      () => undefined,
-    );
+  const serialize = (
+    operation: (deployment: Deployment) => Promise<Deployment>,
+  ): Promise<Deployment> => {
+    const result = mutation.then(async () => {
+      const deployment = await operation(owned.deployment);
+      owned.deployment = deployment;
+      return deployment;
+    });
+    mutation = result.then(() => undefined);
+    void mutation.catch(() => undefined);
     return result;
+  };
+
+  const stopHeartbeats = async (): Promise<void> => {
+    stopped = true;
+    clearInterval(heartbeatTimer);
+    await mutation;
   };
 
   const persist = async (
@@ -330,11 +340,11 @@ export async function processDeploymentJob(
       stageStarted.get(stage) ??
       new Date(finishedAt.valueOf() - Math.max(0, result?.durationMs ?? 0));
     try {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.recordCiStepOutcome(
           job.deploymentId,
           outcomeFor(
-            owned,
+            { ...owned, deployment },
             stage,
             startedAt,
             finishedAt,
@@ -355,11 +365,11 @@ export async function processDeploymentJob(
   const heartbeat = async (): Promise<void> => {
     if (stopped || owned.deployment.ci?.status !== 'RUNNING') return;
     try {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.renewCiExecution(
           job.deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             leaseMs: options.leaseMs,
@@ -368,7 +378,9 @@ export async function processDeploymentJob(
         ),
       );
     } catch (error) {
-      renewalFailure = error;
+      renewalFailure ??= error;
+      stopped = true;
+      clearInterval(heartbeatTimer);
       controller.abort();
     }
   };
@@ -383,6 +395,8 @@ export async function processDeploymentJob(
     const project = await repositories.projects.findById(owned.deployment.projectId);
     if (!project) {
       stageStarted.set('CHECKOUT', now());
+      await stopHeartbeats();
+      if (renewalFailure) throw renewalFailure;
       await persist(
         'CHECKOUT',
         undefined,
@@ -430,8 +444,17 @@ export async function processDeploymentJob(
       },
     );
     if (!completedBuild) throw new Error('CI runner returned without a build result');
+    await stopHeartbeats();
+    if (renewalFailure) throw renewalFailure;
     await persist('BUILD', completedBuild, undefined, 'CLEANED');
   } catch (error) {
+    try {
+      await stopHeartbeats();
+    } catch (mutationError) {
+      if (persistenceFailure) throw persistenceFailure;
+      if (renewalFailure) throw renewalFailure;
+      throw mutationError;
+    }
     if (persistenceFailure) throw persistenceFailure;
     if (renewalFailure) throw renewalFailure;
     if (!runnerInvoked) throw error;

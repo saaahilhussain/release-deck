@@ -247,23 +247,33 @@ export async function processReleaseDeployment(
   let stopped = false;
   let renewalFailure: unknown;
 
-  const serialize = async <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = mutation.then(operation);
-    mutation = result.then(
-      () => undefined,
-      () => undefined,
-    );
+  const serialize = (
+    operation: (deployment: Deployment) => Promise<Deployment>,
+  ): Promise<Deployment> => {
+    const result = mutation.then(async () => {
+      const deployment = await operation(owned.deployment);
+      owned.deployment = deployment;
+      return deployment;
+    });
+    mutation = result.then(() => undefined);
+    void mutation.catch(() => undefined);
     return result;
+  };
+
+  const stopHeartbeats = async (): Promise<void> => {
+    stopped = true;
+    clearInterval(heartbeatTimer);
+    await mutation;
   };
 
   const heartbeat = async (): Promise<void> => {
     if (stopped || owned.deployment.release?.status !== 'RUNNING') return;
     try {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.renewReleaseExecution(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             leaseMs: options.leaseMs,
@@ -272,7 +282,9 @@ export async function processReleaseDeployment(
         ),
       );
     } catch (error) {
-      renewalFailure = error;
+      renewalFailure ??= error;
+      stopped = true;
+      clearInterval(heartbeatTimer);
       controller.abort();
     }
   };
@@ -300,11 +312,11 @@ export async function processReleaseDeployment(
       target: options.target,
       signal: controller.signal,
     });
-    owned.deployment = await serialize(() =>
+    await serialize((deployment) =>
       repositories.deployments.advanceReleaseStage(
         deploymentId,
         {
-          expectedVersion: owned.deployment.version,
+          expectedVersion: deployment.version,
           attemptId: owned.attemptId,
           fence: owned.fence,
           stage: 'HEALTH_CHECK',
@@ -327,6 +339,7 @@ export async function processReleaseDeployment(
   }
 
   try {
+    await stopHeartbeats();
     if (renewalFailure) throw renewalFailure;
     if (operationError) {
       const failure = releaseFailure(
@@ -334,11 +347,11 @@ export async function processReleaseDeployment(
         context,
         controller.signal.aborted && !renewalFailure,
       );
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.recordReleaseFailure(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             failure,
@@ -355,11 +368,11 @@ export async function processReleaseDeployment(
     if (!outcome) throw new Error('release promotion returned no outcome');
     const releaseOutcome = outcome;
     if (releaseOutcome.status === 'PROMOTED') {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.advanceReleaseStage(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             stage: 'PROMOTE',
@@ -368,11 +381,11 @@ export async function processReleaseDeployment(
         ),
       );
       const proof = releaseOutcome.proof;
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.recordReleasePromotion(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             health: releaseOutcome.healthProof,
@@ -391,11 +404,11 @@ export async function processReleaseDeployment(
         ),
       );
     } else if (releaseOutcome.status === 'NO_KNOWN_GOOD') {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.recordReleaseFailure(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             failure: {
@@ -408,11 +421,11 @@ export async function processReleaseDeployment(
         ),
       );
     } else {
-      owned.deployment = await serialize(() =>
+      await serialize((deployment) =>
         repositories.deployments.advanceReleaseStage(
           deploymentId,
           {
-            expectedVersion: owned.deployment.version,
+            expectedVersion: deployment.version,
             attemptId: owned.attemptId,
             fence: owned.fence,
             stage: 'ROLLBACK',
@@ -421,16 +434,16 @@ export async function processReleaseDeployment(
         ),
       );
       if (releaseOutcome.status === 'ROLLED_BACK') {
-        owned.deployment = await serialize(() =>
+        await serialize((deployment) =>
           repositories.deployments.recordReleaseRollback(
             deploymentId,
             {
-              expectedVersion: owned.deployment.version,
+              expectedVersion: deployment.version,
               attemptId: owned.attemptId,
               fence: owned.fence,
               target: rollbackTarget(
                 releaseOutcome.restored,
-                owned.deployment.projectId,
+                deployment.projectId,
                 options.target.remoteRoot,
               ),
               health: releaseOutcome.healthProof,
@@ -439,16 +452,16 @@ export async function processReleaseDeployment(
           ),
         );
       } else {
-        owned.deployment = await serialize(() =>
+        await serialize((deployment) =>
           repositories.deployments.recordReleaseRollbackFailure(
             deploymentId,
             {
-              expectedVersion: owned.deployment.version,
+              expectedVersion: deployment.version,
               attemptId: owned.attemptId,
               fence: owned.fence,
               attemptedTarget: rollbackTarget(
                 releaseOutcome.attemptedRestore,
-                owned.deployment.projectId,
+                deployment.projectId,
                 options.target.remoteRoot,
               ),
               failure: {

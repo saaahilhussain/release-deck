@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  ConcurrencyError,
   createProject,
   createQueuedDeployment,
   type CiExecutionClaim,
+  type CiExecutionLeaseInput,
   type CiStepOutcomeInput,
   type Deployment,
   type Project,
@@ -15,6 +17,7 @@ import {
 import {
   CiCleanupError,
   CiStepError,
+  ProcessCancelledError,
   ProcessTimeoutError,
   type CiRunner,
   type CiRunnerHooks,
@@ -389,6 +392,198 @@ const successfulRunner: CiRunner = {
   },
 };
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function renewed(current: Deployment): Deployment {
+  const heartbeatAt = new Date();
+  return {
+    ...current,
+    version: current.version + 1,
+    updatedAt: heartbeatAt,
+    ci: {
+      ...current.ci!,
+      heartbeatAt,
+      leaseExpiresAt: new Date(heartbeatAt.valueOf() + 60_000),
+    },
+  };
+}
+
+function persistenceHarness(
+  runner: CiRunner,
+  handlers: {
+    renew?: (current: Deployment, input: CiExecutionLeaseInput) => Promise<Deployment>;
+    outcome?: (current: Deployment, input: CiStepOutcomeInput) => Promise<Deployment>;
+  } = {},
+) {
+  let current = queuedDeployment();
+  const active = runningDeployment({ version: 1 });
+  const renewalVersions: number[] = [];
+  const outcomeVersions: number[] = [];
+  const repositories: DeploymentProcessorRepositories = {
+    deployments: {
+      findById: async () => current,
+      claimCiExecution: async () => {
+        current = active;
+        return claim(active);
+      },
+      reclaimExpiredCiExecution: async () => null,
+      renewCiExecution: async (_id, input) => {
+        renewalVersions.push(input.expectedVersion);
+        if (
+          input.expectedVersion !== current.version ||
+          input.attemptId !== current.ci?.attemptId ||
+          input.fence !== current.ci.fence
+        )
+          throw new ConcurrencyError();
+        current = handlers.renew
+          ? await handlers.renew(current, input)
+          : renewed(current);
+        return current;
+      },
+      recordCiStepOutcome: async (_id, input) => {
+        outcomeVersions.push(input.expectedVersion);
+        if (
+          input.expectedVersion !== current.version ||
+          input.attemptId !== current.ci?.attemptId ||
+          input.fence !== current.ci.fence
+        )
+          throw new ConcurrencyError();
+        current = handlers.outcome
+          ? await handlers.outcome(current, input)
+          : applyOutcome(current, input);
+        return current;
+      },
+      claimReleaseExecution: async () => {
+        const now = new Date();
+        current = {
+          ...current,
+          stage: 'DEPLOY',
+          version: current.version + 1,
+          release: {
+            status: 'RUNNING',
+            releaseId: deploymentId,
+            attemptNumber: 1,
+            attemptId,
+            fence: 1,
+            leaseExpiresAt: new Date(now.valueOf() + 60_000),
+            heartbeatAt: now,
+            startedAt: now,
+          },
+        };
+        const leaseExpiresAt = current.release!.leaseExpiresAt!;
+        return {
+          attemptId,
+          fence: 1,
+          attemptNumber: 1,
+          leaseExpiresAt,
+          deployment: current,
+        };
+      },
+      reclaimExpiredReleaseExecution: async () => null,
+      renewReleaseExecution: async () => current,
+      advanceReleaseStage: async (_id, input) => {
+        current = { ...current, stage: input.stage, version: current.version + 1 };
+        return current;
+      },
+      recordReleasePromotion: async (_id, input) => {
+        current = {
+          ...current,
+          status: 'SUCCESS',
+          stage: 'COMPLETE',
+          version: current.version + 1,
+          release: {
+            ...current.release!,
+            status: 'DEPLOYED',
+            success: input.proof,
+            health: input.health,
+            finishedAt: new Date(),
+          },
+        };
+        return current;
+      },
+      recordReleaseRollback: async () => current,
+      recordReleaseRollbackFailure: async () => current,
+      recordReleaseFailure: async () => current,
+    },
+    projects: { findById: async () => project() },
+  };
+  return {
+    repositories,
+    runner,
+    renewalVersions,
+    outcomeVersions,
+    current: () => current,
+    replaceCurrent: (deployment: Deployment) => {
+      current = deployment;
+    },
+  };
+}
+
+const inactiveReleaseOperations: DeploymentReleaseOperations = {
+  async prepareRelease() {
+    throw new Error('release preparation is not expected');
+  },
+  async openPreparedRelease() {
+    throw new Error('release opening is not expected');
+  },
+  async stageRelease() {
+    throw new Error('release staging is not expected');
+  },
+  async promoteRelease() {
+    throw new Error('release promotion is not expected');
+  },
+  async cleanupPreparedRelease() {},
+};
+
+const successfulReleaseOperations: DeploymentReleaseOperations = {
+  async prepareRelease() {
+    throw new Error('release preparation is not expected');
+  },
+  async openPreparedRelease() {
+    return {
+      projectId,
+      deploymentId,
+      commitSha: 'a'.repeat(40),
+      archivePath: 'D:\\artifacts\\release.tar.gz',
+      metadataPath: 'D:\\artifacts\\metadata.json',
+      archiveSha256: 'b'.repeat(64),
+    };
+  },
+  async stageRelease() {},
+  async promoteRelease() {
+    const releasePath = `/srv/apps/${projectId}/releases/${deploymentId}`;
+    return {
+      status: 'PROMOTED',
+      proof: {
+        projectId,
+        deploymentId,
+        commitSha: 'a'.repeat(40),
+        remoteReleasePath: releasePath,
+        activeTarget: releasePath,
+        pm2ProcessName: `releasedeck-${projectId}`,
+        pm2Pid: 123,
+        nginx: { validated: true, reloaded: true },
+        completedAt: new Date(),
+      },
+      healthProof: {
+        url: target.healthUrl,
+        statusCode: 200,
+        attempts: 1,
+        completedAt: new Date(),
+      },
+    };
+  },
+  async cleanupPreparedRelease() {},
+};
+
 test('worker runs exact repository input through all CI stages and persists PASSED', async () => {
   let repositoryUrl = '';
   const base = successfulRunner;
@@ -662,4 +857,320 @@ test('a missing project becomes a terminal checkout failure', async () => {
   assert.equal(state.current().stage, 'CHECKOUT');
   assert.equal(state.outcomes[0]?.exitCode, null);
   assert.equal(state.outcomes[0]?.signal, null);
+});
+
+test('a successful outcome uses the version committed by the heartbeat and stops renewal', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const heartbeatCommitted = deferred();
+  const runner: CiRunner = {
+    async run(_input, hooks = {}) {
+      runnerStarted.resolve();
+      await heartbeatCommitted.promise;
+      await hooks.onStageStarted?.('BUILD');
+      await hooks.onStageCompleted?.(stageResult('BUILD'));
+      return {
+        deploymentId,
+        commitSha: 'a'.repeat(40),
+        workspacePath: 'D:\\temporary-workspace',
+        stages: [stageResult('BUILD')],
+      };
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew(current) {
+      const next = renewed(current);
+      heartbeatCommitted.resolve();
+      return next;
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    successfulReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await processing;
+
+  assert.deepEqual(state.renewalVersions, [1]);
+  assert.deepEqual(state.outcomeVersions, [2]);
+  assert.equal(state.current().ci?.status, 'PASSED');
+  t.mock.timers.tick(100_000);
+  assert.deepEqual(state.renewalVersions, [1]);
+});
+
+test('a failed outcome waits for an in-flight heartbeat before using its version', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const heartbeatStarted = deferred();
+  const releaseHeartbeat = deferred();
+  const runner: CiRunner = {
+    async run(_input, hooks = {}) {
+      runnerStarted.resolve();
+      await heartbeatStarted.promise;
+      await hooks.onStageStarted?.('TEST');
+      const error = new CiStepError('TEST', 'CI test failed', stageResult('TEST', 1));
+      await hooks.onStageFailed?.('TEST', error);
+      throw error;
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew(current) {
+      heartbeatStarted.resolve();
+      await releaseHeartbeat.promise;
+      return renewed(current);
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await heartbeatStarted.promise;
+  await Promise.resolve();
+  assert.deepEqual(state.outcomeVersions, []);
+  releaseHeartbeat.resolve();
+  await processing;
+
+  assert.deepEqual(state.renewalVersions, [1]);
+  assert.deepEqual(state.outcomeVersions, [2]);
+  assert.equal(state.current().ci?.status, 'FAILED');
+});
+
+test('multiple heartbeats serialize and publish each committed version', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const finishRunner = deferred();
+  const firstHeartbeatStarted = deferred();
+  const releaseFirstHeartbeat = deferred();
+  const secondHeartbeatStarted = deferred();
+  let renewCalls = 0;
+  const runner: CiRunner = {
+    async run(_input, hooks = {}) {
+      runnerStarted.resolve();
+      await finishRunner.promise;
+      await hooks.onStageStarted?.('TEST');
+      const error = new CiStepError('TEST', 'CI test failed', stageResult('TEST', 1));
+      await hooks.onStageFailed?.('TEST', error);
+      throw error;
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew(current) {
+      renewCalls += 1;
+      if (renewCalls === 1) {
+        firstHeartbeatStarted.resolve();
+        await releaseFirstHeartbeat.promise;
+      } else if (renewCalls === 2) {
+        secondHeartbeatStarted.resolve();
+      }
+      return renewed(current);
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await firstHeartbeatStarted.promise;
+  t.mock.timers.tick(20_000);
+  await Promise.resolve();
+  assert.equal(renewCalls, 1);
+  releaseFirstHeartbeat.resolve();
+  await secondHeartbeatStarted.promise;
+  finishRunner.resolve();
+  await processing;
+
+  assert.deepEqual(state.renewalVersions, [1, 2]);
+  assert.deepEqual(state.outcomeVersions, [3]);
+});
+
+test('cancellation waits for an in-flight heartbeat before persisting failure', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const controller = new AbortController();
+  const runnerStarted = deferred();
+  const heartbeatStarted = deferred();
+  const releaseHeartbeat = deferred();
+  const runner: CiRunner = {
+    async run(input, hooks = {}) {
+      runnerStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (input.signal?.aborted) resolve();
+        else input.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      const error = new ProcessCancelledError(stageResult('TEST', null, 'SIGTERM'));
+      await hooks.onStageFailed?.('TEST', error);
+      throw error;
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew(current) {
+      heartbeatStarted.resolve();
+      await releaseHeartbeat.promise;
+      return renewed(current);
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1, signal: controller.signal },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await heartbeatStarted.promise;
+  controller.abort();
+  await Promise.resolve();
+  assert.deepEqual(state.outcomeVersions, []);
+  releaseHeartbeat.resolve();
+  await processing;
+
+  assert.deepEqual(state.outcomeVersions, [2]);
+  assert.equal(state.current().ci?.failure?.kind, 'CANCELLED');
+});
+
+test('timeout waits for an in-flight heartbeat before persisting failure', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const heartbeatStarted = deferred();
+  const releaseHeartbeat = deferred();
+  const triggerTimeout = deferred();
+  const runner: CiRunner = {
+    async run(_input, hooks = {}) {
+      runnerStarted.resolve();
+      await triggerTimeout.promise;
+      const error = new ProcessTimeoutError(stageResult('TEST', null, 'SIGTERM'));
+      await hooks.onStageFailed?.('TEST', error);
+      throw error;
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew(current) {
+      heartbeatStarted.resolve();
+      await releaseHeartbeat.promise;
+      return renewed(current);
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await heartbeatStarted.promise;
+  triggerTimeout.resolve();
+  await Promise.resolve();
+  assert.deepEqual(state.outcomeVersions, []);
+  releaseHeartbeat.resolve();
+  await processing;
+
+  assert.deepEqual(state.outcomeVersions, [2]);
+  assert.equal(state.current().ci?.failure?.kind, 'COMMAND_TIMEOUT');
+});
+
+test('a different worker remains rejected by optimistic concurrency and fencing', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const runner: CiRunner = {
+    async run(input) {
+      runnerStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (input.signal?.aborted) resolve();
+        else input.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      throw new ProcessCancelledError(stageResult('TEST', null, 'SIGTERM'));
+    },
+  };
+  const state = persistenceHarness(runner);
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  state.replaceCurrent({
+    ...state.current(),
+    ci: {
+      ...state.current().ci!,
+      attemptId: '550e8400-e29b-41d4-a716-446655440003',
+      fence: 2,
+    },
+  });
+  t.mock.timers.tick(20_000);
+  await assert.rejects(processing, ConcurrencyError);
+  assert.deepEqual(state.outcomeVersions, []);
+});
+
+test('a failed mutation prevents queued heartbeats and outcomes from using stale state', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runnerStarted = deferred();
+  const firstHeartbeatStarted = deferred();
+  const failHeartbeat = deferred();
+  const persistenceError = new Error('MongoDB unavailable');
+  let renewCalls = 0;
+  const runner: CiRunner = {
+    async run(input) {
+      runnerStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (input.signal?.aborted) resolve();
+        else input.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      throw new ProcessCancelledError(stageResult('TEST', null, 'SIGTERM'));
+    },
+  };
+  const state = persistenceHarness(runner, {
+    async renew() {
+      renewCalls += 1;
+      firstHeartbeatStarted.resolve();
+      await failHeartbeat.promise;
+      throw persistenceError;
+    },
+  });
+
+  const processing = processDeploymentJob(
+    job,
+    { attemptsMade: 0, maxAttempts: 1 },
+    state.repositories,
+    state.runner,
+    inactiveReleaseOperations,
+    processorOptions,
+  );
+  await runnerStarted.promise;
+  t.mock.timers.tick(20_000);
+  await firstHeartbeatStarted.promise;
+  t.mock.timers.tick(20_000);
+  failHeartbeat.resolve();
+  await assert.rejects(processing, persistenceError);
+
+  assert.equal(renewCalls, 1);
+  assert.deepEqual(state.outcomeVersions, []);
 });

@@ -65,9 +65,14 @@ function harness(
   activationError?: unknown,
   successError?: unknown,
   promotionOutcome?: Awaited<ReturnType<ReleaseOperations['promoteRelease']>>,
+  controls: {
+    renew?: (current: Deployment) => Promise<Deployment>;
+  } = {},
 ) {
   let current = ciPassed();
   const calls: string[] = [];
+  const renewalVersions: number[] = [];
+  const mutationVersions: number[] = [];
   const repositories: ReleaseProcessorRepositories = {
     deployments: {
       findById: async () => current,
@@ -97,12 +102,24 @@ function harness(
         };
       },
       reclaimExpiredReleaseExecution: async () => null,
-      renewReleaseExecution: async () => current,
+      renewReleaseExecution: async (_id, input) => {
+        renewalVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release heartbeat version');
+        current = controls.renew ? await controls.renew(current) : current;
+        return current;
+      },
       advanceReleaseStage: async (_id, input) => {
+        mutationVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release stage version');
         current = { ...current, stage: input.stage, version: current.version + 1 };
         return current;
       },
       recordReleasePromotion: async (_id, input: ReleasePromotionInput) => {
+        mutationVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release promotion version');
         if (successError) throw successError;
         current = {
           ...current,
@@ -120,6 +137,9 @@ function harness(
         return current;
       },
       recordReleaseRollback: async (_id, input) => {
+        mutationVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release rollback version');
         current = {
           ...current,
           status: 'ROLLED_BACK',
@@ -140,6 +160,9 @@ function harness(
         return current;
       },
       recordReleaseRollbackFailure: async (_id, input) => {
+        mutationVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release rollback-failure version');
         current = {
           ...current,
           status: 'FAILED',
@@ -160,6 +183,9 @@ function harness(
         return current;
       },
       recordReleaseFailure: async (_id, input: ReleaseFailureInput) => {
+        mutationVersions.push(input.expectedVersion);
+        if (input.expectedVersion !== current.version)
+          throw new Error('stale release failure version');
         current = {
           ...current,
           status: input.failure.retryable ? 'RUNNING' : 'FAILED',
@@ -221,7 +247,22 @@ function harness(
       calls.push('cleanup');
     },
   };
-  return { repositories, operations, calls, current: () => current };
+  return {
+    repositories,
+    operations,
+    calls,
+    renewalVersions,
+    mutationVersions,
+    current: () => current,
+  };
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 test('a fenced release attempt stages, activates, cleans, and records proof', async () => {
@@ -237,6 +278,53 @@ test('a fenced release attempt stages, activates, cleans, and records proof', as
   assert.equal(state.current().status, 'SUCCESS');
   assert.equal(state.current().stage, 'COMPLETE');
   assert.equal(state.current().release?.success?.releaseId, deploymentId);
+});
+
+test('release finalization drains its heartbeat and uses each latest version', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const promotionStarted = deferred();
+  const heartbeatCommitted = deferred();
+  const state = harness(undefined, undefined, undefined, {
+    async renew(current) {
+      const now = new Date();
+      const next = {
+        ...current,
+        version: current.version + 1,
+        release: {
+          ...current.release!,
+          heartbeatAt: now,
+          leaseExpiresAt: new Date(now.valueOf() + 60_000),
+        },
+      };
+      heartbeatCommitted.resolve();
+      return next;
+    },
+  });
+  const operations: ReleaseOperations = {
+    ...state.operations,
+    async promoteRelease(input) {
+      promotionStarted.resolve();
+      await heartbeatCommitted.promise;
+      return state.operations.promoteRelease(input);
+    },
+  };
+
+  const processing = processReleaseDeployment(
+    deploymentId,
+    { attemptsMade: 0, maxAttempts: 3 },
+    state.repositories,
+    operations,
+    options,
+  );
+  await promotionStarted.promise;
+  t.mock.timers.tick(20_000);
+  await processing;
+
+  assert.deepEqual(state.renewalVersions, [3]);
+  assert.deepEqual(state.mutationVersions, [2, 4, 5]);
+  assert.equal(state.current().status, 'SUCCESS');
+  t.mock.timers.tick(100_000);
+  assert.deepEqual(state.renewalVersions, [3]);
 });
 
 test('a retryable transport failure is persisted and rethrown for BullMQ', async () => {
