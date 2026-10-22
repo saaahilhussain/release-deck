@@ -42,3 +42,7 @@ export {
   type Workspace,
   type WorkspaceManager,
 } from './workspace.js';
+export type {
+  ReleaseBuildMode,
+  ReleaseDeckBuildPlan,
+} from '@releasedeck/project-config';

@@ -15,8 +15,14 @@ need a separately reviewed metadata contract.
 
 Only install/test/build use this executor, including all package-manager lifecycle
 scripts and their descendants. Fixed npm/pnpm commands execute as `releasedeck-build`
-inside per-stage transient systemd units. A root-owned per-job filesystem view binds
-read-only OS/runtime paths and the current writable `/workspace`. Host homes,
+inside per-stage transient systemd units. The protocol accepts only a validated
+repository-relative working directory; the root-owned launcher independently
+rejects escapes and link components before every command and before collection.
+BUILD alone may be completed without a repository command, and only after successful
+INSTALL and TEST in the launcher's fixed stage sequence. A root-owned per-job
+filesystem view binds read-only OS/runtime paths and the current writable
+`/workspace`; systemd uses `/workspace/<applicationRoot>` as the command working
+directory while `/workspace` remains the writable boundary. Host homes,
 control-plane source, secrets, checkout roots, other jobs, artifacts, and host `/run`
 sockets are absent. Proc visibility hides other users. Capabilities, privilege
 escalation, namespaces, cgroup delegation, and host filesystem writes are denied.

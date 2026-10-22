@@ -1,4 +1,29 @@
-# Private GitHub checkout
+# CI runner contract
+
+## Repository build plan
+
+Without a root `.releasedeck.json`, CI preserves the original contract: the Node
+application is the repository root and BUILD is required. A repository may instead
+commit this strict, data-only version 1 manifest:
+
+```json
+{
+  "schemaVersion": 1,
+  "applicationRoot": "server",
+  "build": "none"
+}
+```
+
+Only `schemaVersion`, `applicationRoot`, and `build` are accepted. The application
+root defaults to `.` and build defaults to `required`. It must be a bounded,
+repository-relative POSIX directory with no link components. Exactly one
+`package-lock.json` or `pnpm-lock.yaml` must exist in that directory. Install and
+test remain mandatory fixed npm/pnpm operations. `build: "none"` records a trusted
+successful BUILD result without running repository build code. All repository
+commands run from the validated application root, which is revalidated after every
+repository-controlled stage and before artifact collection.
+
+## Private GitHub checkout
 
 Public checkout remains credential-free and needs no GitHub App configuration.
 Only a GitHub HTTPS fetch reporting an explicit authentication/prompt failure can

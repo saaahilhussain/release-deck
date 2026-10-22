@@ -28,12 +28,16 @@ const setup = String.raw`set -eu
 root=$(mktemp -d /tmp/releasedeck-pm2-XXXXXXXX)
 export PM2_HOME="$root/pm2"
 trap 'rm -rf -- "$root"' EXIT
-mkdir -p "$root/A" "$root/B" "$root/B-other" "$root/bin"
+mkdir -p "$root/A" "$root/B" "$root/B-other" "$root/N/server" "$root/N/.releasedeck-release" "$root/bin"
 name=releasedeck-isolated-test
 for release in A B B-other; do
   printf 'setInterval(() => {}, 1000);\n' > "$root/$release/server.cjs"
   printf 'module.exports={apps:[{name:"%s",cwd:__dirname,script:"./server.cjs",exec_mode:"fork",instances:1}]};\n' "$name" > "$root/$release/ecosystem.config.cjs"
 done
+printf 'setInterval(() => {}, 1000);\n' > "$root/N/server/server.cjs"
+printf 'module.exports={apps:[{name:"%s",cwd:__dirname,script:"./server.cjs",exec_mode:"fork",instances:1}]};\n' "$name" > "$root/N/server/ecosystem.config.cjs"
+printf server > "$root/N/.releasedeck-release/application-root"
+printf none > "$root/N/.releasedeck-release/build"
 `;
 
 test(
@@ -103,6 +107,8 @@ ${PM2_ACTIVATION_FUNCTION}
 # Missing process is safe; an existing process is replaced by name.
 activate_pm2 "$root/A" "$name" >/dev/null
 activate_pm2 "$root/B" "$name" >/dev/null
+activate_pm2 "$root/N" "$name" >/dev/null
+printf 'verified nested\n'
 for failure in delete start script cwd status pid duplicate; do
   rm -f "$PM2_HOME.json"
   activate_pm2 "$root/A" "$name" >/dev/null
@@ -120,6 +126,12 @@ ln -s "$root/B-other/server.cjs" "$root/B/link.cjs"
 printf 'module.exports={apps:[{name:"%s",cwd:__dirname,script:"./link.cjs"}]};\n' "$name" > "$root/B/ecosystem.config.cjs"
 if activate_pm2 "$root/B" "$name" >/dev/null; then exit 1; fi
 printf 'rejected symlink\n'
+mkdir -p "$root/L/.releasedeck-release"
+ln -s "$root/B-other" "$root/L/server"
+printf server > "$root/L/.releasedeck-release/application-root"
+printf required > "$root/L/.releasedeck-release/build"
+if activate_pm2 "$root/L" "$name" >/dev/null; then exit 1; fi
+printf 'rejected application-root symlink\n'
 `);
   for (const failure of [
     'delete',
@@ -131,6 +143,8 @@ printf 'rejected symlink\n'
     'duplicate',
     'escape',
     'symlink',
+    'application-root symlink',
   ])
     assert.match(output, new RegExp(`rejected ${failure}`));
+  assert.match(output, /verified nested/);
 });

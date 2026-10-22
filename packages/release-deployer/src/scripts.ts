@@ -1,6 +1,7 @@
-import { PM2_ACTIVATION_FUNCTION } from './pm2.js';
+import { PM2_ACTIVATION_FUNCTION, RELEASE_APPLICATION_FUNCTION } from './pm2.js';
 
 export const STAGE_REMOTE_SCRIPT = String.raw`set -eu
+${RELEASE_APPLICATION_FUNCTION}
 project_id=$1
 deployment_id=$2
 commit_sha=$3
@@ -47,12 +48,12 @@ trap 'rm -rf -- "$stage"; rm -f -- "$archive"' EXIT
 actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 test "$actual_sha" = "$archive_sha"
 tar -xzf "$archive" -C "$stage"
-test -f "$stage/ecosystem.config.cjs"
+application=$(release_application_directory "$stage")
 test "$(cat "$stage/.releasedeck-release/project-id")" = "$project_id"
 test "$(cat "$stage/.releasedeck-release/deployment-id")" = "$deployment_id"
 test "$(cat "$stage/.releasedeck-release/commit-sha")" = "$commit_sha"
 printf '%s' "$archive_sha" > "$stage/.releasedeck-release/archive-sha256"
-ln -s "$base/shared/.env" "$stage/.env"
+ln -s "$base/shared/.env" "$application/.env"
 
 if test -e "$target" || test -L "$target"; then
   test -d "$target"
@@ -61,6 +62,7 @@ if test -e "$target" || test -L "$target"; then
   test "$(cat "$target/.releasedeck-release/deployment-id")" = "$deployment_id"
   test "$(cat "$target/.releasedeck-release/commit-sha")" = "$commit_sha"
   test "$(cat "$target/.releasedeck-release/archive-sha256")" = "$archive_sha"
+  release_env_link_valid "$target" "$base/shared/.env"
 else
   mv -Tn -- "$stage" "$target" || true
 fi
@@ -71,6 +73,7 @@ test "$(cat "$target/.releasedeck-release/project-id")" = "$project_id"
 test "$(cat "$target/.releasedeck-release/deployment-id")" = "$deployment_id"
 test "$(cat "$target/.releasedeck-release/commit-sha")" = "$commit_sha"
 test "$(cat "$target/.releasedeck-release/archive-sha256")" = "$archive_sha"
+release_env_link_valid "$target" "$base/shared/.env"
 
 rm -rf -- "$stage"
 rm -f -- "$archive"
@@ -122,7 +125,7 @@ test "$(cat "$target/.releasedeck-release/project-id")" = "$project_id"
 test "$(cat "$target/.releasedeck-release/deployment-id")" = "$deployment_id"
 test "$(cat "$target/.releasedeck-release/commit-sha")" = "$commit_sha"
 test -s "$target/.releasedeck-release/archive-sha256"
-test "$(readlink "$target/.env")" = "$base/shared/.env"
+release_env_link_valid "$target" "$base/shared/.env"
 
 rm -f -- "$next"
 ln -s "releases/$deployment_id" "$next"
@@ -166,7 +169,7 @@ valid_release() {
     test "$(cat "$dir/.releasedeck-release/deployment-id")" = "$id" &&
     test "$(cat "$dir/.releasedeck-release/commit-sha")" = "$sha" &&
     test -s "$dir/.releasedeck-release/archive-sha256" &&
-    test "$(readlink "$dir/.env")" = "$base/shared/.env"
+    release_env_link_valid "$dir" "$base/shared/.env"
 }
 case "$health_url" in http://127.0.0.1:[1-9]*/*) ;; *) exit 64 ;; esac
 case "$health_url" in *\?*|*\#*|*@*|*[!A-Za-z0-9:/._~-]*) exit 64 ;; esac
@@ -212,7 +215,7 @@ fi
 next="$base/.current-$attempt_id"; rm -f -- "$next"; ln -s "releases/$deployment_id" "$next"; mv -Tf -- "$next" "$base/current"
 activate() {
   id=$1 dir="$releases/$1" name="releasedeck-$project_id"
-  ln -sfn "$base/shared/.env" "$dir/.env"
+  link_release_env "$dir" "$base/shared/.env"
   pid=$(activate_pm2 "$dir" "$name") || return 1
   sudo -n nginx -t && sudo -n nginx -s reload || return 1
   return 0
@@ -304,12 +307,12 @@ signature="$request_id $active_id $active_sha $restore_id $restore_sha"
 matching_request() { test -f "$marker" && test ! -L "$marker" && test "$(cat "$marker")" = "$signature"; }
 reject_precondition() { if matching_request; then exit 74; fi; exit 66; }
 test -f "$base/known-good" && test ! -L "$base/known-good" && test -f "$base/previous-known-good" && test ! -L "$base/previous-known-good" || reject_precondition
-test -d "$active" && test ! -L "$active" && test "$(cat "$active/.releasedeck-release/project-id")" = "$project_id" && test "$(cat "$active/.releasedeck-release/deployment-id")" = "$active_id" && test "$(cat "$active/.releasedeck-release/commit-sha")" = "$active_sha" && test -s "$active/.releasedeck-release/archive-sha256" && test "$(readlink "$active/.env")" = "$base/shared/.env" || reject_precondition
+test -d "$active" && test ! -L "$active" && test "$(cat "$active/.releasedeck-release/project-id")" = "$project_id" && test "$(cat "$active/.releasedeck-release/deployment-id")" = "$active_id" && test "$(cat "$active/.releasedeck-release/commit-sha")" = "$active_sha" && test -s "$active/.releasedeck-release/archive-sha256" && release_env_link_valid "$active" "$base/shared/.env" || reject_precondition
 valid_uuid "$restore_id" || reject_precondition
 restore="$releases/$restore_id"
 test -d "$restore" && test ! -L "$restore" && test "$(cat "$restore/.releasedeck-release/project-id")" = "$project_id" && test "$(cat "$restore/.releasedeck-release/deployment-id")" = "$restore_id" && test -s "$restore/.releasedeck-release/archive-sha256" || reject_precondition
 test "$(cat "$restore/.releasedeck-release/commit-sha")" = "$restore_sha" || reject_precondition
-test "$(readlink "$restore/.env")" = "$base/shared/.env" || reject_precondition
+release_env_link_valid "$restore" "$base/shared/.env" || reject_precondition
 current=$(readlink "$base/current") || reject_precondition
 known_good=$(cat "$base/known-good") || reject_precondition
 predecessor=$(cat "$base/previous-known-good") || reject_precondition
@@ -340,7 +343,7 @@ if pid=$(activate_pm2 "$restore" "$name") && sudo -n nginx -t && sudo -n nginx -
       valid_uuid "$old" || continue
       case "$protected" in *" $old "*) continue ;; esac
       old_dir="$releases/$old"
-      test -d "$old_dir" && test ! -L "$old_dir" && test "$(cat "$old_dir/.releasedeck-release/project-id" 2>/dev/null)" = "$project_id" && test "$(cat "$old_dir/.releasedeck-release/deployment-id" 2>/dev/null)" = "$old" && test -s "$old_dir/.releasedeck-release/archive-sha256" && test "$(readlink "$old_dir/.env")" = "$base/shared/.env" || continue
+      test -d "$old_dir" && test ! -L "$old_dir" && test "$(cat "$old_dir/.releasedeck-release/project-id" 2>/dev/null)" = "$project_id" && test "$(cat "$old_dir/.releasedeck-release/deployment-id" 2>/dev/null)" = "$old" && test -s "$old_dir/.releasedeck-release/archive-sha256" && release_env_link_valid "$old_dir" "$base/shared/.env" || continue
       old_sha=$(cat "$old_dir/.releasedeck-release/commit-sha" 2>/dev/null) || continue
       case "$old_sha" in ????????????????????????????????????????) ;; *) continue ;; esac
       case "$old_sha" in *[!0-9a-fA-F]*) continue ;; esac

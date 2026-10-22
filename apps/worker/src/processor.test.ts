@@ -215,6 +215,8 @@ function harness(overrides: {
         commitSha: input.commitSha,
         archivePath: 'D:\\artifacts\\release.tar.gz',
         metadataPath: 'D:\\artifacts\\metadata.json',
+        applicationRoot: '.',
+        build: 'required',
         archiveSha256: 'b'.repeat(64),
       };
     },
@@ -226,6 +228,8 @@ function harness(overrides: {
         commitSha: 'a'.repeat(40),
         archivePath: 'D:\\artifacts\\release.tar.gz',
         metadataPath: 'D:\\artifacts\\metadata.json',
+        applicationRoot: '.',
+        build: 'required',
         archiveSha256: 'b'.repeat(64),
       };
     },
@@ -378,6 +382,8 @@ const successfulRunner: CiRunner = {
           commitSha: input.commitSha,
           workspacePath: 'D:\\temporary-workspace',
           packageManager: 'pnpm',
+          applicationRoot: '.',
+          build: 'required',
           buildResult: result,
         });
       }
@@ -554,6 +560,8 @@ const successfulReleaseOperations: DeploymentReleaseOperations = {
       commitSha: 'a'.repeat(40),
       archivePath: 'D:\\artifacts\\release.tar.gz',
       metadataPath: 'D:\\artifacts\\metadata.json',
+      applicationRoot: '.',
+      build: 'required',
       archiveSha256: 'b'.repeat(64),
     };
   },

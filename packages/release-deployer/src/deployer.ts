@@ -15,6 +15,13 @@ import { isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 
+import {
+  resolveApplicationRoot,
+  validateReleaseDeckBuildPlan,
+  type ReleaseBuildMode,
+  type ReleaseDeckBuildPlan,
+} from '@releasedeck/project-config';
+
 import { ReleaseDeployerError } from './errors.js';
 import {
   defaultCommandExecutor,
@@ -37,12 +44,14 @@ export interface ReleaseMetadata {
 export interface PrepareReleaseInput extends ReleaseMetadata {
   readonly workspacePath: string;
   readonly artifactRoot: string;
+  readonly applicationRoot?: string;
+  readonly build?: ReleaseBuildMode;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
   readonly outputLimitBytes?: number;
 }
 
-export interface PreparedRelease extends ReleaseMetadata {
+export interface PreparedRelease extends ReleaseMetadata, ReleaseDeckBuildPlan {
   readonly archivePath: string;
   readonly metadataPath: string;
   readonly archiveSha256: string;
@@ -165,8 +174,13 @@ export type RollbackOutcome =
       readonly failureCode: 'restore_unhealthy' | 'active_restore_failed';
     };
 
-interface StoredArtifactMetadata extends ReleaseMetadata {
+interface LegacyStoredArtifactMetadata extends ReleaseMetadata {
   readonly schemaVersion: 1;
+  readonly archiveSha256: string;
+}
+
+interface StoredArtifactMetadata extends ReleaseMetadata, ReleaseDeckBuildPlan {
+  readonly schemaVersion: 2;
   readonly archiveSha256: string;
 }
 
@@ -249,33 +263,135 @@ async function hashFile(path: string): Promise<string> {
   return hash.digest('hex');
 }
 
+function buildPlan(input: {
+  readonly applicationRoot?: unknown;
+  readonly build?: unknown;
+}): ReleaseDeckBuildPlan {
+  try {
+    return validateReleaseDeckBuildPlan(input);
+  } catch (cause) {
+    throw new ReleaseDeployerError('preparation', 'release build plan is invalid', {
+      cause,
+    });
+  }
+}
+
 function exactMetadata(
   value: unknown,
   expected: ReleaseMetadata,
-): value is StoredArtifactMetadata {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+): (LegacyStoredArtifactMetadata | StoredArtifactMetadata) | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const keys = Object.keys(value).sort();
-  if (
-    JSON.stringify(keys) !==
-    JSON.stringify([
-      'archiveSha256',
-      'commitSha',
-      'deploymentId',
-      'projectId',
-      'schemaVersion',
-    ])
-  ) {
-    return false;
-  }
-  const metadata = value as Partial<StoredArtifactMetadata>;
-  return (
-    metadata.schemaVersion === 1 &&
+  const legacyKeys = [
+    'archiveSha256',
+    'commitSha',
+    'deploymentId',
+    'projectId',
+    'schemaVersion',
+  ].sort();
+  const currentKeys = [...legacyKeys, 'applicationRoot', 'build'].sort();
+  const metadata = value as Record<string, unknown>;
+  const identityMatches =
     metadata.projectId === expected.projectId &&
     metadata.deploymentId === expected.deploymentId &&
     metadata.commitSha === expected.commitSha &&
     typeof metadata.archiveSha256 === 'string' &&
-    SHA256_PATTERN.test(metadata.archiveSha256)
-  );
+    SHA256_PATTERN.test(metadata.archiveSha256);
+  if (!identityMatches) return undefined;
+  if (
+    metadata.schemaVersion === 1 &&
+    JSON.stringify(keys) === JSON.stringify(legacyKeys)
+  ) {
+    return metadata as unknown as LegacyStoredArtifactMetadata;
+  }
+  if (
+    metadata.schemaVersion === 2 &&
+    JSON.stringify(keys) === JSON.stringify(currentKeys)
+  ) {
+    try {
+      validateReleaseDeckBuildPlan(metadata);
+      return metadata as unknown as StoredArtifactMetadata;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+interface EmbeddedReleaseMetadata extends ReleaseMetadata {
+  readonly applicationRoot?: string;
+  readonly build?: string;
+}
+
+async function readEmbeddedReleaseMetadata(
+  directory: string,
+): Promise<EmbeddedReleaseMetadata> {
+  const runTar = async (args: readonly string[], outputLimitBytes: number) => {
+    const result = await defaultCommandExecutor.run('tar', args, {
+      cwd: directory,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      outputLimitBytes,
+    });
+    if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) {
+      throw new Error('prepared artifact embedded metadata is unavailable');
+    }
+    return result.stdout;
+  };
+  const prefix = '.releasedeck-release';
+  const listing = await runTar(['-tzf', 'release.tar.gz', prefix], 16 * 1024);
+  const members = listing
+    .split(/\r?\n/u)
+    .filter((value) => value !== '')
+    .map((value) => value.replace(/^\.\//u, '').replace(/\/$/u, ''));
+  const counts = new Map<string, number>();
+  for (const member of members) counts.set(member, (counts.get(member) ?? 0) + 1);
+  const identityNames = ['project-id', 'deployment-id', 'commit-sha'] as const;
+  const planNames = ['application-root', 'build'] as const;
+  const allowed = new Set([
+    prefix,
+    ...identityNames.map((name) => `${prefix}/${name}`),
+    ...planNames.map((name) => `${prefix}/${name}`),
+  ]);
+  if (
+    members.some((member) => !allowed.has(member)) ||
+    counts.get(prefix) !== 1 ||
+    identityNames.some((name) => counts.get(`${prefix}/${name}`) !== 1) ||
+    planNames.some((name) => (counts.get(`${prefix}/${name}`) ?? 0) > 1)
+  ) {
+    throw new Error('prepared artifact embedded metadata layout is invalid');
+  }
+  const planPresence = planNames.map((name) => counts.get(`${prefix}/${name}`) === 1);
+  if (planPresence[0] !== planPresence[1]) {
+    throw new Error('prepared artifact embedded build plan is incomplete');
+  }
+  const readMember = (name: string) =>
+    runTar(['-xOzf', 'release.tar.gz', `${prefix}/${name}`], 1024);
+  const [projectId, deploymentId, commitSha] = await Promise.all([
+    readMember(identityNames[0]),
+    readMember(identityNames[1]),
+    readMember(identityNames[2]),
+  ]);
+  if (!planPresence[0]) return { projectId, deploymentId, commitSha };
+  const [applicationRoot, build] = await Promise.all([
+    readMember(planNames[0]),
+    readMember(planNames[1]),
+  ]);
+  return { projectId, deploymentId, commitSha, applicationRoot, build };
+}
+
+function requireMatchingBuildPlan(
+  prepared: PreparedRelease,
+  expected: ReleaseDeckBuildPlan,
+): void {
+  if (
+    prepared.applicationRoot !== expected.applicationRoot ||
+    prepared.build !== expected.build
+  ) {
+    throw new ReleaseDeployerError(
+      'preparation',
+      'prepared artifact build plan does not match',
+    );
+  }
 }
 
 export async function openPreparedRelease(
@@ -304,15 +420,39 @@ export async function openPreparedRelease(
     ) {
       throw new Error('prepared artifact type mismatch');
     }
-    const metadata: unknown = JSON.parse(metadataText);
-    if (!exactMetadata(metadata, expected)) {
+    const parsed: unknown = JSON.parse(metadataText);
+    const metadata = exactMetadata(parsed, expected);
+    if (!metadata) {
       throw new Error('prepared artifact metadata mismatch');
     }
     const archiveSha256 = await hashFile(archivePath);
     if (archiveSha256 !== metadata.archiveSha256) {
       throw new Error('prepared artifact digest mismatch');
     }
-    return { ...expected, archivePath, metadataPath, archiveSha256 };
+    const embedded = await readEmbeddedReleaseMetadata(directory);
+    if (
+      embedded.projectId !== expected.projectId ||
+      embedded.deploymentId !== expected.deploymentId ||
+      embedded.commitSha !== expected.commitSha
+    ) {
+      throw new Error('prepared artifact embedded identity mismatch');
+    }
+    let plan: ReleaseDeckBuildPlan;
+    if (metadata.schemaVersion === 1) {
+      if (embedded.applicationRoot !== undefined || embedded.build !== undefined) {
+        throw new Error('legacy prepared artifact contains a current build plan');
+      }
+      plan = { applicationRoot: '.', build: 'required' };
+    } else {
+      plan = buildPlan(metadata);
+      if (
+        embedded.applicationRoot !== plan.applicationRoot ||
+        embedded.build !== plan.build
+      ) {
+        throw new Error('prepared artifact build plan mismatch');
+      }
+    }
+    return { ...expected, ...plan, archivePath, metadataPath, archiveSha256 };
   } catch (cause) {
     throw new ReleaseDeployerError(
       'preparation',
@@ -327,6 +467,7 @@ export async function prepareRelease(
   executor: CommandExecutor = defaultCommandExecutor,
 ): Promise<PreparedRelease> {
   const metadata = validateReleaseMetadata(input);
+  const plan = buildPlan(input);
   const workspacePath = validateLocalRoot(input.workspacePath, 'workspace path');
   const artifactRoot = validateLocalRoot(input.artifactRoot, 'artifact root');
   if (isWithin(workspacePath, artifactRoot) || samePath(workspacePath, artifactRoot)) {
@@ -342,8 +483,18 @@ export async function prepareRelease(
   ) {
     throw new ReleaseDeployerError('preparation', 'CI workspace is unavailable');
   }
+  let applicationPath: string;
+  try {
+    applicationPath = await resolveApplicationRoot(workspacePath, plan.applicationRoot);
+  } catch (cause) {
+    throw new ReleaseDeployerError(
+      'preparation',
+      'release application root is invalid',
+      { cause },
+    );
+  }
   if (
-    !(await lstat(join(workspacePath, 'ecosystem.config.cjs'))
+    !(await lstat(join(applicationPath, 'ecosystem.config.cjs'))
       .then((value) => value.isFile() && !value.isSymbolicLink())
       .catch(() => false))
   ) {
@@ -352,7 +503,9 @@ export async function prepareRelease(
   await mkdir(artifactRoot, { recursive: true });
   const finalDirectory = join(artifactRoot, metadata.deploymentId);
   try {
-    return await openPreparedRelease(artifactRoot, metadata);
+    const prepared = await openPreparedRelease(artifactRoot, metadata);
+    requireMatchingBuildPlan(prepared, plan);
+    return prepared;
   } catch {
     if (
       await lstat(finalDirectory)
@@ -400,6 +553,12 @@ export async function prepareRelease(
       writeFile(join(embeddedMetadata, 'project-id'), metadata.projectId, 'utf8'),
       writeFile(join(embeddedMetadata, 'deployment-id'), metadata.deploymentId, 'utf8'),
       writeFile(join(embeddedMetadata, 'commit-sha'), metadata.commitSha, 'utf8'),
+      writeFile(
+        join(embeddedMetadata, 'application-root'),
+        plan.applicationRoot,
+        'utf8',
+      ),
+      writeFile(join(embeddedMetadata, 'build'), plan.build, 'utf8'),
     ]);
     // Relative archive names avoid GNU tar interpreting a Windows drive as a host.
     await archiveCommand('tar', [
@@ -427,8 +586,9 @@ export async function prepareRelease(
     await writeFile(
       metadataPath,
       `${JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         ...metadata,
+        ...plan,
         archiveSha256,
       } satisfies StoredArtifactMetadata)}\n`,
       'utf8',
@@ -436,8 +596,9 @@ export async function prepareRelease(
     try {
       await rename(temporaryDirectory, finalDirectory);
     } catch (cause) {
+      let prepared: PreparedRelease;
       try {
-        return await openPreparedRelease(artifactRoot, metadata);
+        prepared = await openPreparedRelease(artifactRoot, metadata);
       } catch {
         throw new ReleaseDeployerError(
           'preparation',
@@ -445,9 +606,12 @@ export async function prepareRelease(
           { cause },
         );
       }
+      requireMatchingBuildPlan(prepared, plan);
+      return prepared;
     }
     return {
       ...metadata,
+      ...plan,
       archivePath: join(finalDirectory, 'release.tar.gz'),
       metadataPath: join(finalDirectory, 'metadata.json'),
       archiveSha256,
@@ -636,6 +800,8 @@ function assertArtifactMatches(
     artifact.projectId !== metadata.projectId ||
     artifact.deploymentId !== metadata.deploymentId ||
     artifact.commitSha !== metadata.commitSha ||
+    buildPlan(artifact).applicationRoot !== artifact.applicationRoot ||
+    buildPlan(artifact).build !== artifact.build ||
     !SHA256_PATTERN.test(artifact.archiveSha256) ||
     !isAbsolute(artifact.archivePath)
   ) {

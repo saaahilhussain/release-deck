@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 
+import { validateApplicationRoot } from '@releasedeck/project-config';
+
 import {
   ProcessCancelledError,
   ProcessTimeoutError,
@@ -17,10 +19,16 @@ export interface BuildSession {
   run(
     stage: BuildStage,
     manager: BuildManager,
+    workingDirectory: string,
     options: ProcessOptions,
   ): Promise<ProcessResult>;
+  /** Advance only the BUILD stage without executing repository code. */
+  completeBuild(
+    manager: BuildManager,
+    workingDirectory: string,
+  ): Promise<ProcessResult>;
   /** Stop/verify the boundary and revoke build access before trusted collection. */
-  collect(): Promise<void>;
+  collect(manager: BuildManager, workingDirectory: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -146,10 +154,40 @@ export function createSystemdBuildExecutor(
         return {
           workspacePath: buildPath,
           close,
-          async collect() {
-            await transport({ op: 'collect', jobId });
+          async collect(manager, workingDirectory) {
+            await transport({
+              op: 'collect',
+              jobId,
+              manager,
+              workingDirectory: validateApplicationRoot(workingDirectory),
+            });
           },
-          async run(stage, manager, options) {
+          async completeBuild(manager, workingDirectory) {
+            const response = await transport({
+              op: 'completeBuild',
+              jobId,
+              stage: 'BUILD',
+              manager,
+              workingDirectory: validateApplicationRoot(workingDirectory),
+            });
+            const result = response.result as ProcessResult | undefined;
+            if (
+              !result ||
+              result.command !== 'releasedeck' ||
+              JSON.stringify(result.args) !== JSON.stringify(['build', 'none']) ||
+              result.exitCode !== 0 ||
+              result.signal !== null ||
+              !Number.isSafeInteger(result.durationMs) ||
+              typeof result.stdout !== 'string' ||
+              typeof result.stderr !== 'string' ||
+              result.stdoutTruncated !== false ||
+              result.stderrTruncated !== false
+            ) {
+              throw new Error('isolated build completion result is invalid');
+            }
+            return result;
+          },
+          async run(stage, manager, workingDirectory, options) {
             const timeoutMs = options.timeoutMs ?? 600_000;
             const outputLimitBytes = options.outputLimitBytes ?? 256 * 1024;
             const args = commandFor(stage, manager);
@@ -187,6 +225,7 @@ export function createSystemdBuildExecutor(
                   jobId,
                   stage,
                   manager,
+                  workingDirectory: validateApplicationRoot(workingDirectory),
                   timeoutMs,
                   outputLimitBytes,
                 });

@@ -563,6 +563,7 @@ test('artifact preparation failure is a BUILD failure and still cleans the works
       processRunner: {
         async run(command, args, options) {
           if (args[0] === 'init') {
+            await writeFile(join(options.cwd, 'package.json'), '{}');
             await writeFile(join(options.cwd, 'package-lock.json'), '{}');
           }
           return {
@@ -623,6 +624,7 @@ test('a pnpm lockfile selects only the fixed pnpm command policy', async () => {
         async run(command, args, options) {
           calls.push(`${command} ${args.join(' ')}`);
           if (args[0] === 'init') {
+            await writeFile(join(options.cwd, 'package.json'), '{}');
             await writeFile(join(options.cwd, 'pnpm-lock.yaml'), 'lockfileVersion: 9');
           }
           return {
@@ -658,6 +660,364 @@ test('a pnpm lockfile selects only the fixed pnpm command policy', async () => {
   }
 });
 
+test('nested application root selects only its lockfile, runs fixed commands there, and can omit BUILD', async () => {
+  const root = await temporaryDirectory('nested-application');
+  const calls: { command: string; args: readonly string[]; cwd: string }[] = [];
+  let ready = false;
+  try {
+    const runner = createCiRunner({
+      workspaceRoot: join(root, 'workspaces'),
+      processRunner: {
+        async run(command, args, options) {
+          calls.push({ command, args, cwd: options.cwd });
+          if (args[0] === 'init') {
+            await mkdir(join(options.cwd, 'client'), { recursive: true });
+            await mkdir(join(options.cwd, 'server'), { recursive: true });
+            await writeFile(join(options.cwd, 'client', 'package.json'), '{}');
+            await writeFile(join(options.cwd, 'client', 'package-lock.json'), '{}');
+            await writeFile(join(options.cwd, 'server', 'package.json'), '{}');
+            await writeFile(join(options.cwd, 'server', 'package-lock.json'), '{}');
+            await writeFile(
+              join(options.cwd, '.releasedeck.json'),
+              JSON.stringify({
+                schemaVersion: 1,
+                applicationRoot: 'server',
+                build: 'none',
+              }),
+            );
+          }
+          return {
+            command,
+            args,
+            exitCode: 0,
+            signal: null,
+            stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+            stderr: '',
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            durationMs: 0,
+          };
+        },
+      },
+    });
+    const output = await runner.run(
+      {
+        deploymentId,
+        repositoryUrl: 'file:///fixture.git',
+        commitSha: 'a'.repeat(40),
+      },
+      {
+        onBuildReady(context) {
+          ready = true;
+          assert.equal(context.applicationRoot, 'server');
+          assert.equal(context.build, 'none');
+          assert.equal(context.packageManager, 'npm');
+          assert.equal(context.buildResult.command, 'releasedeck');
+          assert.deepEqual(context.buildResult.args, ['build', 'none']);
+          assert.match(context.buildResult.stdout, /intentionally omitted/);
+        },
+      },
+    );
+    const repositoryCalls = calls.filter((call) => call.command === 'npm');
+    assert.deepEqual(
+      repositoryCalls.map((call) => call.args),
+      [['ci'], ['test']],
+    );
+    assert.ok(
+      repositoryCalls.every((call) => call.cwd.endsWith(`${join('', 'server')}`)),
+    );
+    assert.equal(ready, true);
+    assert.equal(output.stages.at(-1)?.stage, 'BUILD');
+    assert.equal(output.stages.at(-1)?.exitCode, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('nested required BUILD retains the fixed npm command and application cwd', async () => {
+  const root = await temporaryDirectory('nested-required');
+  const npmCalls: { args: readonly string[]; cwd: string }[] = [];
+  try {
+    await createCiRunner({
+      workspaceRoot: join(root, 'workspaces'),
+      processRunner: {
+        async run(command, args, options) {
+          if (args[0] === 'init') {
+            await mkdir(join(options.cwd, 'server'));
+            await writeFile(join(options.cwd, 'server', 'package.json'), '{}');
+            await writeFile(join(options.cwd, 'server', 'package-lock.json'), '{}');
+            await writeFile(
+              join(options.cwd, '.releasedeck.json'),
+              JSON.stringify({ schemaVersion: 1, applicationRoot: 'server' }),
+            );
+          }
+          if (command === 'npm') npmCalls.push({ args, cwd: options.cwd });
+          return {
+            command,
+            args,
+            exitCode: 0,
+            signal: null,
+            stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+            stderr: '',
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            durationMs: 0,
+          };
+        },
+      },
+    }).run({
+      deploymentId,
+      repositoryUrl: 'file:///fixture.git',
+      commitSha: 'a'.repeat(40),
+    });
+    assert.deepEqual(
+      npmCalls.map((call) => call.args),
+      [['ci'], ['test'], ['run', 'build']],
+    );
+    assert.ok(npmCalls.every((call) => call.cwd.endsWith(join('', 'server'))));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('nested package detection rejects ambiguity or absence only within application root', async () => {
+  for (const mode of ['ambiguous', 'missing'] as const) {
+    const root = await temporaryDirectory(`nested-lock-${mode}`);
+    try {
+      await assert.rejects(
+        createCiRunner({
+          workspaceRoot: join(root, 'workspaces'),
+          processRunner: {
+            async run(command, args, options) {
+              if (args[0] === 'init') {
+                await mkdir(join(options.cwd, 'client'));
+                await mkdir(join(options.cwd, 'server'));
+                await writeFile(join(options.cwd, 'client', 'package.json'), '{}');
+                await writeFile(join(options.cwd, 'client', 'package-lock.json'), '{}');
+                await writeFile(join(options.cwd, 'server', 'package.json'), '{}');
+                if (mode === 'ambiguous') {
+                  await writeFile(
+                    join(options.cwd, 'server', 'package-lock.json'),
+                    '{}',
+                  );
+                  await writeFile(
+                    join(options.cwd, 'server', 'pnpm-lock.yaml'),
+                    'lockfileVersion: 9',
+                  );
+                }
+                await writeFile(
+                  join(options.cwd, '.releasedeck.json'),
+                  JSON.stringify({ schemaVersion: 1, applicationRoot: 'server' }),
+                );
+              }
+              return {
+                command,
+                args,
+                exitCode: 0,
+                signal: null,
+                stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+                stderr: '',
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                durationMs: 0,
+              };
+            },
+          },
+        }).run({
+          deploymentId,
+          repositoryUrl: 'file:///fixture.git',
+          commitSha: 'a'.repeat(40),
+        }),
+        (error: unknown) => error instanceof CiStepError && error.stage === 'INSTALL',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('nested application root requires its own regular package.json', async () => {
+  for (const mode of ['missing', 'directory'] as const) {
+    const root = await temporaryDirectory(`nested-package-${mode}`);
+    try {
+      let repositoryCommands = 0;
+      await assert.rejects(
+        createCiRunner({
+          workspaceRoot: join(root, 'workspaces'),
+          processRunner: {
+            async run(command, args, options) {
+              if (args[0] === 'init') {
+                await mkdir(join(options.cwd, 'client'));
+                await mkdir(join(options.cwd, 'server'));
+                await writeFile(join(options.cwd, 'package.json'), '{}');
+                await writeFile(join(options.cwd, 'client', 'package.json'), '{}');
+                await writeFile(join(options.cwd, 'server', 'package-lock.json'), '{}');
+                if (mode === 'directory') {
+                  await mkdir(join(options.cwd, 'server', 'package.json'));
+                }
+                await writeFile(
+                  join(options.cwd, '.releasedeck.json'),
+                  JSON.stringify({ schemaVersion: 1, applicationRoot: 'server' }),
+                );
+              }
+              if (command === 'npm' || command === 'pnpm') repositoryCommands += 1;
+              return {
+                command,
+                args,
+                exitCode: 0,
+                signal: null,
+                stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+                stderr: '',
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                durationMs: 0,
+              };
+            },
+          },
+        }).run({
+          deploymentId,
+          repositoryUrl: 'file:///fixture.git',
+          commitSha: 'a'.repeat(40),
+        }),
+        (error: unknown) => error instanceof CiStepError && error.stage === 'INSTALL',
+      );
+      assert.equal(repositoryCommands, 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('nested application root rejects a symlinked package.json', async (t) => {
+  const root = await temporaryDirectory('nested-package-symlink');
+  const outsidePackage = join(root, 'outside-package.json');
+  try {
+    await writeFile(outsidePackage, '{}');
+    try {
+      await assert.rejects(
+        createCiRunner({
+          workspaceRoot: join(root, 'workspaces'),
+          processRunner: {
+            async run(command, args, options) {
+              if (args[0] === 'init') {
+                await mkdir(join(options.cwd, 'server'));
+                await writeFile(join(options.cwd, 'server', 'package-lock.json'), '{}');
+                await symlink(
+                  outsidePackage,
+                  join(options.cwd, 'server', 'package.json'),
+                );
+                await writeFile(
+                  join(options.cwd, '.releasedeck.json'),
+                  JSON.stringify({ schemaVersion: 1, applicationRoot: 'server' }),
+                );
+              }
+              return {
+                command,
+                args,
+                exitCode: 0,
+                signal: null,
+                stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+                stderr: '',
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                durationMs: 0,
+              };
+            },
+          },
+        }).run({
+          deploymentId,
+          repositoryUrl: 'file:///fixture.git',
+          commitSha: 'a'.repeat(40),
+        }),
+        (error: unknown) => error instanceof CiStepError && error.stage === 'INSTALL',
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+      t.skip('file symlink creation is unavailable on this Windows host');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('application root is revalidated after repository stages and symlink replacement fails safely', async (t) => {
+  const root = await temporaryDirectory('application-revalidation');
+  const outside = join(root, 'outside');
+  let failedStage: string | undefined;
+  let npmCalls = 0;
+  try {
+    await mkdir(outside);
+    await assert.rejects(
+      createCiRunner({
+        workspaceRoot: join(root, 'workspaces'),
+        processRunner: {
+          async run(command, args, options) {
+            if (args[0] === 'init') {
+              await mkdir(join(options.cwd, 'server'));
+              await writeFile(join(options.cwd, 'server', 'package.json'), '{}');
+              await writeFile(join(options.cwd, 'server', 'package-lock.json'), '{}');
+              await writeFile(
+                join(options.cwd, '.releasedeck.json'),
+                JSON.stringify({ schemaVersion: 1, applicationRoot: 'server' }),
+              );
+            }
+            if (command === 'npm') {
+              npmCalls += 1;
+              if (args[0] === 'ci') {
+                await rm(options.cwd, { recursive: true });
+                try {
+                  await symlink(
+                    outside,
+                    options.cwd,
+                    process.platform === 'win32' ? 'junction' : 'dir',
+                  );
+                } catch (error) {
+                  if (
+                    process.platform === 'win32' &&
+                    (error as NodeJS.ErrnoException).code === 'EPERM'
+                  ) {
+                    t.diagnostic(
+                      'symlink creation is unavailable on this Windows host',
+                    );
+                    throw error;
+                  }
+                  throw error;
+                }
+              }
+            }
+            return {
+              command,
+              args,
+              exitCode: 0,
+              signal: null,
+              stdout: args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '',
+              stderr: '',
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              durationMs: 0,
+            };
+          },
+        },
+      }).run(
+        {
+          deploymentId,
+          repositoryUrl: 'file:///fixture.git',
+          commitSha: 'a'.repeat(40),
+        },
+        {
+          onStageFailed(stage) {
+            failedStage = stage;
+          },
+        },
+      ),
+    );
+    assert.equal(npmCalls, 1);
+    assert.equal(failedStage, 'TEST');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('install rejects missing or ambiguous supported lockfiles before commands', async () => {
   const root = await temporaryDirectory('lockfiles');
   try {
@@ -666,6 +1026,7 @@ test('install rejects missing or ambiguous supported lockfiles before commands',
       processRunner: {
         async run(command, args, options) {
           if (args[0] === 'init') {
+            await writeFile(join(options.cwd, 'package.json'), '{}');
             await writeFile(join(options.cwd, 'package-lock.json'), '{}');
             await writeFile(join(options.cwd, 'pnpm-lock.yaml'), 'lockfileVersion: 9');
           }
@@ -707,7 +1068,10 @@ test('a non-zero fixed stage stops subsequent stages and cleans the workspace', 
         async run(command, args, options) {
           calls.push(`${command} ${args.join(' ')}`);
           if (args[0] === 'init')
-            await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+            await Promise.all([
+              writeFile(join(options.cwd, 'package.json'), '{}'),
+              writeFile(join(options.cwd, 'package-lock.json'), '{}'),
+            ]);
           const exitCode = args[0] === 'test' ? 1 : 0;
           const stdout = args[0] === 'rev-parse' ? `${'a'.repeat(40)}\n` : '';
           return {

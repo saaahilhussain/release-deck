@@ -64,10 +64,11 @@ function executor(check: () => Promise<void>): BuildExecutor {
       await check();
       return {
         workspacePath,
-        run: async (_stage, _manager, options) => {
+        run: async (_stage, _manager, _workingDirectory, options) => {
           assert.equal(options.githubCredential, undefined);
           return result();
         },
+        completeBuild: async () => result(),
         collect: async () => undefined,
         close: async () => undefined,
       };
@@ -262,7 +263,10 @@ for (const authenticated of [false, true]) {
       async run(command, args, options) {
         assert.equal(command, 'git');
         if (args[0] === 'init')
-          await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+          await Promise.all([
+            writeFile(join(options.cwd, 'package.json'), '{}'),
+            writeFile(join(options.cwd, 'package-lock.json'), '{}'),
+          ]);
         if (args[0] === 'remote') assert.equal(args.at(-1), url);
         if (args[0] === 'fetch') {
           assert.equal(args.at(-1), sha);
@@ -325,7 +329,10 @@ test('public fetch with configured App does not mint a token; missing auth confi
     const processRunner: ProcessRunner = {
       async run(_command, args, options) {
         if (args[0] === 'init')
-          await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+          await Promise.all([
+            writeFile(join(options.cwd, 'package.json'), '{}'),
+            writeFile(join(options.cwd, 'package-lock.json'), '{}'),
+          ]);
         return result({
           stdout: args[0] === 'rev-parse' ? sha : '',
           ...(requiresAuth && args[0] === 'fetch'
@@ -515,7 +522,10 @@ test('private runner integrates real JWT signing, mocked token HTTP, authenticat
       processRunner: {
         async run(_command, args, options) {
           if (args[0] === 'init')
-            await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+            await Promise.all([
+              writeFile(join(options.cwd, 'package.json'), '{}'),
+              writeFile(join(options.cwd, 'package-lock.json'), '{}'),
+            ]);
           if (args[0] === 'fetch') {
             if (!options.githubCredential)
               return result({ exitCode: 128, stderr: authRequired });

@@ -139,7 +139,7 @@ print('repository command completed')
                     raise AssertionError('concurrent job was admitted')
                 for stage in ['INSTALL','TEST','BUILD']:
                     request = dict(op='run',jobId=job_id,stage=stage,manager='npm',
-                                   timeoutMs=1000 if mode=='timeout' else 10000,outputLimitBytes=1024)
+                                   workingDirectory='.', timeoutMs=1000 if mode=='timeout' else 10000,outputLimitBytes=1024)
                     if mode=='cancel':
                         with concurrent.futures.ThreadPoolExecutor(1) as pool:
                             future=pool.submit(launcher.handle,request)
@@ -164,16 +164,175 @@ print('repository command completed')
                         break
                 launcher.no_processes()
                 if mode=='success':
-                    launcher.handle(dict(op='collect',jobId=job_id))
+                    try:
+                        launcher.handle(dict(op='completeBuild',jobId=job_id,stage='BUILD',manager='npm',workingDirectory='.'))
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError('successful BUILD was completed again')
+                    launcher.handle(dict(op='collect',jobId=job_id,manager='npm',workingDirectory='.'))
                     assert workspace.stat().st_uid==worker.pw_uid
                     assert workspace.stat().st_mode & 0o777 == 0o700
                     assert not (workspace/'.git').exists()
+                if mode=='INSTALL':
+                    try:
+                        launcher.handle(dict(op='run',jobId=job_id,stage='INSTALL',manager='pnpm',
+                                             workingDirectory='.',timeoutMs=10000,outputLimitBytes=1024))
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError('package manager changed after a failed stage')
+                if mode=='BUILD':
+                    for invalid in [
+                        dict(op='completeBuild',jobId=job_id,stage='BUILD',manager='npm',workingDirectory='.'),
+                        dict(op='collect',jobId=job_id,manager='npm',workingDirectory='.'),
+                    ]:
+                        try:
+                            launcher.handle(invalid)
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError('failed BUILD was converted to success or collected')
             finally:
                 launcher.handle(dict(op='close',jobId=job_id))
                 active_id=None
             launcher.no_processes()
             assert not workspace.exists() and not launcher.active.exists()
             print('PASS: '+mode+' kills detached background child, revokes workspace, and unlocks only after cleanup',flush=True)
+        job_id = str(uuid.uuid4())
+        source = base/'checkout'/('releasedeck-'+job_id)
+        application = source/'server'
+        application.mkdir(parents=True, mode=0o700)
+        unicode_directory = '服务/应用'
+        boundary_directory = 'é'*100 + '/' + 'é'*100 + '/' + 'é'*55
+        (source/unicode_directory).mkdir(parents=True)
+        (source/boundary_directory).mkdir(parents=True)
+        program = "print('nested application command completed')\n"
+        for name in ['ci', 'test', 'run']:
+            (application/name).write_text(program)
+        launcher.own_tree(source, worker.pw_uid, worker.pw_gid)
+        reply = launcher.handle(dict(op='open',jobId=job_id,workspacePath=str(source)))
+        active_id = job_id
+        workspace = pathlib.Path(reply['workspacePath'])
+        try:
+            for invalid in [
+                dict(op='completeBuild',jobId=job_id,stage='BUILD',manager='npm',workingDirectory='server'),
+                dict(op='completeBuild',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='server'),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='../server',timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='C:/server',timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='server\\nested',timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='x'*513,timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='\ud800',timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='\udc00',timeoutMs=10000,outputLimitBytes=1024),
+                dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',workingDirectory='é'*257,timeoutMs=10000,outputLimitBytes=1024),
+            ]:
+                try:
+                    launcher.handle(invalid)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError('invalid stage completion or working directory was admitted')
+            assert launcher.validate_working_directory(launcher.root/job_id, unicode_directory) == '/workspace/'+unicode_directory
+            assert len(boundary_directory.encode('utf-8')) == module.MAX_WORKING_DIRECTORY_BYTES
+            assert launcher.validate_working_directory(launcher.root/job_id, boundary_directory) == '/workspace/'+boundary_directory
+            install = launcher.handle(dict(op='run',jobId=job_id,stage='INSTALL',manager='npm',
+                                            workingDirectory='server',timeoutMs=10000,outputLimitBytes=1024))
+            assert install['result']['exitCode'] == 0
+            try:
+                launcher.handle(dict(op='run',jobId=job_id,stage='TEST',manager='pnpm',
+                                     workingDirectory='server',timeoutMs=10000,outputLimitBytes=1024))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('package manager changed between stages')
+            try:
+                launcher.handle(dict(op='run',jobId=job_id,stage='TEST',manager='npm',
+                                     workingDirectory='.',timeoutMs=10000,outputLimitBytes=1024))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('working directory changed between stages')
+            shutil.rmtree(workspace/'server')
+            (workspace/'server').symlink_to(base)
+            try:
+                launcher.handle(dict(op='run',jobId=job_id,stage='TEST',manager='npm',
+                                     workingDirectory='server',timeoutMs=10000,outputLimitBytes=1024))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('symlinked working directory was admitted')
+            (workspace/'server').unlink()
+            (workspace/'server').mkdir()
+            for name in ['test', 'run']:
+                (workspace/'server'/name).write_text(program)
+            launcher.own_tree(workspace, builder.pw_uid, builder.pw_gid)
+            tested = launcher.handle(dict(op='run',jobId=job_id,stage='TEST',manager='npm',
+                                          workingDirectory='server',timeoutMs=10000,outputLimitBytes=1024))
+            assert tested['result']['exitCode'] == 0
+            completed = launcher.handle(dict(op='completeBuild',jobId=job_id,stage='BUILD',
+                                             manager='npm',workingDirectory='server'))
+            assert completed['result']['command'] == 'releasedeck'
+            assert completed['result']['args'] == ['build', 'none']
+            try:
+                launcher.handle(dict(op='completeBuild',jobId=job_id,stage='BUILD',
+                                     manager='npm',workingDirectory='server'))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('BUILD was completed twice')
+            shutil.rmtree(workspace/'server')
+            (workspace/'server').symlink_to(base)
+            try:
+                launcher.handle(dict(op='collect',jobId=job_id,manager='npm',workingDirectory='server'))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('collection admitted a symlinked application root')
+            (workspace/'server').unlink()
+            (workspace/'server').mkdir()
+            launcher.own_tree(workspace, builder.pw_uid, builder.pw_gid)
+            launcher.handle(dict(op='collect',jobId=job_id,manager='npm',workingDirectory='server'))
+            assert workspace.stat().st_uid == worker.pw_uid
+        finally:
+            launcher.handle(dict(op='close',jobId=job_id))
+            active_id = None
+        print('PASS: nested working directory, manager pinning, Unicode validation, symlink revalidation, and BUILD-none sequence enforced', flush=True)
+        job_id = str(uuid.uuid4())
+        source = base/'checkout'/('releasedeck-'+job_id)
+        source.mkdir(mode=0o700)
+        for name in ['install', 'test', 'run']:
+            (source/name).write_text("print('pnpm stage completed')\n")
+        launcher.own_tree(source, worker.pw_uid, worker.pw_gid)
+        reply = launcher.handle(dict(op='open',jobId=job_id,workspacePath=str(source)))
+        active_id = job_id
+        workspace = pathlib.Path(reply['workspacePath'])
+        try:
+            installed = launcher.handle(dict(op='run',jobId=job_id,stage='INSTALL',manager='pnpm',
+                                              workingDirectory='.',timeoutMs=10000,outputLimitBytes=1024))
+            assert installed['result']['exitCode'] == 0
+            try:
+                launcher.handle(dict(op='run',jobId=job_id,stage='TEST',manager='npm',
+                                     workingDirectory='.',timeoutMs=10000,outputLimitBytes=1024))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('pnpm session admitted npm')
+            for stage in ['TEST', 'BUILD']:
+                response = launcher.handle(dict(op='run',jobId=job_id,stage=stage,manager='pnpm',
+                                                workingDirectory='.',timeoutMs=10000,outputLimitBytes=1024))
+                assert response['result']['exitCode'] == 0
+            try:
+                launcher.handle(dict(op='completeBuild',jobId=job_id,stage='BUILD',manager='pnpm',workingDirectory='.'))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('successful pnpm BUILD was completed again')
+            launcher.handle(dict(op='collect',jobId=job_id,manager='pnpm',workingDirectory='.'))
+            assert workspace.stat().st_uid == worker.pw_uid
+        finally:
+            launcher.handle(dict(op='close',jobId=job_id))
+            active_id = None
+        print('PASS: pnpm is pinned across all required stages and cannot change to npm', flush=True)
         print('PASS: REAL LINUX SYSTEMD BUILD BOUNDARY VERIFIER',flush=True)
     finally:
         if active_id:

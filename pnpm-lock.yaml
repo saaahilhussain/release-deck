@@ -124,6 +124,10 @@ importers:
         version: 6.0.3
 
   packages/ci-runner:
+    dependencies:
+      '@releasedeck/project-config':
+        specifier: workspace:*
+        version: link:../project-config
     devDependencies:
       '@releasedeck/tsconfig':
         specifier: workspace:*
@@ -176,7 +180,26 @@ importers:
         specifier: ^6.0.3
         version: 6.0.3
 
+  packages/project-config:
+    devDependencies:
+      '@releasedeck/tsconfig':
+        specifier: workspace:*
+        version: link:../tsconfig
+      '@types/node':
+        specifier: ^24.10.1
+        version: 24.13.4
+      tsx:
+        specifier: ^4.20.5
+        version: 4.23.13
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+
   packages/release-deployer:
+    dependencies:
+      '@releasedeck/project-config':
+        specifier: workspace:*
+        version: link:../project-config
     devDependencies:
       '@releasedeck/tsconfig':
         specifier: workspace:*

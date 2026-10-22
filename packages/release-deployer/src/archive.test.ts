@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -97,7 +105,13 @@ test('real archive preserves application files and only trusted release metadata
       .split(/\r?\n/)
       .filter(Boolean)
       .map((name) => name.replace(/^\.\//, ''));
-    for (const name of ['project-id', 'deployment-id', 'commit-sha']) {
+    for (const name of [
+      'project-id',
+      'deployment-id',
+      'commit-sha',
+      'application-root',
+      'build',
+    ]) {
       assert.equal(
         entries.filter((entry) => entry === `.releasedeck-release/${name}`).length,
         1,
@@ -121,6 +135,8 @@ test('real archive preserves application files and only trusted release metadata
       ['project-id', metadata.projectId],
       ['deployment-id', metadata.deploymentId],
       ['commit-sha', metadata.commitSha],
+      ['application-root', '.'],
+      ['build', 'required'],
     ]) {
       assert.equal(
         await readFile(join(extracted, '.releasedeck-release', name!), 'utf8'),
@@ -154,6 +170,8 @@ tar -xzf "$archive" -C "$scratch"
 test "$(cat "$scratch/.releasedeck-release/project-id")" = "$2"
 test "$(cat "$scratch/.releasedeck-release/deployment-id")" = "$3"
 test "$(cat "$scratch/.releasedeck-release/commit-sha")" = "$4"
+test "$(cat "$scratch/.releasedeck-release/application-root")" = .
+test "$(cat "$scratch/.releasedeck-release/build")" = required
 test -f "$scratch/ecosystem.config.cjs"
 test -f "$scratch/dist/server.mjs"
 test ! -e "$scratch/.releasedeck-release/attacker-only"
@@ -256,6 +274,169 @@ test('preparation still rejects workspace-contained artifacts and invalid ecosys
       /ecosystem.config.cjs is required/,
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('nested application preparation requires its ecosystem and keeps the full workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'releasedeck-nested-archive-'));
+  const workspacePath = join(root, 'workspace');
+  const artifactRoot = join(root, 'artifacts');
+  const extracted = join(root, 'extracted');
+  try {
+    await mkdir(join(workspacePath, 'server', 'node_modules', 'bcrypt'), {
+      recursive: true,
+    });
+    await mkdir(join(workspacePath, 'client'), { recursive: true });
+    await mkdir(join(workspacePath, 'server', 'node_modules', '.cache'), {
+      recursive: true,
+    });
+    await mkdir(extracted);
+    await writeFile(
+      join(workspacePath, 'ecosystem.config.cjs'),
+      'module.exports = { apps: [] };',
+    );
+    await writeFile(join(workspacePath, 'client', 'source.js'), 'unused frontend');
+    await writeFile(
+      join(workspacePath, '.releasedeck.json'),
+      '{"schemaVersion":1,"applicationRoot":"server","build":"none"}',
+    );
+    await writeFile(
+      join(workspacePath, 'server', 'node_modules', 'bcrypt', 'index.js'),
+      'runtime dependency',
+    );
+    await writeFile(
+      join(workspacePath, 'server', 'node_modules', '.cache', 'excluded'),
+      'cache',
+    );
+    await assert.rejects(
+      prepareRelease({
+        ...metadata,
+        workspacePath,
+        artifactRoot,
+        applicationRoot: 'server',
+        build: 'none',
+      }),
+      /ecosystem.config.cjs is required/,
+    );
+    await writeFile(
+      join(workspacePath, 'server', 'ecosystem.config.cjs'),
+      'module.exports = { apps: [] };',
+    );
+    const prepared = await prepareRelease({
+      ...metadata,
+      workspacePath,
+      artifactRoot,
+      applicationRoot: 'server',
+      build: 'none',
+    });
+    assert.equal(prepared.applicationRoot, 'server');
+    assert.equal(prepared.build, 'none');
+    const result = await defaultCommandExecutor.run(
+      'tar',
+      ['-xzf', 'release.tar.gz', '-C', extracted.replaceAll('\\', '/')],
+      {
+        cwd: dirname(prepared.archivePath),
+        timeoutMs: 10000,
+        outputLimitBytes: 4096,
+      },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(
+      await readFile(join(extracted, 'client', 'source.js'), 'utf8'),
+      'unused frontend',
+    );
+    assert.match(
+      await readFile(join(extracted, '.releasedeck.json'), 'utf8'),
+      /"applicationRoot":"server"/,
+    );
+    assert.equal(
+      await readFile(
+        join(extracted, 'server', 'node_modules', 'bcrypt', 'index.js'),
+        'utf8',
+      ),
+      'runtime dependency',
+    );
+    await assert.rejects(
+      access(join(extracted, 'server', 'node_modules', '.cache', 'excluded')),
+    );
+    assert.equal(
+      await readFile(
+        join(extracted, '.releasedeck-release', 'application-root'),
+        'utf8',
+      ),
+      'server',
+    );
+    assert.equal(
+      await readFile(join(extracted, '.releasedeck-release', 'build'), 'utf8'),
+      'none',
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('concurrent publication rejects a losing caller with a conflicting build plan', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'releasedeck-publication-race-'));
+  const workspacePath = join(root, 'workspace');
+  const artifactRoot = join(root, 'artifacts');
+  let gzipArrivals = 0;
+  let releaseBarrier: (() => void) | undefined;
+  const barrier = new Promise<void>((resolveBarrier) => {
+    releaseBarrier = resolveBarrier;
+  });
+  const executor: CommandExecutor = {
+    async run(command, args, options) {
+      const result = await defaultCommandExecutor.run(command, args, options);
+      if (command === 'gzip') {
+        gzipArrivals += 1;
+        if (gzipArrivals === 2) releaseBarrier?.();
+        await barrier;
+      }
+      return result;
+    },
+  };
+  try {
+    await mkdir(join(workspacePath, 'server'), { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(workspacePath, 'ecosystem.config.cjs'),
+        'module.exports = { apps: [] };',
+      ),
+      writeFile(
+        join(workspacePath, 'server', 'ecosystem.config.cjs'),
+        'module.exports = { apps: [] };',
+      ),
+    ]);
+    const plans = [
+      { applicationRoot: '.', build: 'required' as const },
+      { applicationRoot: 'server', build: 'none' as const },
+    ] as const;
+    const outcomes = await Promise.allSettled(
+      plans.map((plan) =>
+        prepareRelease({ ...metadata, ...plan, workspacePath, artifactRoot }, executor),
+      ),
+    );
+    assert.equal(gzipArrivals, 2);
+    const fulfilled = outcomes.filter(
+      (
+        outcome,
+      ): outcome is PromiseFulfilledResult<
+        Awaited<ReturnType<typeof prepareRelease>>
+      > => outcome.status === 'fulfilled',
+    );
+    const rejected = outcomes.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected',
+    );
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.match(String(rejected[0]!.reason), /build plan does not match/);
+    const winner = fulfilled[0]!.value;
+    const requestedWinner = plans[outcomes.indexOf(fulfilled[0]!)];
+    assert.equal(winner.applicationRoot, requestedWinner!.applicationRoot);
+    assert.equal(winner.build, requestedWinner!.build);
+  } finally {
+    releaseBarrier?.();
     await rm(root, { recursive: true, force: true });
   }
 });

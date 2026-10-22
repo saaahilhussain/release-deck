@@ -24,6 +24,7 @@ import uuid
 CONFIG = "/etc/releasedeck/build-executor.json"
 STAGES = ["INSTALL", "TEST", "BUILD"]
 SYSTEM_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+MAX_WORKING_DIRECTORY_BYTES = 512
 
 
 def require(value):
@@ -144,7 +145,29 @@ class Launcher:
         require(result.stdout.strip() in [b"inactive", b"failed", b""])
         self.no_processes()
 
-    def properties(self, job_id, base, timeout_ms):
+    def validate_working_directory(self, base, value):
+        require(isinstance(value, str))
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RuntimeError("build boundary rejected operation") from None
+        require(0 < len(encoded) <= MAX_WORKING_DIRECTORY_BYTES)
+        require(not value.startswith("/") and "\\" not in value and not re.match(r"^[A-Za-z]:", value))
+        require(not any(ord(char) <= 0x1f or ord(char) == 0x7f for char in value))
+        parts = [] if value == "." else value.split("/")
+        require(value == "." or all(part not in ["", ".", ".."] for part in parts))
+        workspace = base / "workspace"
+        current = workspace
+        workspace_info = workspace.lstat()
+        require(stat.S_ISDIR(workspace_info.st_mode) and not stat.S_ISLNK(workspace_info.st_mode))
+        for part in parts:
+            current = current / part
+            info = current.lstat()
+            require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode))
+        require(current.resolve(strict=True).is_relative_to(workspace.resolve(strict=True)))
+        return "/workspace" if value == "." else "/workspace/" + value
+
+    def properties_for_directory(self, job_id, base, timeout_ms, working_directory):
         workspace = base / "workspace"
         rootfs = base / "rootfs"
         # Only operating-system/runtime paths and this job's workspace are mounted.
@@ -160,7 +183,7 @@ class Launcher:
         readonly += self.config["runtimePaths"]
         props = {
             "User": self.builder.pw_name, "Group": str(self.builder.pw_gid),
-            "WorkingDirectory": "/workspace", "RootDirectory": str(rootfs),
+            "WorkingDirectory": self.validate_working_directory(base, working_directory), "RootDirectory": str(rootfs),
             "BindPaths": str(workspace) + ":/workspace",
             "BindReadOnlyPaths": " ".join(readonly), "MountAPIVFS": "yes",
             "KillMode": "control-group", "SendSIGKILL": "yes", "TimeoutStopSec": "5s",
@@ -178,10 +201,10 @@ class Launcher:
         }
         return ["--property=" + key + "=" + value for key, value in props.items()]
 
-    def execute(self, job_id, base, command, timeout_ms, limit):
+    def execute(self, job_id, base, command, timeout_ms, limit, working_directory="."):
         args = ["/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
                 "--service-type=exec", "--unit=" + self.unit(job_id)]
-        args += self.properties(job_id, base, timeout_ms)
+        args += self.properties_for_directory(job_id, base, timeout_ms, working_directory)
         # env -i also excludes any administrator-set systemd DefaultEnvironment;
         # only these nonsecret, derived values become the repository environment.
         args += ["--", "/usr/bin/env", "-i"]
@@ -254,7 +277,9 @@ class Launcher:
         self.active.mkdir(mode=0o700)  # Cross-process, host-wide fail-closed mutex.
         base = self.root / job_id
         try:
-            self.save({"jobId": job_id, "nextStage": 0, "collected": False})
+            self.save({"jobId": job_id, "nextStage": 0, "collected": False,
+                       "workingDirectory": None, "manager": None,
+                       "buildState": "notAttempted"})
             base.mkdir(mode=0o711)
             (base / "rootfs").mkdir(mode=0o755)
             # Checkout is never executed with the build UID. Its .git/config and
@@ -333,8 +358,9 @@ else:raise RuntimeError('network filter missing')
         op = request.get("op")
         expected = {
             "probe": {"op"}, "open": {"op", "jobId", "workspacePath"},
-            "run": {"op", "jobId", "stage", "manager", "timeoutMs", "outputLimitBytes"},
-            "cancel": {"op", "jobId"}, "collect": {"op", "jobId"}, "close": {"op", "jobId"},
+            "run": {"op", "jobId", "stage", "manager", "workingDirectory", "timeoutMs", "outputLimitBytes"},
+            "completeBuild": {"op", "jobId", "stage", "manager", "workingDirectory"},
+            "cancel": {"op", "jobId"}, "collect": {"op", "jobId", "manager", "workingDirectory"}, "close": {"op", "jobId"},
         }
         require(op in expected and set(request) == expected[op])
         if op == "cancel":
@@ -358,11 +384,36 @@ else:raise RuntimeError('network filter missing')
             if op == "collect":
                 require(data["nextStage"] == 3 and not (self.active / "running").exists())
                 require(not (self.active / "cancelled").exists())
+                require(data["buildState"] in ["succeeded", "omitted"])
+                require(request["manager"] in ["npm", "pnpm"])
+                require(request["manager"] == data["manager"])
+                require(request["workingDirectory"] == data["workingDirectory"])
+                self.validate_working_directory(base, request["workingDirectory"])
                 self.stop(data["jobId"])
                 self.own_tree(base / "workspace", self.worker.pw_uid, self.worker.pw_gid)
                 data["collected"] = True
                 self.save(data)
                 return {}
+            if op == "completeBuild":
+                require(not data["collected"] and not (self.active / "running").exists())
+                require(not (self.active / "cancelled").exists())
+                require(request["stage"] == "BUILD" and data["nextStage"] == 2)
+                require(data["buildState"] == "notAttempted")
+                require(request["manager"] in ["npm", "pnpm"])
+                require(request["manager"] == data["manager"])
+                require(request["workingDirectory"] == data["workingDirectory"])
+                self.validate_working_directory(base, request["workingDirectory"])
+                self.stop(data["jobId"])
+                data["nextStage"] = 3
+                data["buildState"] = "omitted"
+                self.save(data)
+                return {"result": {
+                    "command": "releasedeck", "args": ["build", "none"],
+                    "exitCode": 0, "signal": None,
+                    "stdout": "Build intentionally omitted by trusted ReleaseDeck plan\n",
+                    "stderr": "", "stdoutTruncated": False,
+                    "stderrTruncated": False, "durationMs": 0,
+                }}
             require(op == "run" and not data["collected"])
             require(not (self.active / "cancelled").exists())
             stage = request["stage"]
@@ -373,6 +424,20 @@ else:raise RuntimeError('network filter missing')
             limit = request["outputLimitBytes"]
             require(type(timeout) is int and 1 <= timeout <= 86_400_000)
             require(type(limit) is int and 1 <= limit <= 1_048_576)
+            working_directory = request["workingDirectory"]
+            self.validate_working_directory(base, working_directory)
+            if data["nextStage"] == 0:
+                require(data["workingDirectory"] is None and data["manager"] is None)
+                data["workingDirectory"] = working_directory
+                data["manager"] = manager
+                self.save(data)
+            else:
+                require(working_directory == data["workingDirectory"])
+                require(manager == data["manager"])
+            if stage == "BUILD":
+                require(data["buildState"] == "notAttempted")
+                data["buildState"] = "attempted"
+                self.save(data)
             marker = self.active / "running"
             fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
@@ -380,11 +445,19 @@ else:raise RuntimeError('network filter missing')
             require(not (self.active / "cancelled").exists())
             args = (["ci"] if manager == "npm" else ["install", "--frozen-lockfile"]) if stage == "INSTALL" else (["test"] if stage == "TEST" else ["run", "build"])
             result, timed_out = self.execute(data["jobId"], base,
-                                             [self.config["commands"][manager]] + args, timeout, limit)
+                                             [self.config["commands"][manager]] + args, timeout, limit,
+                                             working_directory)
+            if stage == "BUILD":
+                data["buildState"] = "succeeded" if result["exitCode"] == 0 else "failed"
             if result["exitCode"] == 0:
                 data["nextStage"] += 1
-                self.save(data)
+            self.save(data)
             return {"result": result, "timedOut": timed_out}
+        except BaseException:
+            if stage == "BUILD" and data["buildState"] == "attempted":
+                data["buildState"] = "failed"
+                self.save(data)
+            raise
         finally:
             self.stop(data["jobId"])
             marker.unlink(missing_ok=True)

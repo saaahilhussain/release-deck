@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "pnpm run build:dependencies && turbo run dev",
     "build": "turbo run build",
-    "build:dependencies": "pnpm --filter @releasedeck/runtime build && pnpm --filter @releasedeck/db build && pnpm --filter @releasedeck/queue build && pnpm --filter @releasedeck/ci-runner build && pnpm --filter @releasedeck/release-deployer build",
+    "build:dependencies": "pnpm --filter @releasedeck/project-config build && pnpm --filter @releasedeck/runtime build && pnpm --filter @releasedeck/db build && pnpm --filter @releasedeck/queue build && pnpm --filter @releasedeck/ci-runner build && pnpm --filter @releasedeck/release-deployer build",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "lint": "turbo run lint && eslint scripts/*.mjs eslint.config.mjs",

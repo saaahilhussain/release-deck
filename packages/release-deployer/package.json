@@ -21,6 +21,9 @@
     "lint": "eslint .",
     "test": "pnpm run build && node --test dist/*.test.js"
   },
+  "dependencies": {
+    "@releasedeck/project-config": "workspace:*"
+  },
   "devDependencies": {
     "@releasedeck/tsconfig": "workspace:*",
     "@types/node": "^24.10.1",

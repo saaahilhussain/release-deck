@@ -211,6 +211,8 @@ function harness(
         commitSha,
         archivePath: 'D:\\artifacts\\release.tar.gz',
         metadataPath: 'D:\\artifacts\\metadata.json',
+        applicationRoot: '.',
+        build: 'required',
         archiveSha256: 'b'.repeat(64),
       };
     },

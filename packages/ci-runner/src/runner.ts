@@ -1,5 +1,11 @@
-import { access } from 'node:fs/promises';
+import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
+
+import {
+  readReleaseDeckBuildPlan,
+  resolveApplicationRoot,
+  type ReleaseBuildMode,
+} from '@releasedeck/project-config';
 import type { BuildExecutor, BuildSession } from './build-executor.js';
 import type { GitHubAppAuth } from './github-app-auth.js';
 import {
@@ -62,6 +68,8 @@ export interface CiBuildReadyContext {
   readonly commitSha: string;
   readonly workspacePath: string;
   readonly packageManager: PackageManager;
+  readonly applicationRoot: string;
+  readonly build: ReleaseBuildMode;
   readonly buildResult: CiStageResult;
 }
 
@@ -172,20 +180,40 @@ function stepCommand(
   return manager === 'pnpm' ? ['pnpm', ['run', 'build']] : ['npm', ['run', 'build']];
 }
 
-async function detectPackageManager(workspacePath: string): Promise<PackageManager> {
+async function detectPackageManager(
+  workspacePath: string,
+  applicationRoot: string,
+): Promise<PackageManager> {
+  const applicationPath = await resolveApplicationRoot(workspacePath, applicationRoot);
+  const regularFile = (path: string) =>
+    lstat(path).then(
+      (info) => info.isFile() && !info.isSymbolicLink(),
+      () => false,
+    );
   const [pnpm, npm] = await Promise.all([
-    access(join(workspacePath, 'pnpm-lock.yaml')).then(
-      () => true,
-      () => false,
-    ),
-    access(join(workspacePath, 'package-lock.json')).then(
-      () => true,
-      () => false,
-    ),
+    regularFile(join(applicationPath, 'pnpm-lock.yaml')),
+    regularFile(join(applicationPath, 'package-lock.json')),
   ]);
+  if (!(await regularFile(join(applicationPath, 'package.json')))) {
+    throw new Error('application root package.json must be a regular file');
+  }
   if (pnpm === npm)
     throw new Error('exactly one supported package lockfile is required');
   return pnpm ? 'pnpm' : 'npm';
+}
+
+function omittedBuildResult(): ProcessResult {
+  return {
+    command: 'releasedeck',
+    args: ['build', 'none'],
+    exitCode: 0,
+    signal: null,
+    stdout: 'Build intentionally omitted by trusted ReleaseDeck plan\n',
+    stderr: '',
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    durationMs: 0,
+  };
 }
 
 function boundedText(
@@ -269,6 +297,8 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
       let processTerminationFailed = false;
       let buildSession: BuildSession | undefined;
       let buildWorkspacePath = workspace.path;
+      let applicationRoot = '.';
+      let buildMode: ReleaseBuildMode;
 
       const runProcess = async (
         stage: CiStage,
@@ -278,18 +308,21 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         const deadline = stageDeadlines.get(stage);
         const remainingTimeout =
           deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
-        const processOptions = {
-          cwd: stage === 'CHECKOUT' ? workspace.path : buildWorkspacePath,
-          signal: controller.signal,
-          ...(remainingTimeout === undefined ? {} : { timeoutMs: remainingTimeout }),
-          ...(limits.killGraceMs === undefined
-            ? {}
-            : { killGraceMs: limits.killGraceMs }),
-          ...(limits.outputLimitBytes === undefined
-            ? {}
-            : { outputLimitBytes: limits.outputLimitBytes }),
-        } as ProcessOptions;
         try {
+          const processOptions = {
+            cwd:
+              stage === 'CHECKOUT'
+                ? workspace.path
+                : await resolveApplicationRoot(buildWorkspacePath, applicationRoot),
+            signal: controller.signal,
+            ...(remainingTimeout === undefined ? {} : { timeoutMs: remainingTimeout }),
+            ...(limits.killGraceMs === undefined
+              ? {}
+              : { killGraceMs: limits.killGraceMs }),
+            ...(limits.outputLimitBytes === undefined
+              ? {}
+              : { outputLimitBytes: limits.outputLimitBytes }),
+          } as ProcessOptions;
           if (stage === 'CHECKOUT' && args[0] === 'fetch') {
             const result = await processRunner.run(command, args, processOptions);
             if (!requiresGitHubAuthentication(input.repositoryUrl, result))
@@ -318,7 +351,12 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
             };
           }
           return stage !== 'CHECKOUT' && buildSession
-            ? await buildSession.run(stage, command as PackageManager, processOptions)
+            ? await buildSession.run(
+                stage,
+                command as PackageManager,
+                applicationRoot,
+                processOptions,
+              )
             : await processRunner.run(command, args, processOptions);
         } catch (error) {
           if (error instanceof ProcessTerminationError) processTerminationFailed = true;
@@ -387,11 +425,14 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
         await startStage('INSTALL');
         let packageManager: PackageManager;
         try {
-          packageManager = await detectPackageManager(workspace.path);
+          const plan = await readReleaseDeckBuildPlan(workspace.path);
+          applicationRoot = plan.applicationRoot;
+          buildMode = plan.build;
+          packageManager = await detectPackageManager(workspace.path, applicationRoot);
         } catch {
           const stageError = new CiStepError(
             'INSTALL',
-            'supported lockfile policy was not satisfied',
+            'ReleaseDeck manifest or supported lockfile policy was not satisfied',
           );
           await hooks.onStageFailed?.('INSTALL', stageError);
           throw stageError;
@@ -401,9 +442,31 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
             buildSession = await options.buildExecutor.open(workspace.path);
             buildWorkspacePath = buildSession.workspacePath;
           }
-          const [command, args] = stepCommand(stage, packageManager);
           if (stage !== 'INSTALL') await startStage(stage);
-          const result = await runProcess(stage, command, args);
+          let result: ProcessResult;
+          if (stage === 'BUILD' && buildMode === 'none') {
+            try {
+              if (controller.signal.aborted) {
+                const cancelled = new ProcessCancelledError({
+                  ...omittedBuildResult(),
+                  exitCode: null,
+                });
+                throw totalTimedOut
+                  ? new ProcessTimeoutError(cancelled.result)
+                  : cancelled;
+              }
+              await resolveApplicationRoot(buildWorkspacePath, applicationRoot);
+              result = buildSession
+                ? await buildSession.completeBuild(packageManager, applicationRoot)
+                : omittedBuildResult();
+            } catch (error) {
+              await hooks.onStageFailed?.('BUILD', error);
+              throw error;
+            }
+          } else {
+            const [command, args] = stepCommand(stage, packageManager);
+            result = await runProcess(stage, command, args);
+          }
           const stageResult: CiStageResult = { ...result, stage };
           stages.push(stageResult);
           if (stageResult.exitCode !== 0) {
@@ -417,12 +480,15 @@ export function createCiRunner(options: CiRunnerOptions): CiRunner {
           }
           if (stage === 'BUILD' && hooks.onBuildReady) {
             try {
-              await buildSession?.collect();
+              await resolveApplicationRoot(buildWorkspacePath, applicationRoot);
+              await buildSession?.collect(packageManager, applicationRoot);
               await hooks.onBuildReady({
                 deploymentId: input.deploymentId,
                 commitSha: input.commitSha,
                 workspacePath: buildWorkspacePath,
                 packageManager,
+                applicationRoot,
+                build: buildMode,
                 buildResult: stageResult,
               });
             } catch (cause) {

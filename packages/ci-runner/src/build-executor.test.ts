@@ -88,18 +88,33 @@ test('systemd adapter sends only a fixed operation contract and holds one job un
   const requests: LauncherRequest[] = [];
   const executor = createSystemdBuildExecutor('/trusted/launcher', async (request) => {
     requests.push(request);
-    return { ok: true, workspacePath: resolve('restricted'), result: result() };
+    return {
+      ok: true,
+      workspacePath: resolve('restricted'),
+      result:
+        request.op === 'completeBuild'
+          ? result({
+              command: 'releasedeck',
+              args: ['build', 'none'],
+              stdout: 'Build intentionally omitted by trusted ReleaseDeck plan\n',
+              durationMs: 0,
+            })
+          : result(),
+    };
   });
   await executor.probe();
   const session = await executor.open(resolve('checkout'));
   await assert.rejects(executor.open(resolve('other')), /one job/);
-  await session.run('INSTALL', 'npm', { cwd: session.workspacePath });
-  await session.collect();
+  await session.run('INSTALL', 'npm', 'server', { cwd: session.workspacePath });
+  await session.run('TEST', 'npm', 'server', { cwd: session.workspacePath });
+  const completed = await session.completeBuild('npm', 'server');
+  assert.equal(completed.stdout.includes('intentionally omitted'), true);
+  await session.collect('npm', 'server');
   await session.close();
   await session.close();
   assert.deepEqual(
     requests.map((x) => x.op),
-    ['probe', 'open', 'run', 'collect', 'close'],
+    ['probe', 'open', 'run', 'run', 'completeBuild', 'collect', 'close'],
   );
   assert.deepEqual(Object.keys(requests[2]!).sort(), [
     'jobId',
@@ -108,8 +123,17 @@ test('systemd adapter sends only a fixed operation contract and holds one job un
     'outputLimitBytes',
     'stage',
     'timeoutMs',
+    'workingDirectory',
   ]);
   assert.equal(JSON.stringify(requests).includes('GITHUB'), false);
+  assert.equal(requests[3]!.workingDirectory, 'server');
+  assert.deepEqual(Object.keys(requests[4]!).sort(), [
+    'jobId',
+    'manager',
+    'op',
+    'stage',
+    'workingDirectory',
+  ]);
 });
 
 test('systemd adapter preserves timeout and cancellation semantics and awaits cgroup cancellation', async () => {
@@ -136,7 +160,7 @@ test('systemd adapter preserves timeout and cancellation semantics and awaits cg
     );
     const session = await executor.open(resolve('checkout'));
     await assert.rejects(
-      session.run('TEST', 'npm', {
+      session.run('TEST', 'npm', '.', {
         cwd: session.workspacePath,
         signal: controller.signal,
       }),
@@ -157,7 +181,7 @@ test('unavailable, malformed and failed cleanup paths never fall back or unlock 
   await assert.rejects(executor.probe(), /unavailable/);
   const session = await executor.open(resolve('checkout'));
   await assert.rejects(
-    session.run('BUILD', 'npm', { cwd: session.workspacePath }),
+    session.run('BUILD', 'npm', '.', { cwd: session.workspacePath }),
     /unavailable/,
   );
   await assert.rejects(session.close(), /unavailable/);
@@ -187,7 +211,7 @@ test('cancellation racing unit creation preserves cancellation after acknowledge
   });
   const session = await executor.open(resolve('checkout'));
   await assert.rejects(
-    session.run('INSTALL', 'npm', {
+    session.run('INSTALL', 'npm', '.', {
       cwd: session.workspacePath,
       signal: controller.signal,
     }),
@@ -220,14 +244,18 @@ for (const failure of [
         await mkdir(restricted);
         return {
           workspacePath: restricted,
-          async run(stage, manager, options) {
+          async run(stage, manager, workingDirectory, options) {
             events.push(stage);
             assert.equal(options.cwd, restricted);
+            assert.equal(workingDirectory, '.');
             assert.equal(manager, 'npm');
             if (failure === 'timeout') throw new ProcessTimeoutError(result());
             if (failure === 'cancel') throw new ProcessCancelledError(result());
             if (failure === 'exception') throw new Error('executor failed');
             return result({ exitCode: stage === failure ? 1 : 0 });
+          },
+          async completeBuild() {
+            throw new Error('build completion was not expected');
           },
           async collect() {
             events.push('collect');
@@ -254,7 +282,10 @@ for (const failure of [
             );
             assert.notEqual(options.cwd, restricted);
             if (args[0] === 'init')
-              await writeFile(join(options.cwd, 'package-lock.json'), '{}');
+              await Promise.all([
+                writeFile(join(options.cwd, 'package.json'), '{}'),
+                writeFile(join(options.cwd, 'package-lock.json'), '{}'),
+              ]);
             if (args[0] === 'fetch') assert.equal(args.at(-1), sha);
             return result({
               command,

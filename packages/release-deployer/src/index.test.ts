@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -120,10 +120,7 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
   const executor: CommandExecutor = {
     async run(command, args, options) {
       calls.push({ command, args });
-      if (command === 'gzip') {
-        await writeFile(join(options.cwd!, 'release.tar.gz'), 'archive bytes');
-      } else assert.equal(command, 'tar');
-      return commandResult(command, args);
+      return defaultCommandExecutor.run(command, args, options);
     },
   };
   try {
@@ -136,6 +133,15 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
       { ...metadata, workspacePath, artifactRoot },
       executor,
     );
+    assert.equal(prepared.applicationRoot, '.');
+    assert.equal(prepared.build, 'required');
+    assert.deepEqual(JSON.parse(await readFile(prepared.metadataPath, 'utf8')), {
+      schemaVersion: 2,
+      ...metadata,
+      applicationRoot: '.',
+      build: 'required',
+      archiveSha256: prepared.archiveSha256,
+    });
     assert.equal(calls.length, 3);
     assert.ok(calls[0]!.args.includes('--exclude=.git'));
     assert.ok(calls[0]!.args.includes('--exclude=.env'));
@@ -146,7 +152,55 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
       prepared,
     );
     assert.equal(calls.length, 3);
+    await assert.rejects(
+      prepareRelease(
+        { ...metadata, workspacePath, artifactRoot, build: 'none' },
+        executor,
+      ),
+      /incompatible prepared artifact/,
+    );
 
+    const writeOuterMetadata = async (value: unknown) =>
+      writeFile(prepared.metadataPath, `${JSON.stringify(value)}\n`);
+    const currentOuter = {
+      schemaVersion: 2,
+      ...metadata,
+      applicationRoot: '.',
+      build: 'required',
+      archiveSha256: prepared.archiveSha256,
+    };
+    for (const conflicting of [
+      { ...currentOuter, applicationRoot: 'server' },
+      { ...currentOuter, build: 'none' },
+      { ...currentOuter, applicationRoot: 'server', build: 'none' },
+    ]) {
+      await writeOuterMetadata(conflicting);
+      await assert.rejects(
+        openPreparedRelease(artifactRoot, metadata),
+        ReleaseDeployerError,
+      );
+    }
+    for (const invalid of [
+      { ...currentOuter, applicationRoot: null },
+      { ...currentOuter, build: null },
+    ]) {
+      await writeOuterMetadata(invalid);
+      await assert.rejects(
+        openPreparedRelease(artifactRoot, metadata),
+        ReleaseDeployerError,
+      );
+    }
+    await writeOuterMetadata({
+      schemaVersion: 1,
+      ...metadata,
+      archiveSha256: prepared.archiveSha256,
+    });
+    await assert.rejects(
+      openPreparedRelease(artifactRoot, metadata),
+      ReleaseDeployerError,
+    );
+
+    await writeOuterMetadata(currentOuter);
     await writeFile(prepared.archivePath, 'tampered');
     await assert.rejects(
       openPreparedRelease(artifactRoot, metadata),
@@ -155,6 +209,46 @@ test('prepares, reopens, verifies, and idempotently cleans a deterministic artif
     await cleanupPreparedRelease(artifactRoot, metadata.deploymentId);
     await cleanupPreparedRelease(artifactRoot, metadata.deploymentId);
     await assert.rejects(access(prepared.archivePath));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('opens a genuine schema-1 archive without current embedded build-plan fields', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'releasedeck-schema-1-package-'));
+  const artifactRoot = join(root, 'artifacts');
+  const directory = join(artifactRoot, metadata.deploymentId);
+  const embedded = join(directory, '.releasedeck-release');
+  try {
+    await mkdir(embedded, { recursive: true });
+    await Promise.all([
+      writeFile(join(embedded, 'project-id'), metadata.projectId),
+      writeFile(join(embedded, 'deployment-id'), metadata.deploymentId),
+      writeFile(join(embedded, 'commit-sha'), metadata.commitSha),
+    ]);
+    for (const [command, args] of [
+      ['tar', ['-cf', 'release.tar', '.releasedeck-release']],
+      ['gzip', ['-n', 'release.tar']],
+    ] as const) {
+      const result = await defaultCommandExecutor.run(command, args, {
+        cwd: directory,
+        timeoutMs: 10_000,
+        outputLimitBytes: 4096,
+      });
+      assert.equal(result.exitCode, 0, result.stderr);
+    }
+    const archivePath = join(directory, 'release.tar.gz');
+    const archiveSha256 = createHash('sha256')
+      .update(await readFile(archivePath))
+      .digest('hex');
+    await writeFile(
+      join(directory, 'metadata.json'),
+      `${JSON.stringify({ schemaVersion: 1, ...metadata, archiveSha256 })}\n`,
+    );
+    const legacy = await openPreparedRelease(artifactRoot, metadata);
+    assert.equal(legacy.applicationRoot, '.');
+    assert.equal(legacy.build, 'required');
+    assert.equal(legacy.archiveSha256, archiveSha256);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -189,6 +283,8 @@ test('stages separately, then activates with exact bounded proof', async () => {
   };
   const artifact = {
     ...metadata,
+    applicationRoot: '.',
+    build: 'required' as const,
     archivePath: resolve(root, 'release.tar.gz'),
     metadataPath: resolve(root, 'metadata.json'),
     archiveSha256: 'b'.repeat(64),
@@ -399,13 +495,15 @@ project_id=$2
 deployment_id=$3
 commit_sha=$4
 archive=$5
-mkdir -p "$root/$project_id/shared" "$root/source/.releasedeck-release" "$root/bin"
+mkdir -p "$root/$project_id/shared" "$root/source/.releasedeck-release" "$root/source/server" "$root/bin"
 printf 'PORT=3000\n' > "$root/$project_id/shared/.env"
-printf 'module.exports={apps:[{name:"releasedeck-%s",cwd:__dirname,script:"./server.cjs"}]};\n' "$project_id" > "$root/source/ecosystem.config.cjs"
-printf '' > "$root/source/server.cjs"
+printf 'module.exports={apps:[{name:"releasedeck-%s",cwd:__dirname,script:"./server.cjs"}]};\n' "$project_id" > "$root/source/server/ecosystem.config.cjs"
+printf '' > "$root/source/server/server.cjs"
 printf '%s' "$project_id" > "$root/source/.releasedeck-release/project-id"
 printf '%s' "$deployment_id" > "$root/source/.releasedeck-release/deployment-id"
 printf '%s' "$commit_sha" > "$root/source/.releasedeck-release/commit-sha"
+printf server > "$root/source/.releasedeck-release/application-root"
+printf none > "$root/source/.releasedeck-release/build"
 tar -czf "$archive" -C "$root/source" .
 cat > "$root/bin/pm2" <<'EOF'
 ${fakePm2}
@@ -476,7 +574,8 @@ for release_id do mkdir -p "$releases/$release_id"; sleep 0.01; done
 base=$1
 deployment_id=$2
 test "$(readlink "$base/current")" = "releases/$deployment_id"
-test "$(readlink "$base/releases/$deployment_id/.env")" = "$base/shared/.env"
+test "$(readlink "$base/releases/$deployment_id/server/.env")" = "$base/shared/.env"
+test ! -e "$base/releases/$deployment_id/.env"
 find "$base/releases" -mindepth 1 -maxdepth 1 -type d | wc -l
 `,
       [`${root}/${metadata.projectId}`, metadata.deploymentId],
@@ -545,6 +644,7 @@ test('promotion restores and rechecks healthy A after candidate B fails', async 
         'base="$root/$project"; mkdir -p "$base/shared" "$base/releases/$a/.releasedeck-release" "$base/releases/$b/.releasedeck-release" "$root/bin"',
         'printf x > "$base/shared/.env"',
         'for id in "$a" "$b"; do d="$base/releases/$id"; printf %s "$project" > "$d/.releasedeck-release/project-id"; printf %s "$id" > "$d/.releasedeck-release/deployment-id"; printf x > "$d/.releasedeck-release/archive-sha256"; ln -s "$base/shared/.env" "$d/.env"; printf \'module.exports={apps:[{name:"releasedeck-%s",cwd:__dirname,script:"./server.cjs"}]};\\n\' "$project" > "$d/ecosystem.config.cjs"; printf x > "$d/server.cjs"; done',
+        'a_dir="$base/releases/$a"; mkdir "$a_dir/server"; mv "$a_dir/ecosystem.config.cjs" "$a_dir/server/ecosystem.config.cjs"; mv "$a_dir/server.cjs" "$a_dir/server/server.cjs"; rm "$a_dir/.env"; ln -s "$base/shared/.env" "$a_dir/server/.env"; printf server > "$a_dir/.releasedeck-release/application-root"; printf none > "$a_dir/.releasedeck-release/build"',
         'printf %s "$sha_a" > "$base/releases/$a/.releasedeck-release/commit-sha"; printf %s "$sha_b" > "$base/releases/$b/.releasedeck-release/commit-sha"',
         'printf 200 > "$base/releases/$a/.health"; printf 503 > "$base/releases/$b/.health"',
         'ln -s "releases/$a" "$base/current"',

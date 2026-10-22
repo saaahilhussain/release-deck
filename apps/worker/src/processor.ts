@@ -436,6 +436,8 @@ export async function processDeploymentJob(
             commitSha: owned.deployment.commitSha,
             workspacePath: build.workspacePath,
             artifactRoot: options.release.artifactRoot,
+            applicationRoot: build.applicationRoot,
+            build: build.build,
             signal: controller.signal,
             timeoutMs: options.release.target.timeoutMs,
             outputLimitBytes: options.release.target.outputLimitBytes,
