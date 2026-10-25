@@ -35,6 +35,12 @@ const target = {
   healthRequestTimeoutMs: 2_000,
 };
 const options = { leaseMs: 60_000, retention: 5, target };
+type RollbackOutcome = Awaited<ReturnType<ManualRollbackOperations['rollbackRelease']>>;
+
+interface HarnessControls {
+  readonly renew?: (current: Deployment) => Promise<Deployment>;
+  readonly run?: (outcome: RollbackOutcome) => Promise<RollbackOutcome>;
+}
 
 function deployment(id: string, commitSha: string): Deployment {
   const current = createQueuedDeployment({ projectId, commitSha });
@@ -75,10 +81,28 @@ function remoteProof(id: string, commitSha: string) {
   };
 }
 
-function harness(
-  outcome: Awaited<ReturnType<ManualRollbackOperations['rollbackRelease']>>,
-) {
-  const active = deployment(activeId, 'b'.repeat(40));
+function harness(outcome: RollbackOutcome, controls: HarnessControls = {}) {
+  const claimedAt = new Date();
+  const activeBase = deployment(activeId, 'b'.repeat(40));
+  const active: Deployment = {
+    ...activeBase,
+    version: activeBase.version + 1,
+    updatedAt: claimedAt,
+    release: {
+      ...activeBase.release!,
+      manualRollback: {
+        requestId,
+        targetDeploymentId: targetId,
+        status: 'RUNNING',
+        attemptId,
+        attemptNumber: 1,
+        fence: 2,
+        leaseExpiresAt: new Date(claimedAt.valueOf() + 60_000),
+        heartbeatAt: claimedAt,
+        startedAt: claimedAt,
+      },
+    },
+  };
   const previous = deployment(targetId, 'a'.repeat(40));
   const claim: ManualRollbackClaim = {
     requestId,
@@ -90,25 +114,39 @@ function harness(
     targetDeployment: previous,
   };
   const calls: string[] = [];
+  const renewalVersions: number[] = [];
+  const outcomeVersions: number[] = [];
+  let current = active;
   let final = active;
   const repositories: ManualRollbackRepositories = {
     deployments: {
       claimManualRollback: async () => claim,
       reclaimExpiredManualRollback: async () => null,
-      renewManualRollback: async () => active,
+      renewManualRollback: async (_id, input) => {
+        renewalVersions.push(input.expectedVersion);
+        assert.equal(input.expectedVersion, current.version);
+        current = controls.renew
+          ? await controls.renew(current)
+          : { ...current, version: current.version + 1 };
+        return current;
+      },
       recordManualRollbackOutcome: async (_id, input) => {
         calls.push('persist-restored');
+        outcomeVersions.push(input.expectedVersion);
+        assert.equal(input.expectedVersion, current.version);
         assert.equal(input.target.deploymentId, targetId);
         assert.equal(input.target.commitSha, previous.commitSha);
         assert.equal(input.health.statusCode, 200);
         final = {
-          ...active,
+          ...current,
           status: 'ROLLED_BACK',
           stage: 'ROLLBACK',
+          version: current.version + 1,
           release: {
-            ...active.release!,
+            ...current.release!,
             status: 'ROLLED_BACK',
             manualRollback: {
+              ...current.release!.manualRollback!,
               requestId,
               targetDeploymentId: targetId,
               status: 'RESTORED',
@@ -119,33 +157,42 @@ function harness(
             },
           },
         };
+        current = final;
         return final;
       },
       recordManualRollbackFailure: async (_id, input) => {
         calls.push('persist-failed');
+        outcomeVersions.push(input.expectedVersion);
+        assert.equal(input.expectedVersion, current.version);
         assert.equal(input.target.deploymentId, targetId);
         final = {
-          ...active,
+          ...current,
           status: input.activeHealth ? 'SUCCESS' : 'FAILED',
           stage: input.activeHealth ? 'COMPLETE' : 'ROLLBACK',
+          version: current.version + 1,
         };
+        current = final;
         return final;
       },
       recordManualRollbackRejected: async (_id, input) => {
         calls.push('persist-rejected');
+        outcomeVersions.push(input.expectedVersion);
+        assert.equal(input.expectedVersion, current.version);
         assert.equal(input.target.deploymentId, targetId);
         final = {
-          ...active,
+          ...current,
+          version: current.version + 1,
           release: {
-            ...active.release!,
+            ...current.release!,
             manualRollback: {
-              ...claim.deployment.release!.manualRollback!,
+              ...current.release!.manualRollback!,
               status: 'REJECTED',
               failure: input.failure,
               finishedAt: new Date(),
             },
           },
         };
+        current = final;
         return final;
       },
     },
@@ -157,10 +204,25 @@ function harness(
       assert.equal(input.deploymentId, activeId);
       assert.equal(input.targetDeploymentId, targetId);
       assert.equal(input.targetCommitSha, previous.commitSha);
-      return outcome;
+      return controls.run ? controls.run(outcome) : outcome;
     },
   };
-  return { repositories, operations, calls, final: () => final };
+  return {
+    repositories,
+    operations,
+    calls,
+    renewalVersions,
+    outcomeVersions,
+    final: () => final,
+  };
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 test('manual rollback uses the built predecessor and persists restored health', async () => {
@@ -183,6 +245,122 @@ test('manual rollback uses the built predecessor and persists restored health', 
   );
   assert.equal(result.status, 'ROLLED_BACK');
   assert.deepEqual(state.calls, ['remote-rollback', 'persist-restored']);
+});
+
+test('manual rollback finalization drains its heartbeat and uses the latest version', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const operationStarted = deferred();
+  const finishOperation = deferred();
+  const heartbeatStarted = deferred();
+  const finishHeartbeat = deferred();
+  const outcome: RollbackOutcome = {
+    status: 'RESTORED',
+    proof: remoteProof(targetId, 'a'.repeat(40)),
+    healthProof: {
+      url: healthUrl,
+      statusCode: 200,
+      attempts: 2,
+      completedAt: new Date(),
+    },
+  };
+  const state = harness(outcome, {
+    async run(result) {
+      operationStarted.resolve();
+      await finishOperation.promise;
+      return result;
+    },
+    async renew(current) {
+      heartbeatStarted.resolve();
+      await finishHeartbeat.promise;
+      const heartbeatAt = new Date();
+      return {
+        ...current,
+        version: current.version + 1,
+        release: {
+          ...current.release!,
+          manualRollback: {
+            ...current.release!.manualRollback!,
+            heartbeatAt,
+            leaseExpiresAt: new Date(heartbeatAt.valueOf() + 60_000),
+          },
+        },
+      };
+    },
+  });
+
+  const processing = processManualRollback(
+    activeId,
+    targetId,
+    state.repositories,
+    state.operations,
+    options,
+  );
+  await operationStarted.promise;
+  t.mock.timers.tick(20_000);
+  await heartbeatStarted.promise;
+  finishOperation.resolve();
+  await Promise.resolve();
+  assert.deepEqual(state.outcomeVersions, []);
+  finishHeartbeat.resolve();
+  const result = await processing;
+
+  assert.deepEqual(state.renewalVersions, [4]);
+  assert.deepEqual(state.outcomeVersions, [5]);
+  assert.equal(result.status, 'ROLLED_BACK');
+  t.mock.timers.tick(100_000);
+  assert.deepEqual(state.renewalVersions, [4]);
+});
+
+test('manual rollback heartbeat failure prevents a stale final outcome', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const operationStarted = deferred();
+  const finishOperation = deferred();
+  const heartbeatStarted = deferred();
+  const failHeartbeat = deferred();
+  const persistenceError = new Error('MongoDB unavailable');
+  const state = harness(
+    {
+      status: 'RESTORED',
+      proof: remoteProof(targetId, 'a'.repeat(40)),
+      healthProof: {
+        url: healthUrl,
+        statusCode: 200,
+        attempts: 1,
+        completedAt: new Date(),
+      },
+    },
+    {
+      async run(result) {
+        operationStarted.resolve();
+        await finishOperation.promise;
+        return result;
+      },
+      async renew() {
+        heartbeatStarted.resolve();
+        await failHeartbeat.promise;
+        throw persistenceError;
+      },
+    },
+  );
+
+  const processing = processManualRollback(
+    activeId,
+    targetId,
+    state.repositories,
+    state.operations,
+    options,
+  );
+  await operationStarted.promise;
+  t.mock.timers.tick(20_000);
+  await heartbeatStarted.promise;
+  finishOperation.resolve();
+  await Promise.resolve();
+  failHeartbeat.resolve();
+  await assert.rejects(processing, persistenceError);
+
+  assert.deepEqual(state.renewalVersions, [4]);
+  assert.deepEqual(state.outcomeVersions, []);
+  assert.deepEqual(state.calls, ['remote-rollback']);
 });
 
 test('failed target health with active recovery keeps the active release successful', async () => {

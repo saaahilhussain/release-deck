@@ -93,22 +93,31 @@ export async function processManualRollback(
   let mutation = Promise.resolve();
   let stopped = false;
   let renewalFailure: unknown;
-  const serialize = async <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = mutation.then(operation);
-    mutation = result.then(
-      () => undefined,
-      () => undefined,
-    );
+  const serialize = (
+    operation: (current: Deployment) => Promise<Deployment>,
+  ): Promise<Deployment> => {
+    const result = mutation.then(async () => {
+      const next = await operation(deployment);
+      deployment = next;
+      return next;
+    });
+    mutation = result.then(() => undefined);
+    void mutation.catch(() => undefined);
     return result;
+  };
+  const stopHeartbeats = async (): Promise<void> => {
+    stopped = true;
+    clearInterval(heartbeatTimer);
+    await mutation;
   };
   const heartbeat = async () => {
     if (stopped) return;
     try {
-      deployment = await serialize(() =>
+      await serialize((current) =>
         repositories.deployments.renewManualRollback(
           activeDeploymentId,
           {
-            expectedVersion: deployment.version,
+            expectedVersion: current.version,
             requestId: owned.requestId,
             attemptId: owned.attemptId,
             fence: owned.fence,
@@ -118,7 +127,9 @@ export async function processManualRollback(
         ),
       );
     } catch (error) {
-      renewalFailure = error;
+      renewalFailure ??= error;
+      stopped = true;
+      clearInterval(heartbeatTimer);
       controller.abort();
     }
   };
@@ -148,6 +159,12 @@ export async function processManualRollback(
     } catch (error) {
       operationError = error;
     }
+    try {
+      await stopHeartbeats();
+    } catch (mutationError) {
+      if (renewalFailure) throw renewalFailure;
+      throw mutationError;
+    }
     if (renewalFailure) throw renewalFailure;
     if (options.signal?.aborted) {
       throw operationError ?? new Error('manual rollback was cancelled');
@@ -158,8 +175,8 @@ export async function processManualRollback(
       owned.targetDeployment.commitSha,
       options.target.remoteRoot,
     );
-    const token = () => ({
-      expectedVersion: deployment.version,
+    const token = (current: Deployment) => ({
+      expectedVersion: current.version,
       requestId: owned.requestId,
       attemptId: owned.attemptId,
       fence: owned.fence,
@@ -170,13 +187,13 @@ export async function processManualRollback(
         operationError instanceof ReleaseDeployerError &&
         operationError.kind === 'remote' &&
         operationError.exitCode === 66;
-      deployment = await serialize(() =>
+      await serialize((current) =>
         (rejected
           ? repositories.deployments.recordManualRollbackRejected
           : repositories.deployments.recordManualRollbackFailure)(
           activeDeploymentId,
           {
-            ...token(),
+            ...token(current),
             failure: rollbackFailure(
               rejected
                 ? 'manual rollback precondition was rejected by the target'
@@ -187,19 +204,19 @@ export async function processManualRollback(
         ),
       );
     } else if (outcome!.status === 'RESTORED') {
-      deployment = await serialize(() =>
+      await serialize((current) =>
         repositories.deployments.recordManualRollbackOutcome(
           activeDeploymentId,
-          { ...token(), health: outcome!.healthProof },
+          { ...token(current), health: outcome!.healthProof },
           now(),
         ),
       );
     } else {
-      deployment = await serialize(() =>
+      await serialize((current) =>
         repositories.deployments.recordManualRollbackFailure(
           activeDeploymentId,
           {
-            ...token(),
+            ...token(current),
             failure: rollbackFailure(
               outcome!.status === 'FAILED_ACTIVE_RESTORED'
                 ? 'manual rollback target was unhealthy; active release was restored'
