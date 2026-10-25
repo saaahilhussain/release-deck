@@ -20,6 +20,10 @@ const environment: ApiEnvironment = {
   MONGODB_URI: 'mongodb://127.0.0.1/releasedeck',
   REDIS_URL: 'redis://127.0.0.1',
   GITHUB_WEBHOOK_SECRET: 'phase-3-test-secret',
+  OPERATOR_ID: 'operator',
+  OPERATOR_PASSWORD_HASH:
+    'scrypt$v1$N=65536,r=8,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+  OPERATOR_ORIGIN: 'http://127.0.0.1:5173',
 };
 
 function queueStub(overrides: Partial<DeploymentQueue> = {}): DeploymentQueue {

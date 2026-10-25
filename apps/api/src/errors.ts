@@ -1,6 +1,8 @@
 export type ApiErrorCode =
   | 'BAD_REQUEST'
   | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'TOO_MANY_REQUESTS'
   | 'UNSUPPORTED_MEDIA_TYPE'
   | 'NOT_FOUND'
   | 'CONFLICT'
@@ -38,6 +40,23 @@ export class UnauthorizedError extends ApiError {
   constructor(message = 'webhook authentication failed') {
     super(401, 'UNAUTHORIZED', message);
     this.name = 'UnauthorizedError';
+  }
+}
+
+export class ForbiddenError extends ApiError {
+  constructor(message = 'operator authorization is required') {
+    super(403, 'FORBIDDEN', message);
+    this.name = 'ForbiddenError';
+  }
+}
+
+export class TooManyRequestsError extends ApiError {
+  readonly retryAfterSeconds: number;
+
+  constructor(retryAfterSeconds: number) {
+    super(429, 'TOO_MANY_REQUESTS', 'authentication temporarily unavailable');
+    this.name = 'TooManyRequestsError';
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 

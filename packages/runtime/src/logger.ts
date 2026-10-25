@@ -7,6 +7,8 @@ const sensitiveKeyPaths = [
   '*.MONGODB_URI',
   '*.REDIS_URL',
   '*.GITHUB_WEBHOOK_SECRET',
+  'OPERATOR_PASSWORD_HASH',
+  '*.OPERATOR_PASSWORD_HASH',
   'GITHUB_APP_ID',
   'GITHUB_APP_INSTALLATION_ID',
   'GITHUB_APP_PRIVATE_KEY_PATH',
@@ -27,6 +29,14 @@ const sensitiveKeyPaths = [
   '*.token',
   'authorization',
   '*.authorization',
+  'cookie',
+  '*.cookie',
+  'set-cookie',
+  '*.set-cookie',
+  'csrfToken',
+  '*.csrfToken',
+  'sessionId',
+  '*.sessionId',
 ];
 
 const safeDependencies = new Set(['mongodb', 'redis', 'http']);

@@ -78,6 +78,23 @@ function isTargetHealthUrl(value: string): boolean {
   }
 }
 
+function isWebOrigin(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return (
+      ['http:', 'https:'].includes(parsed.protocol) &&
+      value === parsed.origin &&
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.pathname === '/' &&
+      parsed.search === '' &&
+      parsed.hash === ''
+    );
+  } catch {
+    return false;
+  }
+}
+
 const mongoUrl = z.string().min(1).refine(isMongoUrl);
 
 const redisUrl = z.string().min(1).refine(isRedisUrl);
@@ -128,11 +145,33 @@ const commonEnvironmentSchema = z.object({
   REDIS_URL: redisUrl,
 });
 
-const apiEnvironmentSchema = commonEnvironmentSchema.extend({
-  HOST: z.string().min(1).default('127.0.0.1'),
-  PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
-  GITHUB_WEBHOOK_SECRET: z.string().min(16),
-});
+const apiEnvironmentSchema = commonEnvironmentSchema
+  .extend({
+    HOST: z.string().min(1).default('127.0.0.1'),
+    PORT: z.coerce.number().int().min(1).max(65_535).default(3_000),
+    GITHUB_WEBHOOK_SECRET: z.string().min(16),
+    OPERATOR_ID: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._@-]*$/),
+    OPERATOR_PASSWORD_HASH: z
+      .string()
+      .regex(/^scrypt\$v1\$N=65536,r=8,p=2\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{43}$/),
+    OPERATOR_ORIGIN: z.string().refine(isWebOrigin),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.NODE_ENV === 'production' &&
+      !value.OPERATOR_ORIGIN.startsWith('https://')
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['OPERATOR_ORIGIN'],
+        message: 'production operator origin must use HTTPS',
+      });
+    }
+  });
 
 const workerEnvironmentSchema = commonEnvironmentSchema
   .extend({

@@ -84,6 +84,141 @@ test('failed restoration is labeled attempted; successful restoration is labeled
   }
 });
 
+test('operator sign-in reports safe errors and returns only the authenticated session', async () => {
+  const savedFetch = globalThis.fetch;
+  let responseStatus = 401;
+  let submitted;
+  let signedIn;
+  globalThis.fetch = async (url, options = {}) => {
+    const parsed = new URL(url, 'http://fixture.invalid');
+    if (parsed.pathname === '/api/auth/login') {
+      submitted = JSON.parse(options.body);
+      if (responseStatus === 401) return { ok: false, status: 401 };
+      return { ok: true, status: 204 };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        operator: { id: 'operator', role: 'operator' },
+        csrfToken: 'c'.repeat(43),
+        idleExpiresAt: now,
+        absoluteExpiresAt: now,
+      }),
+    };
+  };
+  const props = {
+    state: 'unauthenticated',
+    message: '',
+    retry() {},
+    signedIn(value) {
+      signedIn = value;
+    },
+  };
+  const app = mount(() => loaded.components.AuthenticationGate(props));
+  try {
+    app.input('operatorId').onChange({ target: { value: 'operator' } });
+    await settle();
+    app.input('password').onChange({ target: { value: 'not-the-password' } });
+    await settle();
+    app.form().onSubmit({ preventDefault() {} });
+    await settle();
+    assert.match(app.text(), /identifier or password is invalid/i);
+    assert.deepEqual(submitted, {
+      operatorId: 'operator',
+      password: 'not-the-password',
+    });
+
+    responseStatus = 200;
+    app.input('password').onChange({ target: { value: 'correct-password' } });
+    await settle();
+    app.form().onSubmit({ preventDefault() {} });
+    await settle();
+    assert.equal(signedIn.operator.id, 'operator');
+    assert.doesNotMatch(app.text(), /correct-password/);
+  } finally {
+    app.close();
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('authentication-unavailable state is distinct from operator sign-in', () => {
+  const app = mount(() =>
+    loaded.components.AuthenticationGate({
+      state: 'unavailable',
+      message: 'The authentication service is unavailable.',
+      retry() {},
+      signedIn() {},
+    }),
+  );
+  try {
+    assert.match(app.text(), /ReleaseDeck is unavailable/);
+    assert.match(app.text(), /Retry connection/);
+    assert.doesNotMatch(app.text(), /Operator identifier/);
+  } finally {
+    app.close();
+  }
+});
+
+test('dashboard reports expired sessions and sends session CSRF evidence on logout', async () => {
+  const savedFetch = globalThis.fetch;
+  const session = {
+    operator: { id: 'test-operator', role: 'operator' },
+    csrfToken: 'z'.repeat(43),
+    idleExpiresAt: now,
+    absoluteExpiresAt: now,
+  };
+  let authFailures = 0;
+  globalThis.fetch = async () => ({ ok: false, status: 401 });
+  const expiredProps = {
+    session,
+    authenticationFailed() {
+      authFailures++;
+    },
+    signedOut() {},
+  };
+  const expired = mount(() => loaded.components.Dashboard(expiredProps));
+  try {
+    await settle();
+    assert.equal(authFailures, 1);
+  } finally {
+    expired.close();
+  }
+
+  let logoutHeaders;
+  let signedOut = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const parsed = new URL(url, 'http://fixture.invalid');
+    if (parsed.pathname === '/api/auth/logout') {
+      logoutHeaders = options.headers;
+      return { ok: true, status: 204 };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ projects: [], nextCursor: null }),
+    };
+  };
+  const activeProps = {
+    session,
+    authenticationFailed() {},
+    signedOut() {
+      signedOut++;
+    },
+  };
+  const active = mount(() => loaded.components.Dashboard(activeProps));
+  try {
+    await settle();
+    active.button('Sign out').onClick();
+    await settle();
+    assert.equal(signedOut, 1);
+    assert.equal(logoutHeaders['X-ReleaseDeck-CSRF'], session.csrfToken);
+  } finally {
+    active.close();
+    globalThis.fetch = savedFetch;
+  }
+});
+
 function fixture(t) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const savedFetch = globalThis.fetch;
@@ -113,7 +248,14 @@ function fixture(t) {
   globalThis.fetch = async (url, options) => {
     const parsed = new URL(url, 'http://fixture.invalid');
     calls.push(parsed);
-    const respond = (value) => ({ ok: true, json: async () => value });
+    const respond = (value) => ({ ok: true, status: 200, json: async () => value });
+    if (parsed.pathname === '/api/auth/session')
+      return respond({
+        operator: { id: 'test-operator', role: 'operator' },
+        csrfToken: 'c'.repeat(43),
+        idleExpiresAt: now,
+        absoluteExpiresAt: now,
+      });
     if (parsed.pathname === '/api/projects')
       return respond({
         projects: parsed.searchParams.has('cursor')
@@ -159,7 +301,17 @@ function fixture(t) {
       });
     });
   };
-  const app = mount(loaded.components.default);
+  const dashboardProps = {
+    session: {
+      operator: { id: 'test-operator', role: 'operator' },
+      csrfToken: 'c'.repeat(43),
+      idleExpiresAt: now,
+      absoluteExpiresAt: now,
+    },
+    authenticationFailed() {},
+    signedOut() {},
+  };
+  const app = mount(() => loaded.components.Dashboard(dashboardProps));
   return {
     app,
     calls,

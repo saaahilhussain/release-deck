@@ -15,6 +15,10 @@ const validEnvironment = {
   MONGODB_URI: 'mongodb://user:secret@127.0.0.1:27017/releasedeck',
   REDIS_URL: 'redis://default:secret@127.0.0.1:6379',
   GITHUB_WEBHOOK_SECRET: 'phase3-test-webhook-secret',
+  OPERATOR_ID: 'operator',
+  OPERATOR_PASSWORD_HASH:
+    'scrypt$v1$N=65536,r=8,p=2$AQEBAQEBAQEBAQEBAQEBAQ$AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI',
+  OPERATOR_ORIGIN: 'http://127.0.0.1:5173',
 };
 
 const validWorkerEnvironment = {
@@ -33,6 +37,34 @@ test('parses API defaults', () => {
   const environment = parseApiEnvironment(validEnvironment);
   assert.equal(environment.HOST, '127.0.0.1');
   assert.equal(environment.PORT, 3_000);
+});
+
+test('operator authentication configuration is required and production origin uses HTTPS', () => {
+  for (const field of ['OPERATOR_ID', 'OPERATOR_PASSWORD_HASH', 'OPERATOR_ORIGIN']) {
+    assert.throws(
+      () => parseApiEnvironment({ ...validEnvironment, [field]: undefined }),
+      (error: unknown) =>
+        error instanceof ConfigurationError && error.fields.includes(field),
+    );
+  }
+  assert.throws(
+    () =>
+      parseApiEnvironment({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        OPERATOR_ORIGIN: 'http://deck.example.test',
+      }),
+    (error: unknown) =>
+      error instanceof ConfigurationError && error.fields.includes('OPERATOR_ORIGIN'),
+  );
+  assert.equal(
+    parseApiEnvironment({
+      ...validEnvironment,
+      NODE_ENV: 'production',
+      OPERATOR_ORIGIN: 'https://deck.example.test',
+    }).OPERATOR_ORIGIN,
+    'https://deck.example.test',
+  );
 });
 
 test('GitHub App configuration is optional, complete-only, safely validated and requires isolated execution', () => {

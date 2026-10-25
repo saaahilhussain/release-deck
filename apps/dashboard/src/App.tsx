@@ -1,10 +1,25 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 
 import { createDetailReader } from './detail-requests';
 
 type View = 'overview' | 'projects' | 'deployments' | 'releases';
 type State = 'loading' | 'ready' | 'error';
 type Stream = 'connecting' | 'live' | 'reconnecting' | 'unavailable';
+type AuthState =
+  'checking' | 'authenticated' | 'unauthenticated' | 'unavailable' | 'forbidden';
+type OperatorSession = {
+  operator: { id: string; role: 'operator' };
+  csrfToken: string;
+  idleExpiresAt: string;
+  absoluteExpiresAt: string;
+};
 type Page<T> = { items: T[]; nextCursor: string | null };
 type Project = {
   id: string;
@@ -102,19 +117,38 @@ const tone = (value?: string) =>
           ? 'progress'
           : 'neutral';
 
-async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+class ApiRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(path, {
+    ...options,
     signal: signal ?? null,
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json', ...options.headers },
   });
   if (!response.ok)
-    throw new Error(
+    throw new ApiRequestError(
+      response.status,
       response.status === 404
         ? 'This record is no longer available.'
         : 'Request failed (' + response.status + ').',
     );
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
+
+const get = <T,>(path: string, signal?: AbortSignal) => request<T>(path, {}, signal);
 
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, ReactNode> = {
@@ -459,8 +493,231 @@ function DeploymentTable({
 }
 
 export default function App() {
-  const [readDetail] = useState(() =>
-    createDetailReader((path, signal) => get<{ deployment: Detail }>(path, signal)),
+  const [authState, setAuthState] = useState<AuthState>('checking');
+  const [session, setSession] = useState<OperatorSession | null>(null);
+  const [authMessage, setAuthMessage] = useState('');
+  const [authAttempt, setAuthAttempt] = useState(0);
+
+  useEffect(() => {
+    let stopped = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    setAuthState('checking');
+    setAuthMessage('');
+    void get<OperatorSession>('/api/auth/session', controller.signal)
+      .then((value) => {
+        if (stopped) return;
+        setSession(value);
+        setAuthState('authenticated');
+      })
+      .catch((error: unknown) => {
+        if (stopped) return;
+        setSession(null);
+        if (error instanceof ApiRequestError && error.status === 401) {
+          setAuthState('unauthenticated');
+        } else if (error instanceof ApiRequestError && error.status === 403) {
+          setAuthState('forbidden');
+        } else {
+          setAuthState('unavailable');
+          setAuthMessage(
+            error instanceof Error && error.name === 'AbortError'
+              ? 'The authentication service did not respond in time.'
+              : 'The authentication service is unavailable.',
+          );
+        }
+      })
+      .finally(() => clearTimeout(timeout));
+    return () => {
+      stopped = true;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [authAttempt]);
+
+  const authenticationFailed = useCallback(() => {
+    setSession(null);
+    setAuthMessage('Your session has expired. Sign in again.');
+    setAuthState('unauthenticated');
+  }, []);
+
+  if (authState !== 'authenticated' || !session) {
+    return (
+      <AuthenticationGate
+        state={authState}
+        message={authMessage}
+        retry={() => setAuthAttempt((attempt) => attempt + 1)}
+        signedIn={(value) => {
+          setSession(value);
+          setAuthMessage('');
+          setAuthState('authenticated');
+        }}
+      />
+    );
+  }
+
+  return (
+    <Dashboard
+      session={session}
+      authenticationFailed={authenticationFailed}
+      signedOut={() => {
+        setSession(null);
+        setAuthMessage('You have signed out.');
+        setAuthState('unauthenticated');
+      }}
+    />
+  );
+}
+
+function AuthenticationGate({
+  state,
+  message,
+  retry,
+  signedIn,
+}: {
+  state: AuthState;
+  message: string;
+  retry: () => void;
+  signedIn: (session: OperatorSession) => void;
+}) {
+  const [operatorId, setOperatorId] = useState('');
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState('');
+
+  const login = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (submitting) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    setSubmitting(true);
+    setLoginError('');
+    void request<void>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operatorId, password }),
+      },
+      controller.signal,
+    )
+      .then(() => get<OperatorSession>('/api/auth/session', controller.signal))
+      .then((value) => {
+        setPassword('');
+        setSubmitting(false);
+        signedIn(value);
+      })
+      .catch((error: unknown) => {
+        setPassword('');
+        setSubmitting(false);
+        if (error instanceof ApiRequestError && error.status === 429) {
+          setLoginError('Too many sign-in attempts. Try again later.');
+        } else if (error instanceof ApiRequestError && error.status === 401) {
+          setLoginError('The operator identifier or password is invalid.');
+        } else if (error instanceof Error && error.name === 'AbortError') {
+          setLoginError('The sign-in request timed out.');
+        } else {
+          setLoginError('Sign-in is currently unavailable.');
+        }
+      })
+      .finally(() => clearTimeout(timeout));
+  };
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-card" aria-labelledby="auth-title">
+        <Brand />
+        {state === 'checking' ? (
+          <p className="loading" role="status">
+            Restoring operator session…
+          </p>
+        ) : state === 'unavailable' ? (
+          <>
+            <h1 id="auth-title">ReleaseDeck is unavailable</h1>
+            <p>{message || 'The authentication service could not be reached.'}</p>
+            <button className="button" onClick={retry}>
+              Retry connection
+            </button>
+          </>
+        ) : state === 'forbidden' ? (
+          <>
+            <h1 id="auth-title">Operator access required</h1>
+            <p>The current session is not authorized for this workspace.</p>
+            <button className="button" onClick={retry}>
+              Check session again
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="eyebrow">OPERATOR ACCESS</span>
+            <h1 id="auth-title">Sign in to ReleaseDeck</h1>
+            <p>Use the operator credentials configured on this ReleaseDeck server.</p>
+            {message && <p className="auth-notice">{message}</p>}
+            <form onSubmit={login} className="auth-form">
+              <label>
+                Operator identifier
+                <input
+                  name="operatorId"
+                  autoComplete="username"
+                  value={operatorId}
+                  onChange={(event) => setOperatorId(event.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  name="password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  required
+                />
+              </label>
+              {loginError && (
+                <p className="warning" role="alert">
+                  {loginError}
+                </p>
+              )}
+              <button className="button" type="submit" disabled={submitting}>
+                {submitting ? 'Signing in…' : 'Sign in'}
+              </button>
+            </form>
+          </>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function Dashboard({
+  session,
+  authenticationFailed,
+  signedOut,
+}: {
+  session: OperatorSession;
+  authenticationFailed: () => void;
+  signedOut: () => void;
+}) {
+  const authenticatedGet = useCallback(
+    async <T,>(path: string, signal?: AbortSignal) => {
+      try {
+        return await get<T>(path, signal);
+      } catch (error) {
+        if (error instanceof ApiRequestError && [401, 403].includes(error.status)) {
+          authenticationFailed();
+        }
+        throw error;
+      }
+    },
+    [authenticationFailed],
+  );
+  const readDetail = useMemo(
+    () =>
+      createDetailReader((path, signal) =>
+        authenticatedGet<{ deployment: Detail }>(path, signal),
+      ),
+    [authenticatedGet],
   );
   const [view, setView] = useState<View>('overview');
   const [search, setSearch] = useState('');
@@ -488,6 +745,41 @@ export default function App() {
   const [detailError, setDetailError] = useState('');
   const [detailRefresh, setDetailRefresh] = useState(0);
   const [stream, setStream] = useState<Stream>('connecting');
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState('');
+
+  const logout = () => {
+    if (loggingOut) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    setLoggingOut(true);
+    setLogoutError('');
+    void request<void>(
+      '/api/auth/logout',
+      {
+        method: 'POST',
+        headers: { 'X-ReleaseDeck-CSRF': session.csrfToken },
+      },
+      controller.signal,
+    )
+      .then(() => {
+        setLoggingOut(false);
+        signedOut();
+      })
+      .catch((error: unknown) => {
+        setLoggingOut(false);
+        if (error instanceof ApiRequestError && [401, 403].includes(error.status)) {
+          authenticationFailed();
+        } else {
+          setLogoutError(
+            error instanceof Error && error.name === 'AbortError'
+              ? 'Sign-out timed out.'
+              : 'Sign-out failed. Your session remains active.',
+          );
+        }
+      })
+      .finally(() => clearTimeout(timeout));
+  };
 
   useEffect(() => {
     let stopped = false;
@@ -502,7 +794,7 @@ export default function App() {
       const controller = new AbortController();
       active = controller;
       const timeout = setTimeout(() => controller.abort(), 10000);
-      void get<{ projects: Project[]; nextCursor: string | null }>(
+      void authenticatedGet<{ projects: Project[]; nextCursor: string | null }>(
         '/api/projects' + query(projectCursors[projectPage] ?? null),
         controller.signal,
       )
@@ -536,7 +828,7 @@ export default function App() {
       clearInterval(timer);
       active?.abort();
     };
-  }, [projectCursors, projectPage, projectRetry]);
+  }, [authenticatedGet, projectCursors, projectPage, projectRetry]);
 
   useEffect(() => {
     if (projectState !== 'ready') return;
@@ -564,7 +856,7 @@ export default function App() {
       const controller = new AbortController();
       active = controller;
       const timeout = setTimeout(() => controller.abort(), 10000);
-      void get<{ deployments: Deployment[]; nextCursor: string | null }>(
+      void authenticatedGet<{ deployments: Deployment[]; nextCursor: string | null }>(
         '/api/projects/' +
           encodeURIComponent(projectId) +
           '/deployments' +
@@ -608,7 +900,7 @@ export default function App() {
       clearInterval(timer);
       active?.abort();
     };
-  }, [projectId, deploymentCursors, deploymentPage, deploymentRetry]);
+  }, [authenticatedGet, projectId, deploymentCursors, deploymentPage, deploymentRetry]);
   useEffect(() => {
     if (
       deployments.items.length &&
@@ -893,11 +1185,21 @@ export default function App() {
               placeholder="Filter loaded records..."
             />
           </label>
-          <div className="read-only">
-            <span />
-            Read only workspace
+          <div className="operator-actions">
+            <div className="read-only">
+              <span />
+              {session.operator.id}
+            </div>
+            <button className="sign-out" onClick={logout} disabled={loggingOut}>
+              {loggingOut ? 'Signing out…' : 'Sign out'}
+            </button>
           </div>
         </header>
+        {logoutError && (
+          <p className="topbar-warning" role="alert">
+            {logoutError}
+          </p>
+        )}
         <main id="main-content" className="content">
           {view === 'overview' && (
             <>

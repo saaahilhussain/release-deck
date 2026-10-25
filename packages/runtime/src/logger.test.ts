@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import test from 'node:test';
 
-test('real structured logger redacts App configuration, JWT, checkout token and helper context', async () => {
+test('real structured logger redacts authentication, App, JWT and helper secrets', async () => {
   const keys = [
     'GITHUB_APP_ID',
     'GITHUB_APP_INSTALLATION_ID',
@@ -12,6 +12,11 @@ test('real structured logger redacts App configuration, JWT, checkout token and 
     'GITHUB_APP_JWT',
     'RELEASEDECK_CHECKOUT_TOKEN',
     'RELEASEDECK_CHECKOUT_PATH',
+    'OPERATOR_PASSWORD_HASH',
+    'cookie',
+    'set-cookie',
+    'csrfToken',
+    'sessionId',
   ];
   const fields = Object.fromEntries(keys.map((key) => [key, `secret-canary-${key}`]));
   const code = `import {createLogger} from './src/logger.ts'; const fields=${JSON.stringify(fields)}; createLogger().info({...fields, nested:fields}, 'safe event');`;

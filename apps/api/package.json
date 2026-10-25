@@ -9,7 +9,8 @@
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
-    "test": "tsx --test src/*.test.ts"
+    "test": "tsx --test src/*.test.ts",
+    "credential:hash": "pnpm run build && node dist/hash-operator-password.js"
   },
   "dependencies": {
     "@releasedeck/db": "workspace:*",

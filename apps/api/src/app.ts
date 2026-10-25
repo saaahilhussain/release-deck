@@ -9,8 +9,11 @@ import {
   isNotFoundError,
   NotFoundError,
   PayloadTooLargeError,
+  ServiceUnavailableError,
+  TooManyRequestsError,
   UnsupportedMediaTypeError,
 } from './errors.js';
+import type { OperatorAuthBoundary } from './auth.js';
 import { createApiRouter, type DeploymentEventOptions } from './routes.js';
 import type { ApiRepositories } from './services.js';
 import {
@@ -34,6 +37,7 @@ export interface AppDependencies {
   deploymentQueue?: DeploymentQueueProducer;
   githubWebhookProcessor?: GithubWebhookProcessor;
   deploymentEventOptions?: DeploymentEventOptions;
+  operatorAuth?: OperatorAuthBoundary;
 }
 
 export function createApp(dependencies: AppDependencies): Express {
@@ -91,9 +95,19 @@ export function createApp(dependencies: AppDependencies): Express {
   });
 
   if (dependencies.repositories) {
+    if (dependencies.operatorAuth) {
+      app.use('/api/auth', dependencies.operatorAuth.router);
+    }
     app.use(
       '/api',
-      createApiRouter(dependencies.repositories, dependencies.deploymentEventOptions),
+      dependencies.operatorAuth?.requireOperator ?? failClosedAuthentication,
+      dependencies.operatorAuth?.requireCsrfForMutation ?? failClosedAuthentication,
+      createApiRouter(dependencies.repositories, {
+        ...dependencies.deploymentEventOptions,
+        ...(dependencies.operatorAuth
+          ? { revalidateSession: dependencies.operatorAuth.revalidate }
+          : {}),
+      }),
     );
   }
 
@@ -128,6 +142,9 @@ function apiErrorHandler(logger: Logger): ErrorRequestHandler {
     }
 
     if (error instanceof ApiError) {
+      if (error instanceof TooManyRequestsError) {
+        response.setHeader('Retry-After', String(error.retryAfterSeconds));
+      }
       response.status(error.status).json({
         error: {
           code: error.code,
@@ -144,6 +161,14 @@ function apiErrorHandler(logger: Logger): ErrorRequestHandler {
     });
   };
 }
+
+const failClosedAuthentication: express.RequestHandler = (
+  _request,
+  _response,
+  next,
+) => {
+  next(new ServiceUnavailableError('operator authentication is not configured'));
+};
 
 async function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;

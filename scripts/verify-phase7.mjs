@@ -82,6 +82,19 @@ try {
     redis: { ping: async () => undefined },
     logger: createLogger('silent'),
     repositories,
+    operatorAuth: {
+      router: (_request, _response, next) => next(),
+      requireOperator: (_request, response, next) => {
+        response.locals.operator = {
+          operatorId: 'phase7-verifier',
+          role: 'operator',
+          csrfToken: 'phase7-verifier-csrf',
+        };
+        next();
+      },
+      requireCsrfForMutation: (_request, _response, next) => next(),
+      revalidate: async () => true,
+    },
   }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();

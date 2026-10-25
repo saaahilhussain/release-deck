@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
+import express from 'express';
 
 import { createLogger } from '@releasedeck/runtime';
+import type { OperatorAuthBoundary } from './auth.js';
 import { createApp } from './app.js';
 import type {
   ApiRepositories,
@@ -34,6 +36,20 @@ const deployment: DeploymentRecord = {
   version: 1,
   createdAt: now,
   updatedAt: now,
+};
+
+const allowTestOperator: OperatorAuthBoundary = {
+  router: express.Router(),
+  requireOperator: (_request, response, next) => {
+    response.locals.operator = {
+      operatorId: 'test-operator',
+      role: 'operator',
+      csrfToken: 'test-csrf',
+    };
+    next();
+  },
+  requireCsrfForMutation: (_request, _response, next) => next(),
+  revalidate: async () => true,
 };
 
 function page<T>(items: T[], nextCursor?: string): CursorPage<T> {
@@ -85,12 +101,14 @@ async function withApi(
   repos: ApiRepositories,
   assertion: (url: string) => Promise<void>,
   deploymentEventOptions?: DeploymentEventOptions,
+  operatorAuth: OperatorAuthBoundary = allowTestOperator,
 ): Promise<void> {
   const server = createApp({
     mongo: { ping: async () => undefined },
     redis: { ping: async () => undefined },
     logger: createLogger('silent'),
     repositories: repos,
+    operatorAuth,
     ...(deploymentEventOptions === undefined ? {} : { deploymentEventOptions }),
   }).listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -619,6 +637,34 @@ test('deployment event stream ends at its bounded lifetime for reconnection', as
       assert.equal(finished.done, true);
     },
     { pollIntervalMs: 100, heartbeatIntervalMs: 100, maxConnectionMs: 30 },
+  );
+});
+
+test('deployment event stream closes when periodic operator authorization is revoked', async () => {
+  let authorized = true;
+  const revocableOperator: OperatorAuthBoundary = {
+    ...allowTestOperator,
+    revalidate: async () => authorized,
+  };
+  await withApi(
+    repositories(),
+    async (url) => {
+      const response = await fetch(`${url}/api/deployments/${deployment.id}/events`);
+      assert.equal(response.status, 200);
+      const reader = response.body!.getReader();
+      const initial = await reader.read();
+      assert.match(new TextDecoder().decode(initial.value), /event: deployment/);
+      authorized = false;
+      const ended = await reader.read();
+      assert.equal(ended.done, true);
+    },
+    {
+      pollIntervalMs: 1_000,
+      heartbeatIntervalMs: 1_000,
+      maxConnectionMs: 1_000,
+      sessionRevalidationIntervalMs: 10,
+    },
+    revocableOperator,
   );
 });
 

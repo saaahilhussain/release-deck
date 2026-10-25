@@ -13,7 +13,8 @@ export async function loadComponents() {
     join(directory, 'hooks.mjs'),
     `export const useState=(...a)=>globalThis.__dashboardTestHooks.useState(...a);
 export const useEffect=(...a)=>globalThis.__dashboardTestHooks.useEffect(...a);
-export const useMemo=(f)=>f();`,
+export const useMemo=(f,d)=>globalThis.__dashboardTestHooks.useMemo(f,d);
+export const useCallback=(f,d)=>globalThis.__dashboardTestHooks.useCallback(f,d);`,
   );
   const source =
     (await readFile('src/App.tsx', 'utf8'))
@@ -21,7 +22,7 @@ export const useMemo=(f)=>f();`,
       .replace(
         "from './detail-requests'",
         `from '${pathToFileURL(resolve('src/detail-requests.ts')).href}'`,
-      ) + '\nexport { DeploymentDetail };';
+      ) + '\nexport { AuthenticationGate, Dashboard, DeploymentDetail };';
   const { code } = await transformWithOxc(source, 'App.tsx', {
     jsx: { runtime: 'automatic' },
   });
@@ -93,6 +94,19 @@ export function mount(App) {
         slots[index].cleanup = callback();
       });
     },
+    useMemo(factory, deps) {
+      const index = cursor++;
+      const old = slots[index];
+      if (old && deps.every((value, i) => Object.is(value, old.deps[i]))) {
+        return old.value;
+      }
+      const value = factory();
+      slots[index] = { deps, value };
+      return value;
+    },
+    useCallback(callback, deps) {
+      return hooks.useMemo(() => callback, deps);
+    },
   };
   function render() {
     if (disposed) return;
@@ -105,11 +119,13 @@ export function mount(App) {
   return {
     text: () => text(expand(tree)),
     button(label) {
-      const found = descendants(expand(tree)).find(
+      const matches = descendants(expand(tree)).filter(
         (node) =>
           node.type === 'button' &&
           (node.props['aria-label'] === label || text(node).trim() === label),
       );
+      const found =
+        matches.find((node) => typeof node.props.onClick === 'function') ?? matches[0];
       if (!found) throw new Error(`Missing button: ${label}`);
       return found.props;
     },
@@ -120,6 +136,18 @@ export function mount(App) {
       );
       if (!select) throw new Error('Missing project selector');
       select.props.onChange({ target: { value: id } });
+    },
+    input(name) {
+      const input = descendants(expand(tree)).find(
+        (node) => node.type === 'input' && node.props.name === name,
+      );
+      if (!input) throw new Error(`Missing input: ${name}`);
+      return input.props;
+    },
+    form() {
+      const form = descendants(expand(tree)).find((node) => node.type === 'form');
+      if (!form) throw new Error('Missing form');
+      return form.props;
     },
     close() {
       disposed = true;

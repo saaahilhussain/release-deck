@@ -1,4 +1,4 @@
-import type { Router } from 'express';
+import type { Request, Router } from 'express';
 import express from 'express';
 import {
   deploymentDetailResponse,
@@ -55,6 +55,8 @@ export interface DeploymentEventOptions {
   heartbeatIntervalMs?: number;
   maxConnectionMs?: number;
   maxActiveStreams?: number;
+  sessionRevalidationIntervalMs?: number;
+  revalidateSession?: (request: Request) => Promise<boolean>;
 }
 
 export function createApiRouter(
@@ -154,13 +156,16 @@ export function createApiRouter(
       poll?: NodeJS.Timeout;
       heartbeat?: NodeJS.Timeout;
       lifetime?: NodeJS.Timeout;
+      authorization?: NodeJS.Timeout;
     } = {};
+    let authorizing = false;
     const close = () => {
       if (closed) return;
       closed = true;
       if (timers.poll) clearInterval(timers.poll);
       if (timers.heartbeat) clearInterval(timers.heartbeat);
       if (timers.lifetime) clearTimeout(timers.lifetime);
+      if (timers.authorization) clearInterval(timers.authorization);
       releaseSlot();
       response.end();
     };
@@ -219,6 +224,22 @@ export function createApiRouter(
       if (!response.write(': heartbeat\n\n')) close();
     }, eventOptions.heartbeatIntervalMs ?? 15_000);
     timers.heartbeat.unref();
+
+    if (eventOptions.revalidateSession) {
+      timers.authorization = setInterval(() => {
+        if (closed || authorizing) return;
+        authorizing = true;
+        void eventOptions.revalidateSession!(request)
+          .then((authorized) => {
+            if (!authorized) close();
+          })
+          .catch(close)
+          .finally(() => {
+            authorizing = false;
+          });
+      }, eventOptions.sessionRevalidationIntervalMs ?? 15_000);
+      timers.authorization.unref();
+    }
 
     // EventSource reconnects with a fresh authoritative snapshot. This bounds
     // the lifetime of every individual polling connection.

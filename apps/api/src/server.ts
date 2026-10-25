@@ -18,6 +18,7 @@ import {
 } from '@releasedeck/runtime';
 
 import { createApp } from './app.js';
+import { createOperatorAuth } from './auth.js';
 import { GithubWebhookProcessor } from './webhooks.js';
 
 const WEBHOOK_RECONCILE_INTERVAL_MS = 5_000;
@@ -91,6 +92,13 @@ export async function startApi(
       secret: environment.GITHUB_WEBHOOK_SECRET,
       queue: deploymentQueue,
     });
+    const operatorAuth = createOperatorAuth({
+      redis: redis.client,
+      operatorId: environment.OPERATOR_ID,
+      passwordHash: environment.OPERATOR_PASSWORD_HASH,
+      allowedOrigin: environment.OPERATOR_ORIGIN,
+      secureCookies: environment.NODE_ENV === 'production',
+    });
     reconciler = startPendingWebhookReconciler(webhookProcessor, dependencies.logger);
     const app = createApp({
       mongo,
@@ -98,6 +106,7 @@ export async function startApi(
       repositories,
       logger: dependencies.logger,
       githubWebhookProcessor: webhookProcessor,
+      operatorAuth,
     });
 
     server = app.listen(environment.PORT, environment.HOST);

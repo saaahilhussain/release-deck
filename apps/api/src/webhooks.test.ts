@@ -3,8 +3,10 @@ import { createHmac } from 'node:crypto';
 import { once } from 'node:events';
 import { createConnection } from 'node:net';
 import test from 'node:test';
+import express from 'express';
 
 import { createLogger } from '@releasedeck/runtime';
+import type { OperatorAuthBoundary } from './auth.js';
 import type { ApiRepositories } from './services.js';
 import { createApp } from './app.js';
 import { GithubWebhookProcessor } from './webhooks.js';
@@ -191,6 +193,16 @@ async function withApi(
   queue: { enqueueDeployment(id: string): Promise<void> },
   assertion: (url: string) => Promise<void>,
 ): Promise<void> {
+  const operatorAuth: OperatorAuthBoundary = {
+    router: express.Router(),
+    requireOperator: () => {
+      throw new Error('webhook reached operator authentication');
+    },
+    requireCsrfForMutation: () => {
+      throw new Error('webhook reached operator CSRF middleware');
+    },
+    revalidate: async () => false,
+  };
   const server = createApp({
     mongo: { ping: async () => undefined },
     redis: { ping: async () => undefined },
@@ -198,6 +210,7 @@ async function withApi(
     repositories: repos,
     githubWebhookSecret: secret,
     deploymentQueue: queue,
+    operatorAuth,
   }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
@@ -272,9 +285,13 @@ test('webhook authenticates exact raw bytes, queues one deployment, and is idemp
         body,
       });
       assert.equal(first.status, 202);
+      assert.equal(first.headers.get('set-cookie'), null);
       const duplicate = await fetch(`${url}/api/webhooks/github`, {
         method: 'POST',
-        headers: headers(body),
+        headers: {
+          ...headers(body),
+          cookie: 'releasedeck_session_dev=not-an-operator-session',
+        },
         body,
       });
       assert.equal(duplicate.status, 202);
