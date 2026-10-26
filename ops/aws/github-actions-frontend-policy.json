@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadDashboardBucketLocation",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::releasedeck-production-dashboard-bdf69d7dda"
+    },
+    {
+      "Sid": "ListDashboardAssets",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::releasedeck-production-dashboard-bdf69d7dda",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["assets", "assets/*"]
+        }
+      }
+    },
+    {
+      "Sid": "PublishDashboardObjects",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::releasedeck-production-dashboard-bdf69d7dda/assets/*",
+        "arn:aws:s3:::releasedeck-production-dashboard-bdf69d7dda/index.html",
+        "arn:aws:s3:::releasedeck-production-dashboard-bdf69d7dda/release.json"
+      ]
+    },
+    {
+      "Sid": "InvalidateDashboardHtml",
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"],
+      "Resource": "arn:aws:cloudfront::821656895501:distribution/E116Z5Y0F8ZJ2J"
+    }
+  ]
+}

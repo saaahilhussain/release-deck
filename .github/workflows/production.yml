@@ -1,0 +1,459 @@
+name: ReleaseDeck production CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/api/**'
+      - 'apps/dashboard/**'
+      - 'packages/db/**'
+      - 'packages/queue/**'
+      - 'packages/runtime/**'
+      - 'packages/tsconfig/**'
+      - '.npmrc'
+      - '.prettierignore'
+      - '.prettierrc.json'
+      - 'eslint.config.mjs'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.json'
+      - 'turbo.json'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character commit SHA already contained in main
+        required: true
+        type: string
+      component:
+        description: Production component to redeploy after its checks pass
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - backend
+          - frontend
+
+concurrency:
+  group: releasedeck-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  NODE_VERSION: 24.22.0
+  PNPM_VERSION: 10.18.1
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      frontend: ${{ steps.plan.outputs.frontend }}
+      backend: ${{ steps.plan.outputs.backend }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+
+      - name: Resolve affected components
+        id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+          REQUESTED_COMPONENT: ${{ inputs.component }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+
+          git fetch --no-tags origin main
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            git merge-base --is-ancestor "$sha" origin/main
+          fi
+
+          frontend=false
+          backend=false
+
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]]
+            [[ "$REQUESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$sha" == "$REQUESTED_COMMIT" ]]
+            case "$REQUESTED_COMPONENT" in
+              both) frontend=true; backend=true ;;
+              frontend) frontend=true ;;
+              backend) backend=true ;;
+              *) echo "Unsupported component selection" >&2; exit 64 ;;
+            esac
+          else
+            if [[ "$EVENT_NAME" == pull_request ]]; then
+              changed=$(git diff --name-only "$BASE_SHA" "$sha")
+            elif [[ "$BEFORE_SHA" =~ ^0{40}$ ]]; then
+              changed=$(git diff-tree --no-commit-id --name-only -r "$sha")
+            else
+              changed=$(git diff --name-only "$BEFORE_SHA" "$sha")
+            fi
+
+            while IFS= read -r path; do
+              case "$path" in
+                apps/dashboard/*)
+                  frontend=true
+                  ;;
+                apps/api/*|packages/db/*|packages/queue/*|packages/runtime/*)
+                  backend=true
+                  ;;
+                packages/tsconfig/*|.npmrc|.prettierignore|.prettierrc.json|eslint.config.mjs|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|tsconfig.json|turbo.json)
+                  frontend=true
+                  backend=true
+                  ;;
+              esac
+            done <<< "$changed"
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "Revision: $sha; frontend=$frontend; backend=$backend"
+
+  frontend-ci:
+    name: Frontend CI
+    needs: plan
+    if: needs.plan.outputs.frontend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable locked pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "$PNPM_VERSION"
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test, lint, typecheck, and build dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @releasedeck/dashboard test
+          pnpm --filter @releasedeck/dashboard lint
+          pnpm --filter @releasedeck/dashboard typecheck
+          pnpm --filter @releasedeck/dashboard build
+
+      - name: Add immutable revision evidence
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+        run: printf '{"commit":"%s"}\n' "$RELEASE_SHA" > apps/dashboard/dist/release.json
+
+      - name: Store production dashboard artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dashboard-${{ needs.plan.outputs.sha }}
+          path: apps/dashboard/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-ci:
+    name: Backend CI
+    needs: plan
+    if: needs.plan.outputs.backend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      - name: Reject automatic database migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-tree -r --name-only HEAD | grep -E '(^|/)(migrations?|migrate)(/|\.)'; then
+            echo 'Database migration content requires a separately reviewed deployment path.' >&2
+            exit 78
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable locked pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "$PNPM_VERSION"
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build API dependencies for tests
+        run: >-
+          pnpm --filter @releasedeck/runtime
+          --filter @releasedeck/db
+          --filter @releasedeck/queue build
+
+      - name: Test API and required workspaces
+        run: >-
+          pnpm --filter @releasedeck/runtime
+          --filter @releasedeck/db
+          --filter @releasedeck/queue
+          --filter @releasedeck/api test
+
+      - name: Lint API and required workspaces
+        run: >-
+          pnpm --filter @releasedeck/runtime
+          --filter @releasedeck/db
+          --filter @releasedeck/queue
+          --filter @releasedeck/api lint
+
+      - name: Typecheck API and required workspaces
+        run: >-
+          pnpm --filter @releasedeck/runtime
+          --filter @releasedeck/db
+          --filter @releasedeck/queue
+          --filter @releasedeck/api typecheck
+
+      - name: Build API and required workspaces
+        run: >-
+          pnpm --filter @releasedeck/runtime
+          --filter @releasedeck/db
+          --filter @releasedeck/queue
+          --filter @releasedeck/api build
+
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [plan, frontend-ci, backend-ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every affected component to pass
+        shell: bash
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          FRONTEND_REQUIRED: ${{ needs.plan.outputs.frontend }}
+          FRONTEND_RESULT: ${{ needs.frontend-ci.result }}
+          BACKEND_REQUIRED: ${{ needs.plan.outputs.backend }}
+          BACKEND_RESULT: ${{ needs.backend-ci.result }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_RESULT" == success ]]
+          [[ "$FRONTEND_REQUIRED" != true || "$FRONTEND_RESULT" == success ]]
+          [[ "$BACKEND_REQUIRED" != true || "$BACKEND_RESULT" == success ]]
+
+  backend-deploy:
+    name: Deploy backend
+    if: github.event_name != 'pull_request' && needs.plan.outputs.backend == 'true'
+    needs: [plan, ci-gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production-backend
+      url: https://deck.saaahil.xyz/api/projects
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure scoped AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::821656895501:role/ReleaseDeckGitHubBackendProduction
+          role-duration-seconds: 1800
+          role-session-name: releasedeck-backend-${{ github.run_id }}
+
+      - name: Deploy exact commit through constrained SSM document
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          command_id=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids i-0dcc195cf171e3fee \
+            --document-name ReleaseDeck-DeployApiProduction \
+            --parameters "CommitSha=$RELEASE_SHA" \
+            --comment "ReleaseDeck backend $RELEASE_SHA from GitHub run $GITHUB_RUN_ID" \
+            --timeout-seconds 1200 \
+            --query 'Command.CommandId' \
+            --output text)
+          echo "SSM command: $command_id"
+
+          status=Pending
+          for _ in $(seq 1 120); do
+            status=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$command_id" \
+              --instance-id i-0dcc195cf171e3fee \
+              --query Status \
+              --output text 2>/dev/null || true)
+            case "$status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
+            esac
+            sleep 10
+          done
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id i-0dcc195cf171e3fee \
+            --query '{Status:Status,ResponseCode:ResponseCode,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+          [[ "$status" == Success ]]
+
+      - name: Verify anonymous production API remains protected
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 5 --retry-all-errors \
+            'https://deck.saaahil.xyz/api/projects?limit=1')
+          [[ "$status" == 401 ]]
+
+  frontend-deploy:
+    name: Deploy frontend
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.plan.result == 'success' &&
+      needs.ci-gate.result == 'success' &&
+      needs.plan.outputs.frontend == 'true' &&
+      (needs.backend-deploy.result == 'success' || needs.backend-deploy.result == 'skipped')
+    needs: [plan, ci-gate, backend-deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production-frontend
+      url: https://deck.saaahil.xyz
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the verified dashboard artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dashboard-${{ needs.plan.outputs.sha }}
+          path: dashboard-dist
+
+      - name: Validate deployment artifact
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test -s dashboard-dist/index.html
+          test -d dashboard-dist/assets
+          grep -Fq "\"commit\":\"$RELEASE_SHA\"" dashboard-dist/release.json
+          if find dashboard-dist -type l -print -quit | grep -q .; then
+            echo 'Dashboard artifact must not contain symbolic links.' >&2
+            exit 65
+          fi
+
+      - name: Configure scoped AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::821656895501:role/ReleaseDeckGitHubFrontendProduction
+          role-duration-seconds: 1800
+          role-session-name: releasedeck-frontend-${{ github.run_id }}
+
+      - name: Publish immutable assets and no-cache HTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 sync dashboard-dist/assets/ \
+            s3://releasedeck-production-dashboard-bdf69d7dda/assets/ \
+            --region "$AWS_REGION" \
+            --only-show-errors \
+            --cache-control 'public,max-age=31536000,immutable' \
+            --sse AES256
+          aws s3 cp dashboard-dist/index.html \
+            s3://releasedeck-production-dashboard-bdf69d7dda/index.html \
+            --region "$AWS_REGION" \
+            --only-show-errors \
+            --content-type 'text/html; charset=utf-8' \
+            --cache-control 'no-cache, no-store, must-revalidate' \
+            --sse AES256
+          aws s3 cp dashboard-dist/release.json \
+            s3://releasedeck-production-dashboard-bdf69d7dda/release.json \
+            --region "$AWS_REGION" \
+            --only-show-errors \
+            --content-type 'application/json; charset=utf-8' \
+            --cache-control 'no-cache, no-store, must-revalidate' \
+            --sse AES256
+
+      - name: Invalidate HTML and revision evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalidation_id=$(aws cloudfront create-invalidation \
+            --distribution-id E116Z5Y0F8ZJ2J \
+            --paths / /index.html /release.json \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "CloudFront invalidation: $invalidation_id"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id E116Z5Y0F8ZJ2J \
+            --id "$invalidation_id"
+
+      - name: Verify live HTTPS publication and API routing
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --output /tmp/index.html \
+            --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 5 --retry-all-errors \
+            https://deck.saaahil.xyz/
+          curl --fail --silent --show-error --output /tmp/release.json \
+            --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 5 --retry-all-errors \
+            https://deck.saaahil.xyz/release.json
+          grep -Fq "\"commit\":\"$RELEASE_SHA\"" /tmp/release.json
+
+          asset=$(grep -oE '/assets/[^" ]+' /tmp/index.html | head -n 1)
+          test -n "$asset"
+          curl --fail --silent --show-error --output /dev/null \
+            --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 5 --retry-all-errors \
+            "https://deck.saaahil.xyz$asset"
+
+          api_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 20 --retry 5 --retry-delay 5 --retry-all-errors \
+            'https://deck.saaahil.xyz/api/projects?limit=1')
+          [[ "$api_status" == 401 ]]

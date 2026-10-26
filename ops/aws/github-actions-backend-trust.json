@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GitHubProductionBackend",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::821656895501:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:saaahilhussain@140058338/release-deck@1363746174:environment:production-backend",
+          "token.actions.githubusercontent.com:repository_owner_id": "140058338",
+          "token.actions.githubusercontent.com:repository_id": "1363746174",
+          "token.actions.githubusercontent.com:ref": "refs/heads/main",
+          "token.actions.githubusercontent.com:environment": "production-backend",
+          "token.actions.githubusercontent.com:workflow": "ReleaseDeck production CI/CD"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,254 @@
+description: >-
+  Deploy one exact ReleaseDeck API commit. The only input is a full commit SHA;
+  repository, build policy, instance paths, service, ports, and verification are fixed.
+schemaVersion: '2.2'
+parameters:
+  CommitSha:
+    type: String
+    description: Exact 40-character commit SHA already reviewed on main
+    allowedPattern: '^[0-9a-f]{40}$'
+    interpolationType: ENV_VAR
+mainSteps:
+  - action: aws:runShellScript
+    name: deployApi
+    timeoutSeconds: 1200
+    inputs:
+      runCommand:
+        - |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          readonly SHA="${SSM_CommitSha:-}"
+          readonly ROOT=/opt/releasedeck
+          readonly RELEASES="$ROOT/releases"
+          readonly STAGING="$ROOT/staging"
+          readonly CURRENT="$ROOT/current"
+          readonly SERVICE=releasedeck-api.service
+          readonly WORKER=releasedeck-worker.service
+          readonly REPOSITORY=https://github.com/saaahilhussain/release-deck.git
+          readonly CANDIDATE_UNIT=releasedeck-api-candidate.service
+          readonly CANDIDATE_PORT=3101
+          readonly LOCK=/run/lock/releasedeck-api-deploy.lock
+
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid commit SHA' >&2; exit 64; }
+
+          exec 9>"$LOCK"
+          /usr/bin/flock -n 9 || { echo 'Another API deployment is active' >&2; exit 75; }
+
+          work=
+          link_tmp=
+          cleanup() {
+            /usr/bin/systemctl stop "$CANDIDATE_UNIT" >/dev/null 2>&1 || true
+            if [[ -n "$link_tmp" ]]; then /usr/bin/rm -f -- "$link_tmp"; fi
+            if [[ -n "$work" && "$work" == "$STAGING/"* && -d "$work" ]]; then
+              /usr/bin/rm -rf --one-file-system -- "$work"
+            fi
+          }
+          trap cleanup EXIT
+
+          curl_status() {
+            /usr/bin/curl --noproxy '*' --silent --show-error \
+              --connect-timeout 2 --max-time 5 --output /dev/null \
+              --write-out '%{http_code}' "$1" 2>/dev/null || true
+          }
+
+          listener_is_loopback() {
+            local port=$1 addresses address
+            addresses=$(/usr/bin/ss -H -ltn "sport = :$port" | /usr/bin/awk '{print $4}')
+            [[ -n "$addresses" ]] || return 1
+            while IFS= read -r address; do
+              [[ "$address" == 127.0.0.1:* ]] || return 1
+            done <<< "$addresses"
+          }
+
+          worker_is_safe() {
+            ! /usr/bin/systemctl is-enabled --quiet "$WORKER" &&
+              ! /usr/bin/systemctl is-active --quiet "$WORKER"
+          }
+
+          verify_api_once() {
+            local expected=$1
+            [[ "$(/usr/bin/readlink -f "$CURRENT")" == "$expected" ]] || return 1
+            /usr/bin/systemctl is-active --quiet "$SERVICE" || return 1
+            [[ "$(curl_status http://127.0.0.1:3000/health)" == 200 ]] || return 1
+            [[ "$(curl_status 'http://127.0.0.1:3000/api/projects?limit=1')" == 401 ]] || return 1
+            listener_is_loopback 3000 || return 1
+            worker_is_safe || return 1
+          }
+
+          verify_active_stable() {
+            local expected=$1 attempt pid_before pid_after restarts_before restarts_after
+            for attempt in $(/usr/bin/seq 1 12); do
+              if verify_api_once "$expected"; then break; fi
+              [[ "$attempt" -lt 12 ]] || return 1
+              /usr/bin/sleep 2
+            done
+            pid_before=$(/usr/bin/systemctl show "$SERVICE" --property MainPID --value)
+            restarts_before=$(/usr/bin/systemctl show "$SERVICE" --property NRestarts --value)
+            [[ "$pid_before" =~ ^[1-9][0-9]*$ ]] || return 1
+            /usr/bin/sleep 8
+            verify_api_once "$expected" || return 1
+            pid_after=$(/usr/bin/systemctl show "$SERVICE" --property MainPID --value)
+            restarts_after=$(/usr/bin/systemctl show "$SERVICE" --property NRestarts --value)
+            [[ "$pid_after" == "$pid_before" && "$restarts_after" == "$restarts_before" ]]
+          }
+
+          verify_candidate() {
+            local candidate=$1 attempt health auth
+            ! /usr/bin/ss -H -ltn "sport = :$CANDIDATE_PORT" | /usr/bin/grep -q . || return 1
+            /usr/bin/systemctl stop "$CANDIDATE_UNIT" >/dev/null 2>&1 || true
+            /usr/bin/systemctl reset-failed "$CANDIDATE_UNIT" >/dev/null 2>&1 || true
+            /usr/bin/systemd-run \
+              --unit="$CANDIDATE_UNIT" \
+              --quiet \
+              --property=Type=simple \
+              --property=User=releasedeck-api \
+              --property=Group=releasedeck-api \
+              --property="WorkingDirectory=$candidate" \
+              --property=EnvironmentFile=/etc/releasedeck/api.env \
+              --property=Restart=no \
+              --property=NoNewPrivileges=true \
+              --property=PrivateTmp=true \
+              --property=PrivateDevices=true \
+              --property=ProtectSystem=strict \
+              --property=ProtectHome=true \
+              /usr/bin/env HOST=127.0.0.1 PORT="$CANDIDATE_PORT" NODE_ENV=production \
+              /usr/local/bin/node "$candidate/apps/api/dist/index.js"
+
+            for attempt in $(/usr/bin/seq 1 15); do
+              health=$(curl_status "http://127.0.0.1:$CANDIDATE_PORT/health")
+              auth=$(curl_status "http://127.0.0.1:$CANDIDATE_PORT/api/projects?limit=1")
+              if [[ "$health" == 200 && "$auth" == 401 ]] && listener_is_loopback "$CANDIDATE_PORT"; then
+                /usr/bin/systemctl stop "$CANDIDATE_UNIT"
+                for _ in $(/usr/bin/seq 1 10); do
+                  ! /usr/bin/systemctl is-active --quiet "$CANDIDATE_UNIT" && break
+                  /usr/bin/sleep 1
+                done
+                ! /usr/bin/ss -H -ltn "sport = :$CANDIDATE_PORT" | /usr/bin/grep -q .
+                return
+              fi
+              /usr/bin/systemctl is-failed --quiet "$CANDIDATE_UNIT" && break
+              /usr/bin/sleep 2
+            done
+            /usr/bin/systemctl stop "$CANDIDATE_UNIT" >/dev/null 2>&1 || true
+            return 1
+          }
+
+          switch_current() {
+            local target=$1
+            [[ "$target" == "$RELEASES/"* && -d "$target" ]] || return 1
+            link_tmp="$ROOT/.current.$SHA.$$"
+            /usr/bin/ln -s "releases/$(/usr/bin/basename "$target")" "$link_tmp"
+            /usr/bin/mv -Tf "$link_tmp" "$CURRENT"
+            link_tmp=
+          }
+
+          [[ "$(/usr/bin/stat -c '%a %U %G' /etc/releasedeck/api.env)" == '640 root releasedeck-api' ]]
+          worker_is_safe || { echo 'Worker must remain disabled and inactive' >&2; exit 70; }
+
+          previous=$(/usr/bin/readlink -f "$CURRENT")
+          [[ "$previous" == "$RELEASES/"* && -d "$previous" ]]
+          previous_sha=$(/usr/bin/git -C "$previous" rev-parse HEAD)
+          [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          verify_active_stable "$previous" || {
+            echo 'Current release is not a verified authenticated rollback target' >&2
+            exit 69
+          }
+
+          if [[ "$previous_sha" == "$SHA" ]]; then
+            echo "DEPLOYMENT_NOOP commit=$SHA authenticated=1 health=200 loopback=1 worker=disabled"
+            exit 0
+          fi
+
+          release="$RELEASES/$SHA"
+          if [[ -d "$release" ]]; then
+            candidate_sha=$(/usr/bin/git -C "$release" rev-parse HEAD)
+            [[ "$candidate_sha" == "$SHA" ]]
+            candidate="$release"
+          else
+            /usr/bin/install -d -m 0755 -o root -g root "$RELEASES" "$STAGING"
+            work=$(/usr/bin/mktemp -d "$STAGING/$SHA.XXXXXX")
+            /usr/bin/install -d -m 0700 -o releasedeck-build -g releasedeck-build "$work/home"
+            /usr/bin/chown releasedeck-build:releasedeck-build "$work"
+            candidate="$work/repo"
+
+            /usr/bin/install -d -m 0700 -o releasedeck-build -g releasedeck-build "$candidate"
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin \
+              /usr/bin/git -C "$candidate" init --quiet
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin \
+              /usr/bin/git -C "$candidate" remote add origin "$REPOSITORY"
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin \
+              /usr/bin/git -C "$candidate" fetch --quiet --depth=1 origin "$SHA"
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin \
+              /usr/bin/git -C "$candidate" checkout --quiet --detach FETCH_HEAD
+            [[ "$(/usr/bin/git -C "$candidate" rev-parse HEAD)" == "$SHA" ]]
+
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin CI=true \
+              /usr/local/bin/pnpm --dir "$candidate" install --frozen-lockfile --store-dir "$work/store"
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin CI=true \
+              /usr/local/bin/pnpm --dir "$candidate" \
+              --filter @releasedeck/runtime \
+              --filter @releasedeck/db \
+              --filter @releasedeck/queue \
+              --filter @releasedeck/api build
+            /usr/sbin/runuser -u releasedeck-build -- /usr/bin/env \
+              HOME="$work/home" PATH=/usr/local/bin:/usr/bin:/bin NODE_ENV=production \
+              /usr/bin/bash -c \
+              "cd \"\$1\" && exec /usr/local/bin/node --input-type=module --eval \"await import('./packages/runtime/dist/index.js'); await import('./packages/db/dist/index.js'); await import('./packages/queue/dist/index.js'); await import('./apps/api/dist/app.js')\"" \
+              releasedeck-build "$candidate"
+
+            /usr/bin/printf '%s\n' "$SHA" > "$candidate/.release-sha"
+            /usr/bin/chown -R root:root "$candidate"
+            /usr/bin/chmod -R go-w "$candidate"
+            /usr/bin/chmod 0755 "$work" "$candidate"
+          fi
+
+          [[ -s "$candidate/apps/api/dist/index.js" ]]
+          [[ -s "$candidate/packages/runtime/dist/index.js" ]]
+          [[ -s "$candidate/packages/db/dist/index.js" ]]
+          [[ -s "$candidate/packages/queue/dist/index.js" ]]
+          verify_candidate "$candidate" || {
+            echo 'Candidate failed isolated health/authentication/loopback verification' >&2
+            exit 1
+          }
+
+          if [[ "$candidate" != "$release" ]]; then
+            /usr/bin/mv -T "$candidate" "$release"
+            candidate="$release"
+          fi
+
+          [[ "$(/usr/bin/readlink -f "$CURRENT")" == "$previous" ]]
+          verify_active_stable "$previous" || {
+            echo 'Verified rollback target changed or became unhealthy before promotion' >&2
+            exit 1
+          }
+
+          switch_current "$release"
+          promoted=true
+          /usr/bin/systemctl restart "$SERVICE" || promoted=false
+          if [[ "$promoted" == true ]] && verify_active_stable "$release"; then
+            echo "DEPLOYMENT_SUCCESS commit=$SHA previous=$previous_sha authenticated=1 health=200 loopback=1 worker=disabled"
+            exit 0
+          fi
+
+          echo 'Candidate promotion failed; restoring only the pre-verified authenticated release' >&2
+          rollback=true
+          switch_current "$previous" || rollback=false
+          if [[ "$rollback" == true ]]; then
+            /usr/bin/systemctl restart "$SERVICE" || rollback=false
+          fi
+          if [[ "$rollback" == true ]] && verify_active_stable "$previous"; then
+            echo "DEPLOYMENT_ROLLED_BACK failed=$SHA restored=$previous_sha authenticated=1 health=200 loopback=1 worker=disabled" >&2
+            exit 1
+          fi
+
+          /usr/bin/systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+          echo 'FAIL_CLOSED: no verified authenticated rollback could be restored; API stopped' >&2
+          exit 1
