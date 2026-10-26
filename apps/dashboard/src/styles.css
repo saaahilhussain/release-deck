@@ -1064,3 +1064,619 @@ tr.selected {
     flex-direction: column;
   }
 }
+
+/* Compact project-first dashboard */
+:root {
+  color: #172033;
+  background: #f6f8fb;
+}
+.app-shell {
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+.sidebar {
+  padding: 18px 12px;
+}
+.sidebar > .brand {
+  padding: 0 8px 20px;
+}
+.sidebar nav {
+  gap: 3px;
+  padding-top: 12px;
+}
+.nav-link {
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+}
+.nav-link:hover,
+.nav-link.active {
+  background: #edf4ff;
+}
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  height: 60px;
+  padding: 0 24px;
+  backdrop-filter: blur(12px);
+}
+.search {
+  width: min(420px, 100%);
+  height: 36px;
+  padding: 0 11px;
+  border-radius: 7px;
+  background: #f7f9fc;
+}
+.operator-actions {
+  position: relative;
+  gap: 10px;
+}
+.read-only {
+  gap: 6px;
+  font-size: 11px;
+}
+.account-menu {
+  position: relative;
+}
+.account-menu > summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 4px 8px 4px 5px;
+  list-style: none;
+  border: 1px solid #dde5ef;
+  border-radius: 8px;
+  background: #fff;
+  color: #34455f;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+}
+.account-menu > summary::-webkit-details-marker,
+.project-card > summary::-webkit-details-marker,
+.deployment-row > summary::-webkit-details-marker,
+.activity-section > summary::-webkit-details-marker {
+  display: none;
+}
+.account-avatar {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: #edf4ff;
+  color: #2563d8;
+}
+.account-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 8;
+  display: grid;
+  width: 230px;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid #dfe6ef;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 16px 36px rgba(30, 48, 78, 0.14);
+}
+.account-popover strong {
+  margin-top: 4px;
+  font-size: 13px;
+}
+.account-popover small {
+  color: #76869e;
+  font-size: 11px;
+}
+.account-popover .sign-out {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+.content {
+  width: min(1280px, 100%);
+  padding: 24px 24px 64px;
+}
+.heading {
+  align-items: center;
+  margin-bottom: 18px;
+}
+.heading h1 {
+  margin-top: 5px;
+  font-size: clamp(24px, 2.5vw, 30px);
+  letter-spacing: -0.045em;
+}
+.heading p {
+  margin-top: 5px;
+  font-size: 12px;
+}
+.card,
+.overview-section {
+  box-shadow: none;
+}
+.badge {
+  gap: 5px;
+  padding: 4px 8px;
+  font-size: 10px;
+}
+.badge-dot {
+  width: 6px;
+  height: 6px;
+}
+.overview-section {
+  margin-bottom: 14px;
+  border: 1px solid #e1e7ef;
+  border-radius: 11px;
+  background: #fff;
+}
+.overview-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 15px 16px 12px;
+  border-bottom: 1px solid #e9edf3;
+}
+.section-heading-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #20314b;
+}
+.section-heading-line > svg {
+  color: #2f6fdf;
+}
+.section-heading-line h2,
+.section-heading-line strong {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: -0.015em;
+}
+.section-heading-line small {
+  display: block;
+  margin-top: 3px;
+  color: #7b889b;
+  font-size: 11px;
+  font-weight: 400;
+}
+.overview-section-head p {
+  margin: 4px 0 0 26px;
+  color: #7a889c;
+  font-size: 11px;
+}
+.count-pill {
+  min-width: 22px;
+  padding: 2px 6px;
+  border-radius: 99px;
+  background: #edf3fc;
+  color: #50647f;
+  font-size: 10px;
+  font-weight: 750;
+  text-align: center;
+}
+.compact-controls {
+  display: flex;
+  gap: 7px;
+}
+.compact-controls select,
+.project-select {
+  min-height: 32px;
+  padding: 5px 28px 5px 9px;
+  border: 1px solid #dce4ee;
+  border-radius: 7px;
+  background: #fff;
+  color: #40516b;
+  font-size: 11px;
+}
+.project-list,
+.deployment-list {
+  display: grid;
+}
+.project-card,
+.deployment-row {
+  border-bottom: 1px solid #ebeff4;
+}
+.project-card:last-child,
+.deployment-row:last-child {
+  border-bottom: 0;
+}
+.project-card > summary,
+.deployment-row > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.project-card > summary {
+  display: grid;
+  grid-template-columns:
+    34px minmax(160px, 1.25fr) minmax(92px, 0.62fr) minmax(130px, 0.78fr)
+    minmax(145px, 1fr) auto 18px;
+  align-items: center;
+  gap: 12px;
+  min-height: 68px;
+  padding: 9px 14px;
+}
+.project-card > summary:hover,
+.deployment-row > summary:hover,
+.project-card[open] > summary,
+.deployment-row[open] > summary {
+  background: #f8fbff;
+}
+.row-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+}
+.project-identity,
+.project-state,
+.project-release {
+  min-width: 0;
+}
+.project-identity strong,
+.project-identity small,
+.project-state small,
+.project-release strong,
+.project-release small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-identity strong {
+  color: #1d2b40;
+  font-size: 13px;
+}
+.project-identity small,
+.project-state small,
+.project-release small {
+  margin-top: 3px;
+  color: #8592a6;
+  font-size: 10px;
+}
+.project-branch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: #586a84;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-release strong {
+  color: #485b76;
+  font-size: 11px;
+  font-weight: 650;
+}
+.project-card time,
+.deployment-row time {
+  color: #7d8ca1;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.disclosure-icon {
+  display: grid;
+  place-items: center;
+  color: #8b98ab;
+  transition: transform 160ms ease;
+}
+.project-card[open] > summary .disclosure-icon,
+.deployment-row[open] > summary .disclosure-icon,
+.activity-section[open] > summary .activity-count svg {
+  transform: rotate(180deg);
+}
+.project-detail-body,
+.deployment-row-detail {
+  padding: 13px 16px 15px 60px;
+  border-top: 1px solid #eef2f6;
+  background: #fbfcfe;
+}
+.compact-facts {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.compact-facts .field span {
+  margin-bottom: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.compact-facts .field strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+.inline-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  color: #8a6618;
+  font-size: 11px;
+}
+.text-action {
+  gap: 6px;
+  font-size: 11px;
+}
+.project-skeleton {
+  height: 68px;
+  border-bottom: 1px solid #ebeff4;
+  background: linear-gradient(90deg, #fafbfd 25%, #f1f4f8 38%, #fafbfd 62%);
+  background-size: 300% 100%;
+  animation: skeleton 1.4s ease infinite;
+}
+@keyframes skeleton {
+  to {
+    background-position: -100% 0;
+  }
+}
+.deployment-row > summary {
+  display: grid;
+  grid-template-columns: 92px minmax(160px, 1fr) 110px 120px auto 18px;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 14px;
+  color: #52637c;
+  font-size: 11px;
+}
+.deployment-row > summary code {
+  color: #174f9f;
+  font-size: 11px;
+  font-weight: 750;
+}
+.deployment-project {
+  overflow: hidden;
+  color: #2d3e58;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.deployment-stage {
+  color: #65768f;
+}
+.deployment-row-detail > .pipeline {
+  max-width: 720px;
+  margin-bottom: 17px;
+}
+.deployment-row-detail .compact-facts {
+  grid-template-columns: 1.5fr 1fr 1fr 1fr;
+}
+.activity-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  list-style: none;
+  cursor: pointer;
+}
+.activity-count {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #7b899c;
+  font-size: 10px;
+}
+.activity-count svg {
+  transition: transform 160ms ease;
+}
+.activity-body {
+  padding: 0 16px 12px;
+  border-top: 1px solid #ebeff4;
+}
+.activity-list {
+  margin-top: 14px;
+}
+.activity-list li {
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 9px;
+  padding-bottom: 13px;
+}
+.activity-list li::after {
+  left: 11px;
+  top: 23px;
+}
+.activity-icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #eef2f7;
+  color: #66768c;
+  z-index: 1;
+}
+.activity-icon.success {
+  background: #e9f7ef;
+  color: #128153;
+}
+.activity-icon.danger {
+  background: #fff0f1;
+  color: #c13b4d;
+}
+.activity-icon.progress {
+  background: #eaf2ff;
+  color: #2869dc;
+}
+.empty {
+  padding: 28px 18px;
+}
+.loading {
+  padding: 28px 18px;
+}
+.error {
+  margin: 12px;
+  padding: 18px;
+}
+.collection,
+.deployment-detail,
+.release-card {
+  padding: 17px;
+}
+.deployment-detail {
+  margin-top: 12px;
+}
+.detail-head h2 {
+  font-size: 20px;
+}
+.evidence-grid {
+  gap: 12px;
+  padding: 16px 0;
+}
+.detail-columns {
+  gap: 22px;
+  padding: 15px 0;
+}
+summary:focus-visible {
+  outline: 3px solid #80adff;
+  outline-offset: -3px;
+}
+
+@media (max-width: 1120px) {
+  .project-card > summary {
+    grid-template-columns:
+      34px minmax(150px, 1.2fr) minmax(90px, 0.7fr) minmax(125px, 0.8fr)
+      auto 18px;
+  }
+  .project-release {
+    display: none;
+  }
+  .compact-facts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    display: block;
+  }
+  .topbar {
+    height: 58px;
+    padding: 0 12px;
+  }
+  .content {
+    padding: 18px 12px 86px;
+  }
+  .read-only,
+  .account-menu > summary > span:not(.account-avatar) {
+    display: none;
+  }
+  .account-menu > summary {
+    padding-right: 5px;
+  }
+  .account-popover {
+    position: fixed;
+    top: 54px;
+    right: 12px;
+  }
+  .heading {
+    margin-bottom: 14px;
+  }
+  .overview-section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .compact-controls {
+    width: 100%;
+  }
+  .compact-controls select {
+    flex: 1;
+    min-width: 0;
+  }
+  .project-card > summary {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 8px 10px;
+    padding: 10px 12px;
+  }
+  .project-identity {
+    grid-column: 2;
+  }
+  .project-branch {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  .project-state {
+    grid-column: 2;
+    grid-row: 3;
+  }
+  .project-card > summary > time,
+  .project-release {
+    display: none;
+  }
+  .disclosure-icon {
+    grid-column: 3;
+    grid-row: 1 / span 3;
+  }
+  .project-detail-body,
+  .deployment-row-detail {
+    padding: 13px 12px 15px;
+  }
+  .compact-facts,
+  .deployment-row-detail .compact-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .deployment-row > summary {
+    grid-template-columns: 80px minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 10px 12px;
+  }
+  .deployment-project {
+    grid-column: 1 / span 2;
+    grid-row: 2;
+  }
+  .deployment-row > summary .badge {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .deployment-row > summary .disclosure-icon {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+  .deployment-stage,
+  .deployment-row > summary time {
+    display: none;
+  }
+  .activity-section > summary {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
+  .mobile-brand .brand span {
+    display: none;
+  }
+  .search {
+    max-width: none;
+  }
+  .compact-controls {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .compact-facts,
+  .deployment-row-detail .compact-facts {
+    grid-template-columns: 1fr 1fr;
+  }
+  .activity-list li {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+  .activity-list time {
+    grid-column: 2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

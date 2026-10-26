@@ -332,6 +332,28 @@ function fixture(t) {
   };
 }
 
+test('overview is project-first and follows the complete project cursor chain', async (t) => {
+  const f = fixture(t);
+  try {
+    await settle();
+    const content = f.app.text();
+    assert.ok(content.indexOf('Your projects') < content.indexOf('Recent deployments'));
+    assert.match(content, /fixture\/project-a/);
+    assert.match(content, /fixture\/project-b/);
+    assert.match(content, /Recorded activity.*0 events/);
+    const projectReads = f.calls.filter((url) => url.pathname === '/api/projects');
+    assert.ok(
+      projectReads.some(
+        (url) =>
+          url.searchParams.get('limit') === '100' &&
+          url.searchParams.get('cursor') === 'projects-page-two',
+      ),
+    );
+  } finally {
+    f.close();
+  }
+});
+
 test('explicit and automatic project switches reset deployment page/cursor', async (t) => {
   const f = fixture(t);
   try {
@@ -357,7 +379,9 @@ test('explicit and automatic project switches reset deployment page/cursor', asy
     await settle();
     assert.match(f.app.text(), /11111111/);
     const b = f.calls.filter(
-      (u) => u.pathname === '/api/projects/project-b/deployments',
+      (u) =>
+        u.pathname === '/api/projects/project-b/deployments' &&
+        u.searchParams.get('limit') === '25',
     );
     assert.equal(b.length, 2);
     assert.ok(b.every((u) => !u.searchParams.has('cursor')));
@@ -369,6 +393,8 @@ test('explicit and automatic project switches reset deployment page/cursor', asy
 test('stalled fallback is bounded, shared with batch reads, and cannot overwrite newer SSE evidence', async (t) => {
   const f = fixture(t);
   try {
+    await settle();
+    f.app.button('Deployments').onClick();
     await settle();
     f.app.button('View deployment eeeeeeee').onClick();
     await settle();

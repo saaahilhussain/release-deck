@@ -4,8 +4,28 @@ import {
   useMemo,
   useState,
   type FormEvent,
+  type ComponentType,
   type ReactNode,
 } from 'react';
+import {
+  ArrowClockwise,
+  ArrowRight,
+  CaretDown,
+  CaretRight,
+  Check,
+  Clock,
+  GitBranch,
+  GithubLogo,
+  MagnifyingGlass,
+  Package,
+  Pulse,
+  RocketLaunch,
+  SignOut,
+  SquaresFour,
+  Stack,
+  UserCircle,
+  WarningCircle,
+} from '@phosphor-icons/react';
 
 import { createDetailReader } from './detail-requests';
 
@@ -21,6 +41,12 @@ type OperatorSession = {
   absoluteExpiresAt: string;
 };
 type Page<T> = { items: T[]; nextCursor: string | null };
+type ProjectSummary = {
+  state: State;
+  deployment?: Deployment;
+  detail?: Detail;
+  error?: string;
+};
 type Project = {
   id: string;
   provider: string;
@@ -88,6 +114,7 @@ type Detail = Deployment & {
   };
   activity: { kind: string; label: string; occurredAt: string; outcome?: string }[];
 };
+type ActivityItem = Detail['activity'][number] & { context?: string };
 
 const format = (value?: string) =>
   value
@@ -106,6 +133,8 @@ const date = (value?: string) =>
 const sha = (value?: string) => (value ? value.slice(0, 8) : 'Unavailable');
 const query = (cursor: string | null) =>
   '?limit=25' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+const allProjectsQuery = (cursor: string | null) =>
+  '?limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
 const tone = (value?: string) =>
   !value
     ? 'neutral'
@@ -150,71 +179,32 @@ async function request<T>(
 
 const get = <T,>(path: string, signal?: AbortSignal) => request<T>(path, {}, signal);
 
+const icons: Record<
+  string,
+  ComponentType<{ size?: number; weight?: 'regular' | 'bold' }>
+> = {
+  overview: SquaresFour,
+  projects: Stack,
+  deployments: RocketLaunch,
+  releases: Package,
+  search: MagnifyingGlass,
+  arrow: ArrowRight,
+  chevron: CaretRight,
+  down: CaretDown,
+  clock: Clock,
+  branch: GitBranch,
+  provider: GithubLogo,
+  activity: Pulse,
+  refresh: ArrowClockwise,
+  check: Check,
+  account: UserCircle,
+  signout: SignOut,
+  warning: WarningCircle,
+};
+
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
-  const paths: Record<string, ReactNode> = {
-    overview: (
-      <>
-        <rect x="3" y="3" width="7" height="7" rx="1.5" />
-        <rect x="14" y="3" width="7" height="7" rx="1.5" />
-        <rect x="3" y="14" width="7" height="7" rx="1.5" />
-        <rect x="14" y="14" width="7" height="7" rx="1.5" />
-      </>
-    ),
-    projects: (
-      <>
-        <path d="m12 2 9 5-9 5-9-5 9-5Z" />
-        <path d="m3 7 9 5 9-5M3 7v10l9 5 9-5V7M12 12v10" />
-      </>
-    ),
-    deployments: (
-      <>
-        <path d="M4 17h16M12 3l5 9-5-2-5 2 5-9ZM12 10v7" />
-        <path d="M6 21h12" />
-      </>
-    ),
-    releases: (
-      <>
-        <path d="M3 7h18M5 7V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2M5 7v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7M9 12h6" />
-      </>
-    ),
-    search: (
-      <>
-        <circle cx="10.8" cy="10.8" r="6.8" />
-        <path d="m16 16 5 5" />
-      </>
-    ),
-    arrow: <path d="M4 12h16m-6-6 6 6-6 6" />,
-    chevron: <path d="m9 18 6-6-6-6" />,
-    clock: (
-      <>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7v5l3 2" />
-      </>
-    ),
-    activity: <path d="M2 12h4l3-8 5 16 3-8h5" />,
-    refresh: (
-      <>
-        <path d="M20 11a8 8 0 1 0-2 6" />
-        <path d="M20 4v7h-7" />
-      </>
-    ),
-    check: <path d="m4 12 5 5L20 6" />,
-  };
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      {paths[name]}
-    </svg>
-  );
+  const Glyph = icons[name] ?? SquaresFour;
+  return <Glyph size={size} weight="regular" aria-hidden="true" />;
 }
 
 function Brand() {
@@ -304,27 +294,6 @@ function Pager({
     </div>
   );
 }
-function Metric({
-  icon,
-  label,
-  value,
-}: {
-  icon: string;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="metric card">
-      <span className="metric-mark">
-        <Icon name={icon} size={23} />
-      </span>
-      <div>
-        <span>{label}</span>
-        <strong>{value}</strong>
-      </div>
-    </div>
-  );
-}
 function SectionTitle({
   icon,
   title,
@@ -409,15 +378,29 @@ function Pipeline({ detail }: { detail: Detail }) {
     </div>
   );
 }
-function Activity({ items }: { items: Detail['activity'] }) {
+function Activity({ items }: { items: ActivityItem[] }) {
   return (
     <ol className="activity-list">
       {items.map((item, index) => (
         <li key={item.kind + item.occurredAt + index}>
-          <span className={'activity-dot ' + tone(item.outcome)} />
+          <span className={'activity-icon ' + tone(item.outcome)}>
+            <Icon
+              name={
+                item.kind.toLowerCase().includes('rollback')
+                  ? 'refresh'
+                  : item.kind.toLowerCase().includes('release')
+                    ? 'releases'
+                    : item.outcome && tone(item.outcome) === 'success'
+                      ? 'check'
+                      : 'activity'
+              }
+              size={13}
+            />
+          </span>
           <div>
             <strong>{item.label}</strong>
             <small>
+              {item.context ? item.context + ' · ' : ''}
               {format(item.kind)}
               {item.outcome ? ' · ' + format(item.outcome) : ''}
             </small>
@@ -699,19 +682,24 @@ function Dashboard({
   authenticationFailed: () => void;
   signedOut: () => void;
 }) {
-  const authenticatedGet = useCallback(
-    async <T,>(path: string, signal?: AbortSignal) => {
+  const authenticatedGet = useMemo(() => {
+    let authFailureReported = false;
+    return async <T,>(path: string, signal?: AbortSignal) => {
       try {
         return await get<T>(path, signal);
       } catch (error) {
-        if (error instanceof ApiRequestError && [401, 403].includes(error.status)) {
+        if (
+          !authFailureReported &&
+          error instanceof ApiRequestError &&
+          [401, 403].includes(error.status)
+        ) {
+          authFailureReported = true;
           authenticationFailed();
         }
         throw error;
       }
-    },
-    [authenticationFailed],
-  );
+    };
+  }, [authenticationFailed]);
   const readDetail = useMemo(
     () =>
       createDetailReader((path, signal) =>
@@ -721,6 +709,16 @@ function Dashboard({
   );
   const [view, setView] = useState<View>('overview');
   const [search, setSearch] = useState('');
+  const [overviewProjects, setOverviewProjects] = useState<Project[]>([]);
+  const [overviewProjectState, setOverviewProjectState] = useState<State>('loading');
+  const [overviewProjectError, setOverviewProjectError] = useState('');
+  const [overviewRetry, setOverviewRetry] = useState(0);
+  const [overviewRevision, setOverviewRevision] = useState(0);
+  const [projectSummaries, setProjectSummaries] = useState<
+    Record<string, ProjectSummary>
+  >({});
+  const [projectSort, setProjectSort] = useState<'updated' | 'name'>('updated');
+  const [projectStatus, setProjectStatus] = useState('all');
   const [projectCursors, setProjectCursors] = useState<(string | null)[]>([null]);
   const [projectPage, setProjectPage] = useState(0);
   const [projects, setProjects] = useState<Page<Project>>({
@@ -785,6 +783,172 @@ function Dashboard({
     let stopped = false;
     let pending = false;
     let active: AbortController | undefined;
+    let hasLoaded = false;
+    setOverviewProjectState('loading');
+    const load = () => {
+      if (pending || stopped) return;
+      pending = true;
+      const controller = new AbortController();
+      active = controller;
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const readAll = async () => {
+        const items = new Map<string, Project>();
+        const cursors = new Set<string>();
+        let cursor: string | null = null;
+        do {
+          const page: { projects: Project[]; nextCursor: string | null } =
+            await authenticatedGet<{
+              projects: Project[];
+              nextCursor: string | null;
+            }>('/api/projects' + allProjectsQuery(cursor), controller.signal);
+          for (const project of page.projects) items.set(project.id, project);
+          if (page.nextCursor && cursors.has(page.nextCursor))
+            throw new Error('The project list returned a repeated cursor.');
+          if (page.nextCursor) cursors.add(page.nextCursor);
+          cursor = page.nextCursor;
+        } while (cursor);
+        return [...items.values()];
+      };
+      void readAll()
+        .then((items) => {
+          if (stopped) return;
+          setOverviewProjects(items);
+          setOverviewProjectState('ready');
+          setOverviewProjectError('');
+          setOverviewRevision((revision) => revision + 1);
+          hasLoaded = true;
+        })
+        .catch((error: unknown) => {
+          if (stopped) return;
+          setOverviewProjectError(
+            error instanceof Error && error.name === 'AbortError'
+              ? 'The complete project list did not respond in time.'
+              : error instanceof Error
+                ? error.message
+                : 'The project request failed.',
+          );
+          if (!hasLoaded) setOverviewProjectState('error');
+        })
+        .finally(() => {
+          clearTimeout(timeout);
+          pending = false;
+          if (active === controller) active = undefined;
+        });
+    };
+    load();
+    const timer = setInterval(load, 15000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      active?.abort();
+    };
+  }, [authenticatedGet, overviewRetry]);
+
+  const overviewProjectIds = overviewProjects.map((item) => item.id).join(',');
+  useEffect(() => {
+    if (overviewProjectState !== 'ready' || !overviewProjects.length) {
+      if (overviewProjectState === 'ready') setProjectSummaries({});
+      return;
+    }
+    let stopped = false;
+    const controller = new AbortController();
+    setProjectSummaries((current) => {
+      const next: Record<string, ProjectSummary> = {};
+      for (const project of overviewProjects) {
+        const existing = current[project.id];
+        next[project.id] = existing?.deployment
+          ? {
+              state: 'loading',
+              deployment: existing.deployment,
+              ...(existing.detail ? { detail: existing.detail } : {}),
+            }
+          : { state: 'loading' };
+      }
+      return next;
+    });
+    const load = async () => {
+      for (let index = 0; index < overviewProjects.length; index += 5) {
+        const batch = overviewProjects.slice(index, index + 5);
+        const results = await Promise.all(
+          batch.map(async (project): Promise<[string, ProjectSummary]> => {
+            try {
+              const page = await authenticatedGet<{
+                deployments: Deployment[];
+                nextCursor: string | null;
+              }>(
+                '/api/projects/' +
+                  encodeURIComponent(project.id) +
+                  '/deployments?limit=1',
+                controller.signal,
+              );
+              const deployment = page.deployments[0];
+              if (!deployment) return [project.id, { state: 'ready' }];
+              if (!stopped)
+                setProjectSummaries((current) => ({
+                  ...current,
+                  [project.id]: { state: 'ready', deployment },
+                }));
+              try {
+                const result = await readDetail(
+                  '/api/deployments/' + encodeURIComponent(deployment.id),
+                  controller.signal,
+                );
+                return [
+                  project.id,
+                  { state: 'ready', deployment, detail: result.deployment },
+                ];
+              } catch (error) {
+                if (controller.signal.aborted) throw error;
+                return [
+                  project.id,
+                  {
+                    state: 'ready',
+                    deployment,
+                    error: 'Release evidence is temporarily unavailable.',
+                  },
+                ];
+              }
+            } catch (error) {
+              return [
+                project.id,
+                {
+                  state: 'error',
+                  error:
+                    error instanceof Error && error.name === 'AbortError'
+                      ? 'Latest deployment request timed out.'
+                      : 'Latest deployment is unavailable.',
+                },
+              ];
+            }
+          }),
+        );
+        if (stopped) return;
+        setProjectSummaries((current) => ({
+          ...current,
+          ...Object.fromEntries(results),
+        }));
+      }
+    };
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    void load().finally(() => clearTimeout(timeout));
+    return () => {
+      stopped = true;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [
+    authenticatedGet,
+    overviewProjectIds,
+    overviewProjectState,
+    overviewProjects,
+    overviewRevision,
+    readDetail,
+  ]);
+
+  useEffect(() => {
+    let stopped = false;
+    let pending = false;
+    let active: AbortController | undefined;
     setProjectState('loading');
     setProjectId(null);
     setProjects({ items: [], nextCursor: null });
@@ -832,13 +996,16 @@ function Dashboard({
 
   useEffect(() => {
     if (projectState !== 'ready') return;
-    if (!projects.items.some((item) => item.id === projectId)) {
+    const projectIsAvailable =
+      projects.items.some((item) => item.id === projectId) ||
+      (view !== 'projects' && overviewProjects.some((item) => item.id === projectId));
+    if (!projectIsAvailable) {
       setProjectId(projects.items[0]?.id ?? null);
       setDeploymentId(null);
       setDeploymentCursors([null]);
       setDeploymentPage(0);
     }
-  }, [projectId, projectState, projects]);
+  }, [overviewProjects, projectId, projectState, projects, view]);
   useEffect(() => {
     if (!projectId) {
       setDeployments({ items: [], nextCursor: null });
@@ -1056,7 +1223,9 @@ function Dashboard({
     };
   }, [deploymentId, readDetail]);
 
-  const project = projects.items.find((item) => item.id === projectId);
+  const project =
+    projects.items.find((item) => item.id === projectId) ??
+    overviewProjects.find((item) => item.id === projectId);
   const name = project
     ? project.owner + '/' + project.repository
     : 'No project selected';
@@ -1078,6 +1247,78 @@ function Dashboard({
       ),
     [deployments, search],
   );
+  const visibleOverviewProjects = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    return overviewProjects
+      .filter((item) => {
+        const summary = projectSummaries[item.id];
+        const matchesSearch = (
+          item.owner +
+          '/' +
+          item.repository +
+          ' ' +
+          item.defaultBranch
+        )
+          .toLowerCase()
+          .includes(term);
+        const status = summary?.deployment?.status;
+        const matchesStatus =
+          projectStatus === 'all' ||
+          (projectStatus === 'none'
+            ? summary?.state === 'ready' && !status
+            : status === projectStatus);
+        return matchesSearch && matchesStatus;
+      })
+      .sort((left, right) => {
+        if (projectSort === 'name')
+          return (left.owner + '/' + left.repository).localeCompare(
+            right.owner + '/' + right.repository,
+          );
+        const leftUpdated =
+          projectSummaries[left.id]?.deployment?.updatedAt ?? left.updatedAt;
+        const rightUpdated =
+          projectSummaries[right.id]?.deployment?.updatedAt ?? right.updatedAt;
+        return Date.parse(rightUpdated) - Date.parse(leftUpdated);
+      });
+  }, [overviewProjects, projectSort, projectStatus, projectSummaries, search]);
+  const recentOverviewDeployments = useMemo(
+    () =>
+      overviewProjects
+        .flatMap((item) => {
+          const summary = projectSummaries[item.id];
+          return summary?.deployment
+            ? [
+                {
+                  project: item,
+                  deployment: summary.deployment,
+                  detail: summary.detail,
+                },
+              ]
+            : [];
+        })
+        .sort(
+          (left, right) =>
+            Date.parse(right.deployment.updatedAt) -
+            Date.parse(left.deployment.updatedAt),
+        )
+        .slice(0, 8),
+    [overviewProjects, projectSummaries],
+  );
+  const overviewActivities = useMemo(
+    () =>
+      overviewProjects
+        .flatMap((project) =>
+          (projectSummaries[project.id]?.detail?.activity ?? []).map((activity) => ({
+            ...activity,
+            context: project.owner + '/' + project.repository,
+          })),
+        )
+        .sort(
+          (left, right) => Date.parse(right.occurredAt) - Date.parse(left.occurredAt),
+        )
+        .slice(0, 12),
+    [overviewProjects, projectSummaries],
+  );
   const loadedDetails = deployments.items
     .map((item) => {
       const detail = details[item.id];
@@ -1090,10 +1331,6 @@ function Dashboard({
     selectedDetail && selectedBase && selectedDetail.version >= selectedBase.version
       ? selectedDetail
       : undefined;
-  const activities = loadedDetails
-    .flatMap((item) => item.activity ?? [])
-    .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt))
-    .slice(0, 7);
   const releases = loadedDetails.filter((item) => item.release);
   const changeProject = (id: string) => {
     setProjectId(id);
@@ -1186,13 +1423,27 @@ function Dashboard({
             />
           </label>
           <div className="operator-actions">
-            <div className="read-only">
-              <span />
-              {session.operator.id}
-            </div>
-            <button className="sign-out" onClick={logout} disabled={loggingOut}>
-              {loggingOut ? 'Signing out…' : 'Sign out'}
-            </button>
+            <span className="read-only">
+              <span /> Read-only
+            </span>
+            <details className="account-menu">
+              <summary aria-label="Open account menu">
+                <span className="account-avatar">
+                  <Icon name="account" size={18} />
+                </span>
+                <span>{session.operator.id}</span>
+                <Icon name="down" size={14} />
+              </summary>
+              <div className="account-popover">
+                <span className="eyebrow">OPERATOR SESSION</span>
+                <strong>{session.operator.id}</strong>
+                <small>Read-only dashboard access</small>
+                <button className="sign-out" onClick={logout} disabled={loggingOut}>
+                  <Icon name="signout" size={15} />
+                  {loggingOut ? 'Signing out…' : 'Sign out'}
+                </button>
+              </div>
+            </details>
           </div>
         </header>
         {logoutError && (
@@ -1205,177 +1456,314 @@ function Dashboard({
             <>
               <Heading
                 eyebrow="OVERVIEW"
-                title="Deployment control"
-                description="Current page records refresh every 15 seconds."
+                title="Overview"
+                description="Projects and their latest recorded release state. Refreshes every 15 seconds."
               />
-              <div className="metrics">
-                <Metric
-                  icon="projects"
-                  label="Projects on this page"
-                  value={projectState === 'ready' ? String(projects.items.length) : '—'}
-                />
-                <Metric
-                  icon="deployments"
-                  label="Deployments on this page"
-                  value={
-                    deploymentState === 'ready' ? String(deployments.items.length) : '—'
-                  }
-                />
-                <Metric
-                  icon="check"
-                  label="Succeeded on this page"
-                  value={
-                    deploymentState === 'ready'
-                      ? String(
-                          deployments.items.filter((item) => item.status === 'SUCCESS')
-                            .length,
-                        )
-                      : '—'
-                  }
-                />
-                <Metric
-                  icon="activity"
-                  label="Running on this page"
-                  value={
-                    deploymentState === 'ready'
-                      ? String(
-                          deployments.items.filter((item) => item.status === 'RUNNING')
-                            .length,
-                        )
-                      : '—'
-                  }
-                />
-              </div>
-              {projectState === 'error' ? (
-                <ErrorState
-                  message={projectError}
-                  retry={() => setProjectRetry((n) => n + 1)}
-                />
-              ) : projectState === 'loading' ? (
-                <p className="loading" role="status">
-                  Loading projects…
-                </p>
-              ) : !projects.items.length ? (
-                <Empty
-                  title="No projects yet"
-                  description="Projects appear here after registration through the API."
-                />
-              ) : (
-                <>
-                  <div className="overview-grid">
-                    <section className="card feature">
-                      <div className="feature-top">
-                        <span className="feature-mark">
-                          <Icon name="projects" size={26} />
-                        </span>
-                        <span className="eyebrow">SELECTED PROJECT</span>
-                      </div>
-                      <h2>{name}</h2>
-                      <p>
-                        Tracking deployments from{' '}
-                        <strong>{project?.defaultBranch}</strong>
-                      </p>
-                      <div className="feature-facts">
-                        <Field label="Provider" value={format(project?.provider)} />
-                        <Field
-                          label="Latest commit on this page"
-                          value={
-                            deployments.items[0]
-                              ? sha(deployments.items[0].commitSha)
-                              : undefined
-                          }
-                        />
-                        <Field label="Updated" value={date(project?.updatedAt)} />
-                      </div>
-                      <button
-                        className="text-action"
-                        onClick={() => setView('projects')}
-                      >
-                        View projects <Icon name="arrow" size={16} />
-                      </button>
-                    </section>
-                    <section className="card peek">
-                      <SectionTitle
-                        icon="activity"
-                        title="Selected deployment"
-                        action={current ? <Badge value={current.status} /> : undefined}
-                      />
-                      {current ? (
-                        <>
-                          <h3>
-                            {sha(current.commitSha)}{' '}
-                            <small>· {format(current.stage)}</small>
-                          </h3>
-                          <p>Updated {date(current.updatedAt)}</p>
-                          <Pipeline detail={current} />
-                          <button
-                            className="text-action"
-                            onClick={() => setView('deployments')}
-                          >
-                            View deployment <Icon name="arrow" size={16} />
-                          </button>
-                        </>
-                      ) : deploymentState === 'loading' ? (
-                        <p className="loading" role="status">
-                          Loading deployments…
-                        </p>
-                      ) : (
-                        <p className="muted">No deployment available on this page.</p>
+              <section className="overview-section" aria-labelledby="projects-title">
+                <div className="overview-section-head">
+                  <div>
+                    <div className="section-heading-line">
+                      <Icon name="projects" size={18} />
+                      <h2 id="projects-title">Your projects</h2>
+                      {overviewProjectState === 'ready' && (
+                        <span className="count-pill">{overviewProjects.length}</span>
                       )}
-                    </section>
+                    </div>
+                    <p>
+                      Every registered repository, with its latest known deployment.
+                    </p>
                   </div>
-                  <div className="overview-grid">
-                    <section className="card panel">
-                      <SectionTitle
-                        icon="clock"
-                        title="Recent deployments"
-                        action={
-                          <button
-                            className="text-action"
-                            onClick={() => setView('deployments')}
-                          >
-                            View all <Icon name="arrow" size={15} />
-                          </button>
-                        }
-                      />
-                      <p className="section-note">Selected project · current page</p>
-                      {deploymentState === 'error' ? (
-                        <ErrorState
-                          message={deploymentError}
-                          retry={() => setDeploymentRetry((n) => n + 1)}
-                        />
-                      ) : (
-                        <DeploymentTable
-                          items={visibleDeployments.slice(0, 5)}
-                          choose={(id) => {
-                            setDeploymentId(id);
-                            setView('deployments');
-                          }}
-                        />
-                      )}
-                    </section>
-                    <section className="card panel">
-                      <SectionTitle icon="activity" title="Recorded activity" />
-                      <p className="section-note">
-                        Persisted milestones from loaded deployments
-                      </p>
-                      {activities.length ? (
-                        <Activity items={activities} />
-                      ) : (
-                        <Empty
-                          title="No activity available"
-                          description="Milestones appear when deployments record evidence."
-                        />
-                      )}
-                      {detailError && (
-                        <p className="warning" role="status">
-                          {detailError}
-                        </p>
-                      )}
-                    </section>
+                  <div
+                    className="compact-controls"
+                    aria-label="Project display options"
+                  >
+                    <select
+                      value={projectStatus}
+                      onChange={(event) => setProjectStatus(event.target.value)}
+                      aria-label="Filter projects by deployment status"
+                    >
+                      <option value="all">All statuses</option>
+                      <option value="SUCCESS">Successful</option>
+                      <option value="RUNNING">Running</option>
+                      <option value="FAILED">Failed</option>
+                      <option value="ROLLED_BACK">Rolled back</option>
+                      <option value="none">No deployments</option>
+                    </select>
+                    <select
+                      value={projectSort}
+                      onChange={(event) =>
+                        setProjectSort(event.target.value as 'updated' | 'name')
+                      }
+                      aria-label="Sort projects"
+                    >
+                      <option value="updated">Recently updated</option>
+                      <option value="name">Project name</option>
+                    </select>
                   </div>
-                </>
-              )}
+                </div>
+                {overviewProjectState === 'error' ? (
+                  <ErrorState
+                    message={overviewProjectError}
+                    retry={() => setOverviewRetry((retry) => retry + 1)}
+                  />
+                ) : overviewProjectState === 'loading' ? (
+                  <div
+                    className="project-list"
+                    role="status"
+                    aria-label="Loading projects"
+                  >
+                    {[0, 1, 2].map((item) => (
+                      <div className="project-skeleton" key={item} />
+                    ))}
+                  </div>
+                ) : !overviewProjects.length ? (
+                  <Empty
+                    title="No projects yet"
+                    description="Projects appear here after registration through the API."
+                  />
+                ) : visibleOverviewProjects.length ? (
+                  <div className="project-list">
+                    {visibleOverviewProjects.map((item) => {
+                      const summary = projectSummaries[item.id];
+                      const deployment = summary?.deployment;
+                      const detail = summary?.detail;
+                      return (
+                        <details className="project-card" key={item.id}>
+                          <summary>
+                            <span className="row-mark">
+                              <Icon name="projects" size={18} />
+                            </span>
+                            <span className="project-identity">
+                              <strong>{item.repository}</strong>
+                              <small>
+                                {item.owner}/{item.repository}
+                              </small>
+                            </span>
+                            <span className="project-branch">
+                              <Icon name="branch" size={14} /> {item.defaultBranch}
+                            </span>
+                            <span className="project-state">
+                              {summary?.state === 'loading' ? (
+                                <span className="badge neutral">Loading</span>
+                              ) : summary?.state === 'error' ? (
+                                <span className="badge danger">Unavailable</span>
+                              ) : deployment ? (
+                                <Badge value={deployment.status} />
+                              ) : (
+                                <span className="badge neutral">No deployments</span>
+                              )}
+                              <small>
+                                {deployment
+                                  ? format(deployment.stage)
+                                  : 'No stage recorded'}
+                              </small>
+                            </span>
+                            <span className="project-release">
+                              <strong>
+                                {detail?.release?.releaseId ?? 'No release'}
+                              </strong>
+                              <small>
+                                {detail?.release
+                                  ? format(detail.release.status)
+                                  : (summary?.error ?? 'No release evidence')}
+                              </small>
+                            </span>
+                            <time dateTime={deployment?.updatedAt ?? item.updatedAt}>
+                              {date(deployment?.updatedAt ?? item.updatedAt)}
+                            </time>
+                            <span className="disclosure-icon">
+                              <Icon name="down" size={16} />
+                            </span>
+                          </summary>
+                          <div className="project-detail-body">
+                            <div className="compact-facts">
+                              <Field label="Provider" value={format(item.provider)} />
+                              <Field
+                                label="Latest commit"
+                                value={
+                                  deployment ? (
+                                    <code>{sha(deployment.commitSha)}</code>
+                                  ) : undefined
+                                }
+                              />
+                              <Field
+                                label="Tracked branch"
+                                value={item.defaultBranch}
+                              />
+                              <Field
+                                label="Health gate"
+                                value={
+                                  detail?.release?.health
+                                    ? 'HTTP ' +
+                                      detail.release.health.statusCode +
+                                      ' after ' +
+                                      detail.release.health.attempts +
+                                      ' attempts'
+                                    : undefined
+                                }
+                              />
+                              <Field
+                                label="Promoted"
+                                value={date(detail?.release?.success?.completedAt)}
+                              />
+                              <Field
+                                label="Rollback"
+                                value={
+                                  detail?.release?.rollback
+                                    ? format(detail.release.rollback.mode) +
+                                      ' / ' +
+                                      format(detail.release.rollback.outcome)
+                                    : undefined
+                                }
+                              />
+                            </div>
+                            {summary?.error && (
+                              <p className="inline-note" role="status">
+                                <Icon name="warning" size={15} /> {summary.error}
+                              </p>
+                            )}
+                            <button
+                              className="text-action"
+                              onClick={() => {
+                                changeProject(item.id);
+                                if (deployment) setDeploymentId(deployment.id);
+                                setView('deployments');
+                              }}
+                            >
+                              Open project <Icon name="arrow" size={15} />
+                            </button>
+                          </div>
+                        </details>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <Empty
+                    title="No projects match"
+                    description="Clear the loaded-record search or choose another status."
+                  />
+                )}
+                {overviewProjectError && overviewProjectState === 'ready' && (
+                  <p className="warning" role="status">
+                    {overviewProjectError}
+                  </p>
+                )}
+              </section>
+
+              <section className="overview-section" aria-labelledby="recent-title">
+                <div className="overview-section-head">
+                  <div>
+                    <div className="section-heading-line">
+                      <Icon name="deployments" size={18} />
+                      <h2 id="recent-title">Recent deployments</h2>
+                    </div>
+                    <p>
+                      Latest known deployment from each project, ordered by update time.
+                    </p>
+                  </div>
+                </div>
+                {recentOverviewDeployments.length ? (
+                  <div className="deployment-list">
+                    {recentOverviewDeployments.map(
+                      ({ project, deployment, detail }) => (
+                        <details className="deployment-row" key={deployment.id}>
+                          <summary>
+                            <code>{sha(deployment.commitSha)}</code>
+                            <span className="deployment-project">
+                              {project.owner}/{project.repository}
+                            </span>
+                            <Badge value={deployment.status} />
+                            <span className="deployment-stage">
+                              {format(deployment.stage)}
+                            </span>
+                            <time dateTime={deployment.updatedAt}>
+                              {date(deployment.updatedAt)}
+                            </time>
+                            <span className="disclosure-icon">
+                              <Icon name="down" size={16} />
+                            </span>
+                          </summary>
+                          <div className="deployment-row-detail">
+                            {detail ? (
+                              <Pipeline detail={detail} />
+                            ) : (
+                              <p className="muted">
+                                Detailed evidence is not currently available.
+                              </p>
+                            )}
+                            <div className="compact-facts">
+                              <Field
+                                label="Full commit"
+                                value={
+                                  <code className="wrap">{deployment.commitSha}</code>
+                                }
+                              />
+                              <Field
+                                label="Release ID"
+                                value={detail?.release?.releaseId}
+                              />
+                              <Field
+                                label="Release state"
+                                value={format(detail?.release?.status)}
+                              />
+                              <Field
+                                label="Updated"
+                                value={date(deployment.updatedAt)}
+                              />
+                            </div>
+                            <button
+                              className="text-action"
+                              onClick={() => {
+                                changeProject(project.id);
+                                setDeploymentId(deployment.id);
+                                setView('deployments');
+                              }}
+                            >
+                              View deployment <Icon name="arrow" size={15} />
+                            </button>
+                          </div>
+                        </details>
+                      ),
+                    )}
+                  </div>
+                ) : overviewProjectState === 'loading' ? (
+                  <p className="loading" role="status">
+                    Loading recent deployments...
+                  </p>
+                ) : (
+                  <Empty
+                    title="No deployments recorded"
+                    description="Latest deployment attempts will appear here when recorded."
+                  />
+                )}
+              </section>
+
+              <details className="overview-section activity-section">
+                <summary>
+                  <span className="section-heading-line">
+                    <Icon name="activity" size={18} />
+                    <span>
+                      <strong>Recorded activity</strong>
+                      <small>
+                        Persisted milestones from latest project deployments
+                      </small>
+                    </span>
+                  </span>
+                  <span className="activity-count">
+                    {overviewActivities.length} events <Icon name="down" size={16} />
+                  </span>
+                </summary>
+                <div className="activity-body">
+                  {overviewActivities.length ? (
+                    <Activity items={overviewActivities} />
+                  ) : (
+                    <Empty
+                      title="No activity available"
+                      description="Milestones appear when deployments record evidence."
+                    />
+                  )}
+                </div>
+              </details>
             </>
           )}
           {view === 'projects' && (
@@ -1447,14 +1835,17 @@ function Dashboard({
                   'Selected project: ' + name + ' · refreshes every 15 seconds'
                 }
                 action={
-                  projects.items.length > 1 ? (
+                  (overviewProjects.length || projects.items.length) > 1 ? (
                     <select
                       className="project-select"
                       aria-label="Select project"
                       value={projectId ?? ''}
                       onChange={(event) => changeProject(event.target.value)}
                     >
-                      {projects.items.map((item) => (
+                      {(overviewProjects.length
+                        ? overviewProjects
+                        : projects.items
+                      ).map((item) => (
                         <option value={item.id} key={item.id}>
                           {item.owner}/{item.repository}
                         </option>
