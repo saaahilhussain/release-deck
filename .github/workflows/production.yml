@@ -119,6 +119,10 @@ jobs:
                   frontend=true
                   backend=true
                   ;;
+                .github/workflows/production.yml|ops/aws/*)
+                  frontend=true
+                  backend=true
+                  ;;
               esac
             done <<< "$changed"
           fi
@@ -277,7 +281,12 @@ jobs:
 
   backend-deploy:
     name: Deploy backend
-    if: github.event_name != 'pull_request' && needs.plan.outputs.backend == 'true'
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.plan.result == 'success' &&
+      needs.ci-gate.result == 'success' &&
+      needs.plan.outputs.backend == 'true'
     needs: [plan, ci-gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
